@@ -37,3 +37,16 @@ RECIPIENT = "your_email"
 pip install -r backend/requirements.txt
 python backend/gmail_demo.py
 ```
+
+## 核心逻辑
+
+后端向手机要当前页面，手机返回界面 XML。后端读 XML 里的文字和坐标，决定下一步，再把命令发回手机。手机收到后执行，自己不决定下一步。
+
+现在的命令：
+
+- `home`：回到桌面
+- `tap`：按坐标点击
+- `swipe_down`：向下滑
+- `input text`、回车：写入邮箱、主题和正文
+
+现在这些判断是写死在 `gmail_demo.py` 里的。以后可以换成 LangChain、LangGraph，加上 AI：后端把页面 XML 交给模型，由模型决定发哪条命令。手机仍然只负责接收命令并执行。
