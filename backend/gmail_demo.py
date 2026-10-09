@@ -27,8 +27,10 @@ def running() -> bool:
 def start(dump_screen, adb: str) -> dict:
     global _running
     with _lock:
-        if _running:
-            return _message(False, "Gmail 演示还在进行")
+        import recognize
+
+        if _running or recognize.running():
+            return _message(False, "已有操作在进行，请等它结束")
         if not _accessibility_enabled(adb):
             return _message(False, "请先在系统设置里打开 Demo 的无障碍服务")
         _running = True
@@ -412,7 +414,7 @@ def _adb() -> str:
 
 
 if __name__ == "__main__":
-    from fastapi import FastAPI
+    from fastapi import Body, FastAPI
     import uvicorn
 
     app = FastAPI()
@@ -420,5 +422,11 @@ if __name__ == "__main__":
     @app.post("/gmail/start")
     def start_gmail() -> dict:
         return start(_dump_screen_xml, _adb())
+
+    @app.post("/recognize/start")
+    def start_recognize(body: dict = Body()) -> dict:
+        import recognize
+
+        return recognize.start(_dump_screen_xml, str(body.get("prompt", "")))
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
