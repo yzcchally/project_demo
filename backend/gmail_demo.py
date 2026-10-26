@@ -2,19 +2,26 @@
 
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+from fastapi import Body, FastAPI
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 LOG_FILE = Path(__file__).resolve().parent / "gmail_demo_log.txt"
 RECEIVER = "com.example.demo/.A11yCommandReceiver"
 ACTION = "com.example.demo.A11Y_COMMAND"
 SCAN_INTERVAL_SECONDS = 3
 MAX_SCANS = 24
-RECIPIENT = "your_send_email@example.com"
+RECIPIENT = os.environ.get("GMAIL_RECIPIENT", "your_send_email@example.com").strip()
 
 _lock = threading.Lock()
 _running = False
@@ -31,12 +38,15 @@ def start(dump_screen, adb: str) -> dict:
 
         if _running or recognize.running():
             return _message(False, "已有操作在进行，请等它结束")
+        installed = subprocess.run(
+            [adb, "shell", "pm", "path", "com.google.android.gm"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if installed.returncode != 0 or not installed.stdout.strip().startswith("package:"):
+            return _message(False, "没有检测到原生 Gmail，请先安装并登录 Gmail 后再运行固定流程")
         if not _accessibility_enabled(adb):
             return _message(False, "请先在系统设置里打开 Demo 的无障碍服务")
-        _running = True
-    LOG_FILE.write_text("", encoding="utf-8")
-    threading.Thread(target=_run, args=(dump_screen, adb), daemon=True).start()
-    return _message(True, "已回到桌面。之后每 3 秒看一次界面，并按固定步骤打开 Gmail")
+        return _message(False, "直接发送的旧演示已停用，请使用带草稿核对与确认的新邮件任务")
 
 
 def _run(dump_screen, adb: str) -> None:
@@ -386,7 +396,7 @@ def _message(ok: bool, message: str) -> dict:
 
 
 def _dump_screen_xml() -> str:
-    adb = os.path.join(os.environ["LOCALAPPDATA"], "Android", "Sdk", "platform-tools", "adb.exe")
+    adb = _adb()
     dump = subprocess.run(
         [adb, "shell", "uiautomator", "dump", "/sdcard/window.xml"],
         capture_output=True,
@@ -410,23 +420,40 @@ def _dump_screen_xml() -> str:
 
 
 def _adb() -> str:
-    return os.path.join(os.environ["LOCALAPPDATA"], "Android", "Sdk", "platform-tools", "adb.exe")
+    explicit = os.environ.get("ADB_PATH", "").strip()
+    if explicit:
+        resolved = shutil.which(os.path.expanduser(explicit))
+        if resolved:
+            return resolved
+        raise RuntimeError("ADB_PATH 指向的文件不存在或不能执行，请检查 .env")
+
+    executable = "adb.exe" if sys.platform == "win32" else "adb"
+    found = shutil.which(executable)
+    if found:
+        return found
+    sdk_roots = [
+        Path(value).expanduser()
+        for name in ("ANDROID_HOME", "ANDROID_SDK_ROOT")
+        if (value := os.environ.get(name, "").strip())
+    ]
+    if sys.platform == "darwin":
+        sdk_roots.append(Path.home() / "Library" / "Android" / "sdk")
+    elif sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
+        sdk_roots.append(Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk")
+    else:
+        sdk_roots.append(Path.home() / "Android" / "Sdk")
+    for root in sdk_roots:
+        candidate = root / "platform-tools" / executable
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    raise RuntimeError("没有找到 ADB，请安装 Android platform-tools，或在 .env 设置 ADB_PATH")
+
+
+from api.application import create_app
+app = create_app()
 
 
 if __name__ == "__main__":
-    from fastapi import Body, FastAPI
     import uvicorn
 
-    app = FastAPI()
-
-    @app.post("/gmail/start")
-    def start_gmail() -> dict:
-        return start(_dump_screen_xml, _adb())
-
-    @app.post("/recognize/start")
-    def start_recognize(body: dict = Body()) -> dict:
-        import recognize
-
-        return recognize.start(_dump_screen_xml, str(body.get("prompt", "")))
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("gmail_demo:app", host="127.0.0.1", port=8000)

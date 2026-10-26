@@ -13,6 +13,11 @@ class A11yCommandReceiver : BroadcastReceiver() {
             return
         }
         when (intent.getStringExtra("op")) {
+            "set_field" -> {
+                val value = decode(intent.getStringExtra("text").orEmpty())
+                setResultCode(if (service.setMailField(intent.getStringExtra("field").orEmpty(), value,
+                        intent.getBooleanExtra("use_clipboard", false))) 1 else 0)
+            }
             "home" -> service.goHome()
             "tap" -> service.tap(
                 intent.getIntExtra("x", 0).toFloat(),

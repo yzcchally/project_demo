@@ -1,0 +1,4 @@
+-r requirements.txt
+faster-whisper==1.2.1
+# Tested decoder version; PyAV 19 removed an argument used by this release.
+av==16.1.0
