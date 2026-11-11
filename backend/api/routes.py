@@ -145,6 +145,11 @@ def register(app):
     def graph_structure():
         return {"ok": True, "mermaid": get_engine().graph.get_graph().draw_mermaid()}
 
+    @app.get("/api/system/demo-capabilities")
+    def demo_capabilities():
+        return {"ok": True, "recovery_supported": True,
+                "case_ids": [f"T{number:02}" for number in range(1, 13)]}
+
     @app.get("/api/evaluation")
     def evaluation():
         from evaluation.metrics import build_report

@@ -9,13 +9,14 @@ import javax.imageio.ImageIO;
 class GenerateDemoQr {
     public static void main(String[] args) throws Exception {
         var target = Path.of(args[0]);
+        var content = args.length > 1 ? args[1] : "https://example.org/";
         Files.createDirectories(target.toAbsolutePath().getParent());
-        var matrix = new QRCodeWriter().encode("https://example.org/", BarcodeFormat.QR_CODE, 800, 800);
+        var matrix = new QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, 800, 800);
         var image = new BufferedImage(800, 800, BufferedImage.TYPE_INT_RGB);
         for (int y = 0; y < 800; y++)
             for (int x = 0; x < 800; x++)
                 image.setRGB(x, y, matrix.get(x, y) ? 0 : 0xffffff);
         ImageIO.write(image, "png", target.toFile());
-        System.out.println("QR fixture: https://example.org/ -> " + target);
+        System.out.println("QR fixture: " + content + " -> " + target);
     }
 }

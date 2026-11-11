@@ -18,6 +18,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -110,6 +111,13 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     var ttsSupported by remember { mutableStateOf(true) }
     var receiptDialog by remember { mutableStateOf(false) }
     var speechStatus by remember { mutableStateOf("") }
+    var showDemoPicker by rememberSaveable { mutableStateOf(false) }
+    var selectedDemoId by rememberSaveable { mutableStateOf("") }
+    var selectedDemoPrompt by rememberSaveable { mutableStateOf("") }
+    var demoMetadataSupported by rememberSaveable { mutableStateOf(false) }
+    var demoRecoverySupported by rememberSaveable { mutableStateOf(false) }
+    var demoRecoveryStatus by remember { mutableStateOf("正在检查演示功能…") }
+    val pageScroll = rememberScrollState()
     val tts = remember { TextToSpeech(context) { ttsReady = it == TextToSpeech.SUCCESS } }
     DisposableEffect(tts) {
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -128,13 +136,26 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     val active = task != null && state !in terminalStates
     fun changed() { requestKey = UUID.randomUUID().toString() }
     fun newTask() {
-        editMode = false; launchedScan = ""
+        dismissedTaskId = taskId.ifBlank { dismissedTaskId }
+        prefs.edit().remove("task_id").putString("dismissed_task", dismissedTaskId)
+            .remove("live_task").remove("live_events").remove("events_task")
+            .remove("connection_error").remove("active_scan_task").apply()
+        TaskConnectionService.dismiss(context, dismissedTaskId)
+        watchedTask = ""
+        editMode = false; editRecipient = ""; editSubject = ""; editBody = ""
+        manualMode = false; contactsOpen = false; advanced = false
+        contactAlias = ""; contactAddress = ""
+        receiptDialog = false; showDemoPicker = false; launchedScan = ""
         scanInFlight = false; scanOwner = ""; scanNonce = ""
-        dismissedTaskId = taskId
-        task = null; taskId = ""; timeline = ""; result = "请填写新任务的信息。"; changed()
-        prefs.edit().remove("task_id").putString("dismissed_task", dismissedTaskId).apply()
+        task = null; taskId = ""; timeline = ""; result = ""; changed()
+        instruction = ""; webpage = ""; body = ""; subject = "网页分享"; source = "text"
+        recipient = prefs.getString("recipient", "").orEmpty()
+        selectedDemoId = ""; selectedDemoPrompt = ""
+        tts.stop(); speechStatus = ""
+        scope.launch { pageScroll.scrollTo(0) }
     }
     fun fillInstruction(text: String) {
+        selectedDemoId = ""; selectedDemoPrompt = ""
         val parsed = parseTaskInstruction(text)
         instruction = text
         recipient = parsed.recipient
@@ -191,10 +212,52 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     }
     val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     fun startGoal(text: String) {
+        val demo = DemoCases.find(selectedDemoId)?.takeIf { text == selectedDemoPrompt }
+        if (demo?.recoveryFault != null && !demoRecoverySupported) {
+            result = "恢复演示暂不可用，请检查电脑连接后重新打开演示案例。"
+            return
+        }
+        if (demo == null) { selectedDemoId = ""; selectedDemoPrompt = "" }
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         instruction = text
-        action("/api/tasks", JSONObject().put("instruction", text).put("request_key", requestKey).put("assistance_mode", prefs.getString("assistance_mode", "silverguide")))
+        val payload = JSONObject().put("instruction", text).put("request_key", requestKey)
+            .put("assistance_mode", prefs.getString("assistance_mode", "silverguide"))
+        if (demo != null && demoMetadataSupported) {
+            payload.put("demo_case_id", demo.id)
+            demo.recoveryFault?.let { payload.put("demo_fault", it) }
+        }
+        action("/api/tasks", payload)
+    }
+
+    fun openDemoPicker() {
+        showDemoPicker = true
+        demoRecoverySupported = false; demoMetadataSupported = false
+        demoRecoveryStatus = "正在检查演示功能…"
+        scope.launch {
+            try {
+                val capabilities = request("/api/system/demo-capabilities")
+                demoMetadataSupported = (capabilities.optJSONArray("case_ids")?.length() ?: 0) > 0
+                demoRecoverySupported = capabilities.optBoolean("recovery_supported", false) && demoMetadataSupported
+                demoRecoveryStatus = if (demoRecoverySupported) "恢复演示已就绪" else "当前电脑后端暂不支持恢复演示。"
+            } catch (_: Exception) {
+                demoRecoveryStatus = "恢复演示暂不可用，请检查电脑连接并更新后端。"
+            }
+        }
+    }
+
+    fun useDemo(case: DemoCase) {
+        if (active || loading) return
+        if (case.recoveryFault != null && !demoRecoverySupported) return
+        if (task != null) newTask()
+        manualMode = false; contactsOpen = false; editMode = false
+        selectedDemoId = case.id
+        selectedDemoPrompt = DemoCases.promptFor(case, UUID.randomUUID().toString().take(8).uppercase(Locale.US))
+        instruction = selectedDemoPrompt
+        changed()
+        result = ""
+        showDemoPicker = false
+        scope.launch { pageScroll.animateScrollTo(0) }
     }
     val scanner = rememberLauncherForActivityResult(ScanContract()) { scan ->
         scanInFlight = false
@@ -239,8 +302,14 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     }
 
 
-    Column(modifier.verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text("小银助手 · SilverGuide", style = MaterialTheme.typography.headlineMedium)
+    Column(modifier.verticalScroll(pageScroll).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("小银助手", style = MaterialTheme.typography.headlineMedium)
+                Text("SilverGuide", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            TextButton(onClick = { openDemoPicker() }) { Text("演示案例", fontSize = 17.sp) }
+        }
         Text("扫码打开网页，核对后分享给家人。", fontSize = 20.sp)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("语音播报任务进度", fontSize = 18.sp)
@@ -333,7 +402,8 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
                         Text("请先核对收件箱或已发送记录，避免重复邮件。", fontSize = 19.sp)
                         Button(onClick = { action("/tasks/$taskId/control", JSONObject().put("action", "verify_only")) }, enabled = !loading) { Text("仅重新检查发送结果", fontSize = 20.sp) }
                     }
-                    if (state in setOf("completed", "outcome_unknown") && !current.optBoolean("delivery_confirmed")) {
+                    if (current.optString("task_type") != "open_url" && current.optInt("send_attempts") == 1 &&
+                        state in setOf("completed", "outcome_unknown") && !current.optBoolean("delivery_confirmed")) {
                         OutlinedButton(onClick = { receiptDialog = true }, enabled = !loading) { Text("我已在收件箱核对收到", fontSize = 19.sp) }
                     }
                     if (state == "needs_review") {
@@ -349,9 +419,20 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
                 }
             }
         }
-        if (!active) {
-            OutlinedTextField(instruction, onValueChange = { instruction = it; changed() }, label = { Text("告诉小银想做什么") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
-            Button(onClick = { startGoal(instruction) }, enabled = !loading && instruction.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) { Text("让小银完成这个任务", fontSize = 21.sp) }
+        if (task == null) {
+            DemoCases.find(selectedDemoId)?.let { demo ->
+                SelectedDemoCaseCard(case = demo, onClear = {
+                    selectedDemoId = ""; selectedDemoPrompt = ""; instruction = ""; changed()
+                }, canClear = !loading)
+            }
+            OutlinedTextField(instruction, onValueChange = {
+                instruction = it
+                if (it != selectedDemoPrompt) { selectedDemoId = ""; selectedDemoPrompt = "" }
+                changed()
+            }, label = { Text("告诉小银想做什么") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+            Button(onClick = { startGoal(instruction) }, enabled = !loading && instruction.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) {
+                Text(if (DemoCases.find(selectedDemoId)?.category == DemoCategory.SUCCESS) "开始完整演示" else "让小银完成这个任务", fontSize = 21.sp)
+            }
             LocalVoiceInput(enabled = !loading, onRecognized = { text ->
                 if (listOf("主题", "正文", "内容").any { it in text } && listOf("扫码", "扫描", "二维码", "打开", "发给", "发送", "分享").none { it in text }) {
                     fillInstruction(text); manualMode = true
@@ -380,7 +461,12 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
                     } catch (e: Exception) { result = e.message.orEmpty() }
                 } }, enabled = contactAlias.isNotBlank() && contactAddress.isNotBlank()) { Text("保存联系人称呼", fontSize = 20.sp) }
             }
-            TextButton(onClick = { manualMode = !manualMode }) { Text("按字段准备邮件", fontSize = 18.sp) }
+            TextButton(onClick = {
+                manualMode = !manualMode
+                if (manualMode && selectedDemoId.isNotBlank()) {
+                    selectedDemoId = ""; selectedDemoPrompt = ""; instruction = ""; changed()
+                }
+            }) { Text("按字段准备邮件", fontSize = 18.sp) }
             if (manualMode) {
             Button(onClick = { openScanner() },
                 modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) { Text("扫描网页二维码", fontSize = 21.sp) }
@@ -411,10 +497,37 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
         }
         Spacer(Modifier.height(24.dp))
     }
+    if (showDemoPicker) DemoCasePickerSheet(
+        onDismiss = { showDemoPicker = false }, onSelect = { useDemo(it) },
+        canSelect = !active && !loading, recoverySupported = demoRecoverySupported,
+        recoveryStatus = demoRecoveryStatus,
+    )
     if (receiptDialog && task != null) AlertDialog(onDismissRequest = { receiptDialog = false }, title = { Text("确认已经收到？") },
         text = { Text("请仅在收件箱中找到这封邮件，并核对主题和正文后确认。此结果会记录为您人工核对。") },
         confirmButton = { TextButton(onClick = {
             receiptDialog = false
             action("/tasks/$taskId/received", JSONObject().put("draft_digest", task!!.getString("draft_digest")).put("confirmed", true))
         }) { Text("已核对收到") } }, dismissButton = { TextButton(onClick = { receiptDialog = false }) { Text("还没有确认") } })
+    task?.takeIf { current ->
+        state == "completed" && if (current.optString("task_type") == "open_url")
+            current.optBoolean("webpage_verified") else current.optBoolean("delivery_confirmed")
+    }?.let { completed ->
+        AlertDialog(
+            onDismissRequest = { },
+            title = { Text("任务已完成", fontSize = 26.sp) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("任务已完成，请点击确认。", fontSize = 21.sp)
+                    Text(if (completed.optString("task_type") == "open_url") "网页已经打开，网址已核对。"
+                        else "您已在收件箱核对收到这封邮件。", fontSize = 19.sp)
+                }
+            },
+            confirmButton = {
+                Button(onClick = { newTask() }, enabled = !loading,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) {
+                    Text("确认，返回首页", fontSize = 21.sp)
+                }
+            },
+        )
+    }
 }

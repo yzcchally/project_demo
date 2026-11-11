@@ -33,6 +33,7 @@ class TaskConnectionService : Service() {
     private var lastSpoken = ""
     private var ttsReady = false
     private var reconnectScheduled = false
+    private var destroyed = false
     private lateinit var tts: TextToSpeech
     private val terminal = setOf("completed", "failed", "cancelled", "outcome_unknown", "interrupted")
 
@@ -41,14 +42,44 @@ class TaskConnectionService : Service() {
         if (Build.VERSION.SDK_INT >= 26)
             getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL, "小银助手任务", NotificationManager.IMPORTANCE_LOW))
         tts = TextToSpeech(this) { code ->
-            ttsReady = code == TextToSpeech.SUCCESS
-            if (ttsReady) { tts.setLanguage(Locale.SIMPLIFIED_CHINESE); tts.setSpeechRate(.85f); latest?.let { speak(it.optString("message")) } }
+            handler.post {
+                if (!destroyed) {
+                    ttsReady = code == TextToSpeech.SUCCESS
+                    if (ttsReady) {
+                        tts.setLanguage(Locale.SIMPLIFIED_CHINESE); tts.setSpeechRate(.85f)
+                        latest?.let { speak(it.optString("id"), it.optString("message")) }
+                    }
+                }
+            }
         }
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val id = intent?.getStringExtra("task_id") ?: prefs.getString("task_id", "").orEmpty()
-        if (id.isBlank()) { stopSelf(); return START_NOT_STICKY }
+        if (intent?.action == ACTION_DISMISS) {
+            if (watched.isBlank() || watched == id) {
+                active = false; watched = ""; latest = null
+                handler.removeCallbacksAndMessages(null)
+                socket?.cancel(); socket = null
+                client.dispatcher.cancelAll()
+                tts.stop()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                getSystemService(NotificationManager::class.java).cancel(NOTICE)
+                stopSelfResult(startId)
+                return START_NOT_STICKY
+            }
+            return START_STICKY
+        }
+        if (id.isBlank() || dismissed(id)) {
+            if (watched.isBlank() || watched == id) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                getSystemService(NotificationManager::class.java).cancel(NOTICE)
+                stopSelfResult(startId)
+                return START_NOT_STICKY
+            }
+            return START_STICKY
+        }
         if (watched != id || socket == null) {
+            if (watched != id) { latest = null; lastSpoken = "" }
             watched = id; active = true
             startForeground(NOTICE, notification("正在连接任务进度", null))
             connect(id)
@@ -56,35 +87,47 @@ class TaskConnectionService : Service() {
         intent?.getStringExtra("control")?.let { control(id, it) }
         return START_STICKY
     }
+    private fun dismissed(id: String) = id.isNotBlank() && prefs.getString("dismissed_task", "") == id
+    private fun current(id: String) = !destroyed && id.isNotBlank() && watched == id && !dismissed(id)
     private fun connect(id: String) {
-        if (watched != id || !active) return
+        if (!current(id) || !active) return
         reconnectScheduled = false
         val previous = socket; socket = null; previous?.cancel()
         val cursor = prefs.getLong("cursor:$id", 0)
         socket = client.newWebSocket(Request.Builder().url("ws://${apiHost()}:8000/ws/tasks/$id?after=$cursor").build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                prefs.edit().remove("connection_error").apply()
-                prefs.getString("pending_control:$id", null)?.let { control(id, it) }
+                handler.post {
+                    if (current(id) && socket === webSocket) {
+                        prefs.edit().remove("connection_error").apply()
+                        prefs.getString("pending_control:$id", null)?.let { control(id, it) }
+                    }
+                }
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (watched != id) return
-                try { update(JSONObject(text)) } catch (_: Exception) { reconnect(id) }
+                handler.post {
+                    if (current(id) && socket === webSocket)
+                        try { update(JSONObject(text)) } catch (_: Exception) { reconnect(id) }
+                }
             }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { if (socket === webSocket) reconnect(id) }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (socket === webSocket) reconnect(id) }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                handler.post { if (current(id) && socket === webSocket) reconnect(id) }
+            }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                handler.post { if (current(id) && socket === webSocket) reconnect(id) }
+            }
         })
     }
     private fun reconnect(id: String) {
-        if (watched != id || !active || reconnectScheduled) return
+        if (!current(id) || !active || reconnectScheduled) return
         reconnectScheduled = true
         prefs.edit().putString("connection_error", "连接暂时中断，正在恢复原任务。请检查电脑和 USB 连接。").apply()
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification("连接中断，正在恢复", latest))
-        handler.postDelayed({ if (watched == id && active) connect(id) }, 2500)
+        handler.postDelayed({ if (current(id) && active) connect(id) }, 2500)
     }
     private fun update(response: JSONObject) {
         val task = response.optJSONObject("task") ?: return
         val id = task.getString("id")
-        if (id != watched) return
+        if (!current(id)) return
         val old = latest
         if (old != null && old.optString("id") == id && old.optString("updated_at") > task.optString("updated_at")) return
         latest = task
@@ -97,35 +140,43 @@ class TaskConnectionService : Service() {
         prefs.edit().putString("live_task", task.toString()).putString("live_events", trimmed.toString()).putString("events_task", id)
             .putLong("cursor:$id", response.optLong("cursor", prefs.getLong("cursor:$id", 0))).remove("connection_error").apply()
         val message = task.optString("message")
-        handler.post { speak(message) }
+        speak(id, message)
         active = task.optString("state") !in terminal
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification(message, task))
         if (!active) {
             socket?.close(1000, "任务已结束")
-            handler.post { stopForeground(STOP_FOREGROUND_DETACH) }
-            handler.postDelayed({ if (!active && watched == id) stopSelf() }, 10000)
+            stopForeground(STOP_FOREGROUND_DETACH)
+            handler.postDelayed({ if (!active && current(id)) stopSelf() }, 10000)
         }
     }
     private fun control(id: String, action: String) {
+        if (!current(id) || latest?.optString("state") in terminal) return
         prefs.edit().putString("pending_control:$id", action).apply()
         val body = JSONObject().put("action", action).toString().toRequestBody("application/json; charset=utf-8".toMediaType())
         http.newCall(Request.Builder().url("http://${apiHost()}:8000/api/tasks/$id/control").post(body).build()).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                prefs.edit().putString("connection_error", "控制请求尚未送达，恢复连接后继续提交。").apply()
+                handler.post {
+                    if (current(id)) prefs.edit().putString("connection_error", "控制请求尚未送达，恢复连接后继续提交。").apply()
+                }
             }
             override fun onResponse(call: Call, response: Response) {
                 response.use {
                     try {
                         val result = JSONObject(it.body?.string().orEmpty())
-                        if (it.isSuccessful) { prefs.edit().remove("pending_control:$id").apply(); update(result) }
-                        else prefs.edit().putString("connection_error", result.optString("detail", "请打开助手查看任务状态")).apply()
+                        val successful = it.isSuccessful
+                        handler.post {
+                            if (current(id)) {
+                                if (successful) { prefs.edit().remove("pending_control:$id").apply(); update(result) }
+                                else prefs.edit().putString("connection_error", result.optString("detail", "请打开助手查看任务状态")).apply()
+                            }
+                        }
                     } catch (_: Exception) { }
                 }
             }
         })
     }
-    private fun speak(message: String) {
-        if (ttsReady && prefs.getBoolean("speak_enabled", false) && message.isNotBlank() && message != lastSpoken) {
+    private fun speak(id: String, message: String) {
+        if (current(id) && ttsReady && prefs.getBoolean("speak_enabled", false) && message.isNotBlank() && message != lastSpoken) {
             lastSpoken = message; tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "task-progress")
         }
     }
@@ -146,15 +197,25 @@ class TaskConnectionService : Service() {
         return builder.build()
     }
     override fun onDestroy() {
-        active = false; handler.removeCallbacksAndMessages(null); socket?.cancel(); client.dispatcher.cancelAll()
+        destroyed = true; active = false; ttsReady = false
+        handler.removeCallbacksAndMessages(null); socket?.cancel(); client.dispatcher.cancelAll()
         tts.stop(); tts.shutdown(); super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
     companion object {
         const val CHANNEL = "silverguide_tasks"
         const val NOTICE = 7001
+        private const val ACTION_DISMISS = "com.example.demo.DISMISS_TASK"
         fun watch(context: Context, taskId: String) {
+            if (taskId.isBlank() || context.getSharedPreferences("silverguide", 0).getString("dismissed_task", "") == taskId) return
             ContextCompat.startForegroundService(context, Intent(context, TaskConnectionService::class.java).putExtra("task_id", taskId))
+        }
+        fun dismiss(context: Context, taskId: String) {
+            if (taskId.isBlank()) return
+            context.getSharedPreferences("silverguide", 0).edit()
+                .putString("dismissed_task", taskId).remove("pending_control:$taskId").apply()
+            context.startService(Intent(context, TaskConnectionService::class.java)
+                .setAction(ACTION_DISMISS).putExtra("task_id", taskId))
         }
     }
 }

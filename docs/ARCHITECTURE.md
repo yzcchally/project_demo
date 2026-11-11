@@ -44,6 +44,59 @@ The model may propose only typed, observed preparation actions. Send and approva
 
 ## Background operation
 
+### In-App demonstration cases
+
+The companion exposes 11 cases, T02–T12, locally in `DemoCases.kt`. The normal
+category contains only T02: one complete QR-to-email demonstration, with no
+step-by-step card or separate normal subcases. T03 draft-change review belongs
+to the checks category; checks and recovery retain expandable instructions.
+The recommended filter contains T02, T04 and T12. T01 is no longer shown in the
+picker, while the backend still accepts all 12 historical case IDs.
+A small header entry opens `DemoCasePickerSheet`; selection fills a prompt with
+a fresh subject suffix, without starting a task. The user starts the complete
+normal flow once, and still approves the verified draft before sending.
+An active task cannot be replaced by a case selection. The client checks
+`/api/system/demo-capabilities` before enabling recovery demos.
+
+The completion dialog says “任务已完成，请点击确认”. It requires `completed` plus
+`webpage_verified` for an open-URL task, or `completed` plus `delivery_confirmed`
+for an email task after the receipt-confirmation request succeeds. A sent-record
+check alone does not trigger it; failure, cancellation and unknown outcomes do
+not trigger it. “确认，返回首页” clears the current input, selected demo, progress
+and form state and scrolls to the top, while retaining saved contacts, voice
+preferences and backend task history.
+
+Only explicit T12 metadata can arm the regular backend's per-task foreground-loss
+demo. `device/demo.py` registers the one-shot attempt before HOME and requires an
+actual non-composer observation. The scoped observer is restored on graph return;
+approval, sending and verification never arm the fault. Normal case metadata is
+observational only. The CLI driver shares the same injection primitive and task-ID
+deduplication rather than adding a separate recovery implementation.
+
+### Bounded recovery before sending
+
+`safety/recovery.py` classifies native dialogs by their observed ownership,
+container, title, content and unique enabled dismiss control. Only known
+informational/update hints can be dismissed. Sensitive, unknown or ambiguous
+dialogs stop execution; web content cannot authorize a native-dialog click.
+The adapter re-observes and re-classifies immediately before dismissal.
+
+The Huawei adapter waits for transient missing composer controls and may bring
+the recorded original composer activity back once. It never reopens `mailto:`
+as an automatic recovery action. The recipient and extra-recipient/attachment
+checks still apply after recovery; a changed approved draft requires new review.
+An unsuccessful field replacement can be retried once and is reported recovered
+only after its exact value is read back. Each browser/draft preparation stage
+has a budget of three recovery attempts, and every action checks pause/cancel.
+`send_once` is outside these loops: an uncertain send remains verification-only.
+
+Recovery events are written to the task's `recoveries.jsonl` and published
+through the existing durable task/event stream. Optional task fields are
+`recovery_count`, `last_recovery` and the most recent 20 `recovery_events`.
+The task retains its actual phase rather than creating a second approval path.
+See [recovery test cases](RECOVERY_TEST_CASES.md) and the explicitly labelled
+`tools/run_recovery_demo.py` real-phone foreground-loss injection driver.
+
 `TaskConnectionService` holds a WebSocket, persists its cursor and latest task, reconnects after interruption, and displays a foreground notification with pause/resume/cancel actions. TTS progress continues while another app is foreground. A control request is not announced as successful until acknowledged by the backend.
 
 The native scanner remains in the companion (ZXing). The original proposal's preference for an existing phone scanner is a documented implementation variation; course acceptance of this route is an external question. Mobilerun uses its local ADB backend, with Portal enhancements available when configured. No cloud-phone service is required.

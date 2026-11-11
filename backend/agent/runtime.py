@@ -151,6 +151,8 @@ class Engine:
         task = self._stage(task_id, "preparing_draft")
         self.device.prepare(task["draft"], self.checkpoint)
         self.device.verify_draft(task["draft"], self.checkpoint)
+        if task.get("demo_fault") and self.store.get(task_id).get("demo_fault_status") != "observed":
+            raise WorkflowError("恢复演示没有实际观察到页面中断，请重新选择演示案例后测试")
         self._stage(task_id, "awaiting_confirmation", draft_verified=True,
                     agent_decision=getattr(self.device, "agent_decision", None))
 
@@ -211,11 +213,17 @@ class Engine:
 
     def _work(self, function, task_id: str):
         try:
+            from device.demo import task_injection
             self.device.task_id = task_id
-            self.device.agent_models = self.models if self.store.get(task_id).get("agent_mode") else None
+            task = self.store.get(task_id)
+            self.device.agent_models = self.models if task.get("agent_mode") else None
+            self.device.recovery_callback = lambda event: self._device_recovery(task_id, event)
             self.current_task_id = task_id
             self.models.task_id = task_id
-            function(task_id)
+            with task_injection(self.device, task,
+                                before_inject=lambda event: self._demo_fault_registered(task_id, event),
+                                after_observed=lambda event: self._demo_fault_observed(task_id, event)):
+                function(task_id)
         except Exception as error:
             with self.lock:
                 task = self.store.get(task_id)
@@ -232,6 +240,38 @@ class Engine:
                 self.device.show_app()
             except Exception:
                 pass
+
+    def _demo_fault_registered(self, task_id, event):
+        with self.condition:
+            task = self.store.get(task_id)
+            if task.get("demo_fault_injected"):
+                return False
+            if self.cancelled or task["state"] in TERMINAL | {"interrupted"}:
+                raise Cancelled("任务已取消，中断演示未执行")
+            if task["send_attempts"] or task["state"] != "preparing_draft":
+                raise WorkflowError("仅可在草稿准备阶段执行中断演示")
+            task.update(demo_fault_injected=True, demo_fault_status="registered", demo_fault_event=dict(event))
+            self.store.save(task, "恢复演示：已登记本次页面中断，正在切到桌面")
+            return True
+
+    def _demo_fault_observed(self, task_id, event):
+        with self.condition:
+            task = self.store.get(task_id)
+            task.update(demo_fault_status="observed", demo_fault_event=dict(event))
+            if task["state"] not in TERMINAL | {"interrupted"}:
+                self.store.save(task, "恢复演示：已观察到离开写信页，正在恢复原草稿")
+
+    def _device_recovery(self, task_id, event):
+        """Publish observed recovery steps without changing approval or effect state."""
+        with self.condition:
+            task = self.store.get(task_id)
+            if self.cancelled or task["state"] in TERMINAL | {"interrupted", "paused"}:
+                return
+            if event["outcome"] == "attempting":
+                task["recovery_count"] = task.get("recovery_count", 0) + 1
+            task["last_recovery"] = dict(event)
+            task["recovery_events"] = (task.get("recovery_events", []) + [dict(event)])[-20:]
+            self.store.save(task, event["message"])
 
     def control(self, task_id: str, action: str) -> dict:
         with self.condition:
@@ -307,15 +347,22 @@ class Engine:
         tasks = self.store.all()
         return tasks[0] if tasks else None
 
-    def create_goal(self, instruction, request_key, assistance_mode="silverguide", scenario_id=None, third_party_assistance=None):
+    def create_goal(self, instruction, request_key, assistance_mode="silverguide", scenario_id=None, third_party_assistance=None,
+                    demo_case_id=None, demo_fault=None):
+        from api.schemas import validate_demo_request
+        try:
+            validate_demo_request(demo_case_id, demo_fault)
+        except ValueError as error:
+            raise WorkflowError(str(error)) from None
         instruction = instruction.strip()
         if not instruction or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", request_key):
             raise WorkflowError("请说出或填写需要完成的任务")
         with self.lock:
             for old in self.store.all():
                 if old["request_key"] == request_key:
-                    if old.get("instruction") != instruction:
-                        raise WorkflowError("同一请求编号不能对应不同需求")
+                    if (old.get("instruction") != instruction or old.get("demo_case_id") != demo_case_id
+                            or old.get("demo_fault") != demo_fault):
+                        raise WorkflowError("同一请求编号不能对应不同需求或演示配置")
                     return old
             if self.active() or self.worker and self.worker.is_alive():
                 raise WorkflowError("请先完成或取消当前任务")
@@ -327,6 +374,8 @@ class Engine:
                     "webpage_verified": False, "draft_verified": False, "sent_record_verified": False,
                     "delivery_confirmed": False, "graph_run": 1, "agent_mode": True,
                     "assistance_mode": assistance_mode, "scenario_id": scenario_id, "third_party_assistance": third_party_assistance,
+                    "demo_case_id": demo_case_id, "demo_fault": demo_fault,
+                    "demo_fault_injected": False,
                     "environment": "real_device" if self.device.__class__.__module__.startswith("device.") else "test_double",
                     "approval_nonce": secrets.token_urlsafe(24), "scan_nonce": secrets.token_urlsafe(24)}
             self.store.save(task, MESSAGES["understanding"])
@@ -340,6 +389,8 @@ class Engine:
         task = self.store.get(task_id)
         if intent.task_type == "unsupported":
             raise WorkflowError("目前支持扫码、打开网页和邮件分享，请换一个相关需求")
+        if task.get("demo_fault") and intent.task_type == "open_url":
+            raise WorkflowError("恢复演示需要邮件草稿场景，请使用内置恢复案例")
         instruction = task["instruction"]
         emails = re.findall(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}", instruction)
         alias = intent.recipient_alias if intent.recipient_alias and intent.recipient_alias in instruction else ""
