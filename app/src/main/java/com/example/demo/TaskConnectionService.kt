@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Build
 import android.os.IBinder
@@ -35,10 +36,14 @@ class TaskConnectionService : Service() {
     private var reconnectScheduled = false
     private var destroyed = false
     private lateinit var tts: TextToSpeech
-    private val terminal = setOf("completed", "failed", "cancelled", "outcome_unknown", "interrupted")
+    private val terminal = setOf("completed", "partial", "no_route", "failed", "cancelled", "outcome_unknown", "interrupted")
 
+    private val speechListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "route_speech_active" && prefs.getBoolean("route_speech_active", false)) handler.post { if (!destroyed) tts.stop() }
+    }
     override fun onCreate() {
         super.onCreate()
+        prefs.registerOnSharedPreferenceChangeListener(speechListener)
         if (Build.VERSION.SDK_INT >= 26)
             getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL, "小银助手任务", NotificationManager.IMPORTANCE_LOW))
         tts = TextToSpeech(this) { code ->
@@ -144,7 +149,7 @@ class TaskConnectionService : Service() {
         active = task.optString("state") !in terminal
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification(message, task))
         if (!active) {
-            socket?.close(1000, "任务已结束")
+            socket?.close(1000, "任务已结束"); socket = null
             stopForeground(STOP_FOREGROUND_DETACH)
             handler.postDelayed({ if (!active && current(id)) stopSelf() }, 10000)
         }
@@ -176,7 +181,7 @@ class TaskConnectionService : Service() {
         })
     }
     private fun speak(id: String, message: String) {
-        if (current(id) && ttsReady && prefs.getBoolean("speak_enabled", false) && message.isNotBlank() && message != lastSpoken) {
+        if (current(id) && ttsReady && !prefs.getBoolean("route_speech_active", false) && prefs.getBoolean("speak_enabled", false) && message.isNotBlank() && message != lastSpoken) {
             lastSpoken = message; tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "task-progress")
         }
     }
@@ -198,6 +203,7 @@ class TaskConnectionService : Service() {
     }
     override fun onDestroy() {
         destroyed = true; active = false; ttsReady = false
+        prefs.unregisterOnSharedPreferenceChangeListener(speechListener)
         handler.removeCallbacksAndMessages(null); socket?.cancel(); client.dispatcher.cancelAll()
         tts.stop(); tts.shutdown(); super.onDestroy()
     }

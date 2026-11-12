@@ -9,7 +9,8 @@ from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from workflow import WorkflowError, get_engine, validate_url
-from api.schemas import GoalRequest, HumanReply, QRReply, Contact
+from api.schemas import (GoalRequest, HumanReply, QRReply, Contact, DEMO_CASE_IDS,
+                         TransitClarification, TransitPlaceChoice, TransitRequery, TransitQuestion, TransitQueryRef)
 from api.events import hub
 
 START_LOCK = threading.RLock()
@@ -37,7 +38,7 @@ class Control(BaseModel):
 def reply(function):
     try:
         task = function()
-        return {"ok": True, "task": task, "message": task["message"] if task else "还没有邮件任务"}
+        return {"ok": True, "task": task, "message": task["message"] if task else "还没有任务"}
     except WorkflowError as error:
         raise HTTPException(status_code=409, detail=str(error)) from None
 
@@ -148,7 +149,40 @@ def register(app):
     @app.get("/api/system/demo-capabilities")
     def demo_capabilities():
         return {"ok": True, "recovery_supported": True,
-                "case_ids": [f"T{number:02}" for number in range(1, 13)]}
+                "case_ids": list(DEMO_CASE_IDS)}
+
+    @app.post("/api/tasks/{task_id}/transit/clarify")
+    def clarify_transit(task_id: str, body: TransitClarification):
+        return reply(lambda: get_engine().clarify_transit(task_id, body.model_dump(exclude_none=True)))
+
+    @app.post("/api/tasks/{task_id}/transit/place")
+    def choose_transit_place(task_id: str, body: TransitPlaceChoice):
+        return reply(lambda: get_engine().choose_transit_place(task_id, body.model_dump()))
+
+    @app.post("/api/tasks/{task_id}/transit/requery")
+    def requery_transit(task_id: str, body: TransitRequery):
+        import recognize
+        import gmail_demo
+        with START_LOCK:
+            if recognize.running() or gmail_demo.running():
+                raise HTTPException(409, "请先停止基础 AI 操作，再查询路线")
+            return reply(lambda: get_engine().requery_transit(task_id, body.model_dump(exclude_none=True)))
+
+    @app.post("/api/tasks/{task_id}/transit/ask")
+    def ask_transit(task_id: str, body: TransitQuestion):
+        try:
+            return get_engine().ask_transit(task_id, body.query_id, body.question)
+        except WorkflowError as error:
+            raise HTTPException(409, detail=str(error)) from None
+
+    @app.post("/api/tasks/{task_id}/transit/show")
+    def show_transit(task_id: str, body: TransitQueryRef):
+        import recognize
+        import gmail_demo
+        with START_LOCK:
+            if recognize.running() or gmail_demo.running():
+                raise HTTPException(409, "请先停止基础 AI 操作，再查看高德")
+            return reply(lambda: get_engine().show_transit(task_id, body.query_id))
 
     @app.get("/api/evaluation")
     def evaluation():

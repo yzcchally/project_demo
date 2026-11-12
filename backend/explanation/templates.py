@@ -7,4 +7,9 @@ DETAILS = {
 
 
 def explain(task):
+    if task.get("task_type") == "plan_transit":
+        if task.get("transit_result"):
+            from transit.explain import explain_result
+            return explain_result(task["transit_result"])
+        return task["message"] + "\n小银只读取本次高德页面，不猜测起点、分馆、线路方向或出口。定位无法核实时请填写明确起点。"
     return task["message"] + "\n" + DETAILS.get(task["state"], "小银会在关键步骤重新读取手机界面，核对通过才继续。您可以暂停或取消任务。")

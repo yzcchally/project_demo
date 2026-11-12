@@ -2,6 +2,7 @@
 import json
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
+from typing import get_args
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +10,7 @@ from pydantic import ValidationError
 
 import gmail_demo
 from agent.runtime import Engine
-from api.schemas import DEMO_CASE_IDS, GoalRequest, TaskIntent
+from api.schemas import DEMO_CASE_IDS, DemoCaseId, GoalRequest, TaskIntent
 from device.demo import install_injection, task_injection
 from domain import Cancelled, WorkflowError
 from storage.tasks import Store
@@ -109,7 +110,7 @@ def test_request_case_and_fault_are_explicitly_paired(case_id):
 
 @pytest.mark.parametrize("case_id,fault", [
     (None, "composer-background"), ("T03", "composer-background"), ("T12", None),
-    ("T13", None), ("T12", "send"), ("T12", "approve"), ("T12", "shell"),
+    ("T21", None), ("T99", None), ("T12", "send"), ("T12", "approve"), ("T12", "shell"),
 ])
 def test_invalid_demo_configuration_cannot_create_a_request_or_task(engine, case_id, fault):
     with pytest.raises(ValidationError):
@@ -207,7 +208,8 @@ def test_demo_api_accepts_case_metadata_and_invalid_fault_is_rejected_before_exe
 def test_demo_capabilities_advertise_supported_case_ids_without_starting_a_task():
     data = TestClient(gmail_demo.app).get("/api/system/demo-capabilities").json()
     assert data["ok"] and data["recovery_supported"]
-    assert data["case_ids"] == list(DEMO_CASE_IDS)
+    assert data["case_ids"] == list(DEMO_CASE_IDS) == [f"T{number:02}" for number in range(1, 21)]
+    assert tuple(get_args(DemoCaseId)) == DEMO_CASE_IDS
 
 
 @pytest.mark.parametrize("cli_first", [True, False])
@@ -282,3 +284,31 @@ def test_injection_is_never_installed_into_send_or_result_verification(tmp_path,
         assert device.observe == observer
         assert device.observe() != HOME
     assert device.home_calls == 0
+
+
+
+@pytest.mark.parametrize("case_id", [f"T{number:02}" for number in range(15, 21)])
+def test_new_map_demo_metadata_is_ordinary_route_input_not_a_fault_driver(engine, case_id):
+    instruction = "在广州，从家里去广东省博物馆，坐公交。"
+    engine.models.understand = lambda text, aliases: TaskIntent(task_type="plan_transit", transit={
+        "origin": "家里", "destination": "广东省博物馆", "city": "广州"})
+    with patch("workflow_api.get_engine", return_value=engine):
+        client = TestClient(gmail_demo.app)
+        payload = {"instruction": instruction, "request_key": "map-demo-" + case_id, "demo_case_id": case_id}
+        invalid = client.post("/api/tasks", json={**payload, "demo_fault": "composer-background"})
+        assert invalid.status_code == 422 and engine.store.all() == []
+        valid = client.post("/api/tasks", json=payload)
+        assert valid.status_code == 200
+        task = settle(engine, valid.json()["task"])
+    assert task["demo_case_id"] == case_id and task["task_type"] == "plan_transit"
+    assert task["state"] == "needs_clarification" and task["clarification_fields"] == ["origin"]
+    assert task["demo_fault"] is None and not task["demo_fault_injected"]
+    assert not engine.device.calls and engine.device.home_calls == task["send_attempts"] == 0
+
+
+@pytest.mark.parametrize("case_id", [f"T{number:02}" for number in range(15, 21)])
+def test_new_map_ids_cannot_enable_recovery_fault_through_the_engine(engine, case_id):
+    with pytest.raises(WorkflowError):
+        engine.create_goal("从家里去博物馆坐地铁", "map-fault-" + case_id, demo_case_id=case_id,
+                           demo_fault="composer-background")
+    assert not engine.store.all() and engine.device.home_calls == 0

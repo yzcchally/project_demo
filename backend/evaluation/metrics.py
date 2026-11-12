@@ -9,6 +9,14 @@ SCENARIOS = {"N01": "扫码分享", "N02": "第二个二维码", "N03": "分享�
 
 
 def outcome(task):
+    if task.get("task_type") == "plan_transit":
+        result = task.get("transit_result") or {}
+        if task["state"] == "completed":
+            return "SUCCESS" if (task.get("route_verified") and result.get("route_verified") and
+                result.get("classification") == "COMPLETE" and result.get("query_id") == task.get("query_id") and
+                result.get("task_id") == task.get("id")) else "UNKNOWN"
+        if task["state"] == "partial": return "PARTIAL"
+        if task["state"] == "no_route": return "NO_ROUTE"
     if task["state"] == "completed":
         evidence = (task.get("webpage_verified") if task.get("task_type") == "open_url"
                     else task.get("sent_record_verified") or task.get("delivery_confirmed"))
@@ -78,5 +86,5 @@ def build_report(store):
         "by_stage": dict(Counter(c.get("stage", "unknown") for c in calls)),
         "mean_latency_ms": sum(latencies) / len(latencies) if latencies else None,
         "recorded_tokens": sum(c.get("tokens") or 0 for c in calls), "malformed_log_lines": damaged}
-    report["records"] = [{"task_id": t["id"], "state": t["state"], "send_attempts": t["send_attempts"], "scenario_id": t.get("scenario_id")} for t in tasks]
+    report["records"] = [{"task_id": t["id"], "state": t["state"], "send_attempts": t["send_attempts"], "scenario_id": t.get("scenario_id"), "task_type": t.get("task_type"), "query_id": t.get("query_id"), "route_verified": t.get("route_verified")} for t in tasks]
     return report

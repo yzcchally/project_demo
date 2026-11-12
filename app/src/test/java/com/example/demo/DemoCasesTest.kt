@@ -5,15 +5,15 @@ import org.junit.Test
 
 class DemoCasesTest {
     @Test fun visibleCasesHaveUniqueStableIdsWithoutTheOldWebOnlyCase() {
-        assertEquals((2..12).map { "T%02d".format(it) }, DemoCases.all.map { it.id })
-        assertEquals(11, DemoCases.all.map { it.id }.toSet().size)
+        assertEquals((2..20).map { "T%02d".format(it) }, DemoCases.all.map { it.id })
+        assertEquals(19, DemoCases.all.map { it.id }.toSet().size)
         DemoCases.all.forEach { assertEquals(it, DemoCases.find(it.id)) }
         assertNull(DemoCases.find("T01"))
         assertNull(DemoCases.find("not-a-case"))
     }
 
     @Test fun theSingleNormalDemoIsContinuousAndOtherCasesKeepTheirSteps() {
-        val normalCases = DemoCases.all.filter { it.category == DemoCategory.SUCCESS }
+        val normalCases = DemoCases.visible(DemoDomain.MAIL, DemoFilter.SUCCESS)
         assertEquals(listOf("T02"), normalCases.map { it.id })
         assertEquals("完整扫码发信演示", normalCases.single().title)
         assertTrue(normalCases.single().steps.isEmpty())
@@ -23,6 +23,7 @@ class DemoCasesTest {
             assertTrue(it.summary.isNotBlank())
             assertTrue(it.promptTemplate.isNotBlank())
             if (it.category != DemoCategory.SUCCESS) assertTrue(it.steps.size in 3..5)
+            else assertTrue(it.steps.isEmpty())
             assertTrue(it.steps.all(String::isNotBlank))
             assertTrue(it.expected.isNotBlank())
         }
@@ -85,13 +86,53 @@ class DemoCasesTest {
     }
 
     @Test fun recommendedCasesCoverNormalClarificationAndRecovery() {
-        assertEquals(setOf("T02", "T04", "T12"),
+        assertEquals(setOf("T02", "T04", "T12", "T13", "T15", "T18"),
             DemoCases.all.filter { it.recommended }.map { it.id }.toSet())
     }
 
     @Test fun runLabelsDoNotChangePromptsWithoutASubject() {
         val example = DemoCases.find("T06")!!
         assertEquals(example.promptTemplate, DemoCases.promptFor(example, "RUN-A"))
+    }
+
+    @Test fun routeExamplesStaySeparateFromMailAndFaultInjection() {
+        val routes = DemoCases.all.filter { it.domain == DemoDomain.MAP }
+        assertEquals((13..20).map { "T%02d".format(it) }, routes.map { it.id })
+        routes.forEach {
+            assertNull(it.recoveryFault)
+            assertFalse(it.requiresQr)
+            assertFalse(it.promptTemplate.contains("主题是"))
+            assertEquals("查询公交地铁路线", it.startLabel)
+        }
+        assertTrue(routes.first().promptTemplate.contains("从广州塔地铁站"))
+        assertTrue(DemoCases.find("T14")!!.promptTemplate.contains("当前位置"))
+    }
+
+    @Test fun bothDomainsOfferNormalExceptionsAndRecoveryWithoutMixingCases() {
+        val expected = mapOf(
+            DemoFilter.RECOMMENDED to listOf("T13", "T15", "T18"),
+            DemoFilter.SUCCESS to listOf("T13", "T14"),
+            DemoFilter.CHECKS to listOf("T15", "T16", "T17"),
+            DemoFilter.RECOVERY to listOf("T18", "T19", "T20"),
+        )
+        expected.forEach { (filter, ids) ->
+            assertEquals(ids, DemoCases.visible(DemoDomain.MAP, filter).map { it.id })
+            assertTrue(DemoCases.visible(DemoDomain.MAIL, filter).all { it.domain == DemoDomain.MAIL })
+        }
+        assertEquals(listOf("T02", "T04", "T12"), DemoCases.visible(DemoDomain.MAIL, DemoFilter.RECOMMENDED).map { it.id })
+        assertEquals(listOf("T12"), DemoCases.visible(DemoDomain.MAIL, DemoFilter.RECOVERY).map { it.id })
+    }
+
+    @Test fun mapRecoveryExamplesDescribeRealUserActionsInsteadOfRequestingAFakeFault() {
+        val clarify = DemoCases.find("T18")!!
+        assertTrue(clarify.promptTemplate.contains("从家里"))
+        assertTrue(clarify.steps.any { it.contains("体育西路地铁站") })
+        val network = DemoCases.find("T20")!!
+        assertTrue(network.steps.any { "本人" in it && "关闭" in it })
+        assertTrue(network.steps.any { "故障未复现" in it })
+        assertTrue(network.steps.any { "重新查询" in it })
+        assertFalse(network.promptTemplate.contains("断网"))
+        assertEquals("开始完整演示", DemoCases.find("T02")!!.startLabel)
     }
 
     @Test(expected = IllegalArgumentException::class)

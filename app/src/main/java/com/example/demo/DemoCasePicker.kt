@@ -28,6 +28,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -36,12 +37,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-
-private enum class DemoFilter(val label: String) {
-    RECOMMENDED("推荐"), SUCCESS("正常"), CHECKS("异常"), RECOVERY("恢复")
-}
 
 /** Browse examples without replacing an active task or starting an operation. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -53,22 +51,17 @@ fun DemoCasePickerSheet(
     recoverySupported: Boolean,
     recoveryStatus: String,
 ) {
+    var domainName by rememberSaveable { mutableStateOf<String?>(null) }
+    val domain = DemoDomain.entries.firstOrNull { it.name == domainName }
     var filterName by rememberSaveable { mutableStateOf(DemoFilter.RECOMMENDED.name) }
     val filter = DemoFilter.valueOf(filterName)
-    val cases = DemoCases.all.filter { case ->
-        when (filter) {
-            DemoFilter.RECOMMENDED -> case.recommended
-            DemoFilter.SUCCESS -> case.category == DemoCategory.SUCCESS
-            DemoFilter.CHECKS -> case.category == DemoCategory.CHECKS
-            DemoFilter.RECOVERY -> case.category == DemoCategory.RECOVERY
-        }
-    }
+    val cases = domain?.let { DemoCases.visible(it, filter) }.orEmpty()
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
     ) {
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.9f)) {
+        Column(Modifier.fillMaxWidth().fillMaxHeight(if (domain == null) .5f else .9f)) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 24.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -77,7 +70,7 @@ fun DemoCasePickerSheet(
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("演示案例", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "选好案例，填入后再由您开始",
+                        if (domain == null) "先选择演示类型" else "选好案例，填入后再由您开始",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -86,8 +79,45 @@ fun DemoCasePickerSheet(
             }
 
             Row(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                DemoDomain.entries.forEach { item ->
+                    FilterChip(
+                        selected = domain == item,
+                        onClick = {
+                            if (domainName != item.name) {
+                                domainName = item.name
+                                filterName = DemoFilter.RECOMMENDED.name
+                            }
+                        },
+                        modifier = Modifier.weight(1f).heightIn(min = 80.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        label = {
+                            Column(
+                                Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Text(item.title, fontSize = 20.sp, textAlign = TextAlign.Center)
+                                Text(item.subtitle, fontSize = 14.sp, textAlign = TextAlign.Center)
+                            }
+                        },
+                    )
+                }
+            }
+
+            if (domain != null) Text(
+                if (domain == DemoDomain.MAP) "公交地铁路线的完整查询、异常处理和恢复测试。"
+                else "扫码、网页与邮件流程，含异常和控制测试。",
+                modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 12.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            if (domain != null) Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 24.dp, vertical = 12.dp),
+                    .padding(start = 24.dp, end = 24.dp, bottom = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 DemoFilter.entries.forEach { item ->
@@ -115,19 +145,30 @@ fun DemoCasePickerSheet(
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth().weight(1f),
-                contentPadding = PaddingValues(start = 20.dp, top = 16.dp, end = 20.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                items(cases, key = { it.id }) { case ->
-                    DemoCaseChoice(
-                        case = case,
-                        canSelect = canSelect,
-                        recoverySupported = recoverySupported,
-                        recoveryStatus = recoveryStatus,
-                        onSelect = { onSelect(case) },
+            if (domain == null) {
+                Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("您想演示哪一种任务？", fontSize = 22.sp)
+                    Text(
+                        "点击上方按钮查看对应案例。选择类型和浏览案例都不会启动任务。",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            } else key(domain, filter) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    contentPadding = PaddingValues(start = 20.dp, top = 16.dp, end = 20.dp, bottom = 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    items(cases, key = { it.id }) { case ->
+                        DemoCaseChoice(
+                            case = case,
+                            canSelect = canSelect,
+                            recoverySupported = recoverySupported,
+                            recoveryStatus = recoveryStatus,
+                            onSelect = { onSelect(case) },
+                        )
+                    }
                 }
             }
         }

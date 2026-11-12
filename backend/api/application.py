@@ -37,8 +37,13 @@ def create_app():
     @app.post("/recognize/start")
     def start_recognize(body: dict = Body()):
         with START_LOCK:
-            if get_engine().active():
+            engine = get_engine()
+            if engine.active():
                 return legacy._message(False, "请先完成或取消当前任务")
+            # A completed snapshot can precede the worker's final show_app /
+            # cleanup. Do not give the old AI loop the phone during that gap.
+            if engine.worker and engine.worker.is_alive():
+                return legacy._message(False, "手机还有操作正在结束，请稍后再试")
             return recognize.start(legacy._dump_screen_xml, str(body.get("prompt", "")))
 
     @app.get("/recognize/status")

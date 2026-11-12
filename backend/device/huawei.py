@@ -179,7 +179,7 @@ class HuaweiDevice:
                     with (folder / f"screen-{time.time_ns()}-{uuid.uuid4().hex}.xml").open("x", encoding="utf-8") as saved:
                         saved.write(xml)
                 return xml
-            except (OSError, RuntimeError, subprocess.TimeoutExpired, ET.ParseError):
+            except (OSError, RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ET.ParseError):
                 if attempt == 2:
                     raise WorkflowError("连续三次无法读取手机界面，请检查 USB 连接并解锁手机") from None
                 checkpoint()

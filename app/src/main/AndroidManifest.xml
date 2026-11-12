@@ -10,6 +10,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <queries>
+        <package android:name="com.autonavi.minimap" />
         <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
         <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
@@ -66,6 +67,13 @@
                 <action android:name="com.example.demo.A11Y_COMMAND" />
             </intent-filter>
         </receiver>
+
+        <provider
+            android:name=".TransitBridgeProvider"
+            android:authorities="com.example.demo.transit"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:grantUriPermissions="false" />
     </application>
 
 </manifest>

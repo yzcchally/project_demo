@@ -12,8 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-TERMINAL = {"completed", "failed", "cancelled", "outcome_unknown"}
+TERMINAL = {"completed", "failed", "cancelled", "outcome_unknown", "partial", "no_route"}
 MESSAGES = {
+    "planning_transit": "正在高德查询公交地铁路线", "reading_transit": "正在展开并核对路线各段",
+    "validating_transit": "正在校验本次高德路线及分段证据",
+    "awaiting_place_choice": "请选择本次明确的地点", "viewing_transit": "正在回到高德查看路线",
+    "partial": "路线只读取了一部分，请核对缺失信息", "no_route": "高德当前没有可用公共交通方案",
     "understanding": "正在理解您的需求", "needs_clarification": "请补充收件信息",
     "awaiting_qr": "请将镜头对准二维码，小银会继续打开并分享网页",
     "preparing": "正在准备任务", "opening_webpage": "正在打开并核对扫码网址",

@@ -6,6 +6,15 @@ enum class DemoCategory(val label: String) {
     RECOVERY("异常恢复"),
 }
 
+enum class DemoDomain(val title: String, val subtitle: String) {
+    MAP("地图查询", "公交地铁路线"),
+    MAIL("邮件案例", "扫码与发信"),
+}
+
+enum class DemoFilter(val label: String) {
+    RECOMMENDED("推荐"), SUCCESS("正常"), CHECKS("异常"), RECOVERY("恢复")
+}
+
 data class DemoCase(
     val id: String,
     val title: String,
@@ -17,7 +26,14 @@ data class DemoCase(
     val requiresQr: Boolean = false,
     val recoveryFault: String? = null,
     val recommended: Boolean = false,
-)
+    val domain: DemoDomain = DemoDomain.MAIL,
+) {
+    val startLabel: String get() = when {
+        domain == DemoDomain.MAP -> "查询公交地铁路线"
+        category == DemoCategory.SUCCESS -> "开始完整演示"
+        else -> "让小银完成这个任务"
+    }
+}
 
 /** Local examples only. Choosing one prepares text; it never starts a task. */
 object DemoCases {
@@ -174,9 +190,130 @@ object DemoCases {
             recoveryFault = "composer-background",
             recommended = true,
         ),
+        DemoCase(
+            id = "T13",
+            title = "高德公交地铁路线",
+            summary = "用明确起终点查询真实高德路线，回小银查看大字分步讲解和朗读。城市及地点可在输入框修改，也可展开首页路线表单重新填写。",
+            category = DemoCategory.SUCCESS,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从广州塔地铁站去体育西路地铁站，坐地铁或公交，尽量少换乘。",
+            steps = emptyList(),
+            expected = "真实打开高德并读取路线详情；完整核对后展示步骤，信息不全会明确标注。",
+            recommended = true,
+        ),
+        DemoCase(
+            id = "T14",
+            title = "当前位置完整查询",
+            summary = "开始一次任务，从高德核对真实当前位置，查询前往博物馆的公交地铁路线，再回小银查看步骤和朗读；定位不可用时请您补充起点。",
+            category = DemoCategory.SUCCESS,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从当前位置去广东省博物馆，坐地铁或公交，选择高德推荐方案。",
+            steps = emptyList(),
+            expected = "使用真实位置或停下来澄清，不把演示地址冒充当前位置。",
+        ),
+        DemoCase(
+            id = "T15",
+            title = "出发地不明确",
+            summary = "没有绑定家庭地址时，检查小银是否先询问起点。",
+            category = DemoCategory.CHECKS,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从家里去广东省博物馆，坐地铁或公交。",
+            steps = listOf(
+                "填入案例并开始，保留提示词中的“家里”。",
+                "观察小银是否要求填写明确出发地。",
+                "本轮只检查澄清提示，查看后取消任务。",
+            ),
+            expected = "先询问起点地址，不把“家里”替换成当前位置或演示站点。",
+            recommended = true,
+        ),
+        DemoCase(
+            id = "T16",
+            title = "目的地不明确",
+            summary = "没有绑定家庭地址时，检查小银是否先询问目的地。",
+            category = DemoCategory.CHECKS,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从体育西路地铁站去我家，坐地铁或公交。",
+            steps = listOf(
+                "填入案例并开始，保留提示词中的“我家”。",
+                "观察小银是否要求填写明确目的地，并保留已提供的出发地。",
+                "本轮只检查缺失信息，查看后取消任务。",
+            ),
+            expected = "询问目的地地址，不猜测家庭位置，也不擅自选择同名地点。",
+        ),
+        DemoCase(
+            id = "T17",
+            title = "取消路线查询",
+            summary = "在查询途中取消，检查后续操作和旧结果是否停止。",
+            category = DemoCategory.CHECKS,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从广州塔地铁站去公园前地铁站，坐地铁或公交，选择高德推荐方案。",
+            steps = listOf(
+                "开始任务，等高德打开并进入地点或路线查询。",
+                "下拉小银助手通知，点击“取消”。",
+                "回到小银查看取消状态；已经发出的调用可能需要等返回后停止。",
+                "观察取消后是否不再点击高德、不提交迟到的路线结果。",
+            ),
+            expected = "任务变为已取消，后续检查点停止操作；不把迟到回包显示为新完成结果。",
+        ),
+        DemoCase(
+            id = "T18",
+            title = "补充起点后继续",
+            summary = "先触发起点澄清，再在手机补充公共站点，继续同一条路线任务。",
+            category = DemoCategory.RECOVERY,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从家里去广东省博物馆，坐地铁或公交，选择高德推荐方案。",
+            steps = listOf(
+                "开始任务，等待小银询问明确出发地。",
+                "在出发地填写“体育西路地铁站”，核对城市和目的地仍为广州市、广东省博物馆。",
+                "点击“补充好了，继续查询”，让任务继续打开高德。",
+                "回小银核对真实路线、步骤卡片和朗读；本轮使用的是本人补充的明确起点。",
+            ),
+            expected = "补充信息后继续原任务并重新核对路线；明确起点不会被当作 GPS 定位。",
+            recommended = true,
+        ),
+        DemoCase(
+            id = "T19",
+            title = "暂停后继续查询",
+            summary = "手动暂停和继续，检查旧控件失效后是否重新观察页面。",
+            category = DemoCategory.RECOVERY,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从流花地铁站去广州东站地铁站，坐地铁或公交，尽量少换乘。",
+            steps = listOf(
+                "开始任务，等高德打开后，从小银通知点击“暂停”。",
+                "观察暂停状态，等待几秒，保持手机页面不变，暂时不要点按高德。",
+                "从通知点击“继续”，等待当前调用返回并重新核对页面。",
+                "检查继续后的路线；若页面无法安全恢复，应明确提示重新查询，再按提示重查。",
+            ),
+            expected = "暂停时停止推进；继续时重新观察，不沿用暂停前控件，无法安全继续时保留明确重查入口。",
+        ),
+        DemoCase(
+            id = "T20",
+            title = "恢复网络后重查",
+            summary = "需本人手动准备手机断网，观察真实失败提示，恢复网络后再查询。",
+            category = DemoCategory.RECOVERY,
+            domain = DemoDomain.MAP,
+            promptTemplate = "在广州市，从体育西路地铁站去广东省博物馆，坐地铁或公交，选择高德推荐方案。",
+            steps = listOf(
+                "本人在手机关闭 Wi-Fi 和移动数据；电脑后端保持联网，USB 连接保持正常。",
+                "开始任务，观察高德是否出现网络错误；若缓存仍返回结果，说明本次故障未复现。",
+                "本人恢复手机网络，确认高德可以正常搜索。",
+                "回小银等待旧任务停止，再点击“重新查询”，等待新查询重新读取真实页面。",
+                "核对新的查询时间和结果；成功、部分读取或失败均按实际状态记录。",
+            ),
+            expected = "故障复现时显示真实原因；网络恢复后以新查询重新核对，不把旧结果当成新成功。",
+        ),
     )
 
     fun find(id: String): DemoCase? = all.firstOrNull { it.id == id }
+
+    fun visible(domain: DemoDomain, filter: DemoFilter): List<DemoCase> = all.filter { example ->
+        example.domain == domain && when (filter) {
+            DemoFilter.RECOMMENDED -> example.recommended
+            DemoFilter.SUCCESS -> example.category == DemoCategory.SUCCESS
+            DemoFilter.CHECKS -> example.category == DemoCategory.CHECKS
+            DemoFilter.RECOVERY -> example.category == DemoCategory.RECOVERY
+        }
+    }
 
     fun promptFor(case: DemoCase, runLabel: String): String {
         require(runLabel.isNotBlank()) { "演示编号不能为空" }

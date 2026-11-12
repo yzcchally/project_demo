@@ -23,6 +23,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.journeyapps.barcodescanner.ScanContract
@@ -40,7 +41,7 @@ import java.net.URL
 import java.util.Locale
 import java.util.UUID
 
-private val terminalStates = setOf("completed", "failed", "cancelled", "outcome_unknown", "interrupted")
+private val terminalStates = setOf("completed", "partial", "no_route", "failed", "cancelled", "outcome_unknown", "interrupted")
 
 internal fun apiHost(): String {
     val emulator = android.os.Build.FINGERPRINT.let { it.contains("generic") || it.contains("emulator") }
@@ -95,6 +96,7 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     var scanOwner by rememberSaveable { mutableStateOf("") }
     var scanNonce by rememberSaveable { mutableStateOf("") }
     var manualMode by rememberSaveable { mutableStateOf(false) }
+    var transitFormOpen by rememberSaveable { mutableStateOf(false) }
     var contactsOpen by rememberSaveable { mutableStateOf(false) }
     var contactAlias by rememberSaveable { mutableStateOf("") }
     var contactAddress by rememberSaveable { mutableStateOf("") }
@@ -122,20 +124,47 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     DisposableEffect(tts) {
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) { scope.launch { speechStatus = "正在播报。" } }
-            override fun onDone(utteranceId: String?) { scope.launch { speechStatus = "语音播报已完成。" } }
+            override fun onDone(utteranceId: String?) { scope.launch {
+                if (utteranceId == "route:" + prefs.getString("route_speech_query", ""))
+                    prefs.edit().remove("route_speech_query").remove("route_speech_task").putBoolean("route_speech_active", false).apply()
+                speechStatus = "语音播报已完成。"
+            } }
             @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) { scope.launch { speechStatus = "本次播报未完成，请查看文字。" } }
+            override fun onError(utteranceId: String?) { scope.launch {
+                if (utteranceId == "route:" + prefs.getString("route_speech_query", ""))
+                    prefs.edit().remove("route_speech_query").remove("route_speech_task").putBoolean("route_speech_active", false).apply()
+                speechStatus = "本次播报未完成，请查看文字。"
+            } }
         })
-        onDispose { tts.stop(); tts.shutdown() }
+        onDispose { prefs.edit().remove("route_speech_query").remove("route_speech_task").putBoolean("route_speech_active", false).apply(); tts.stop(); tts.shutdown() }
     }
     LaunchedEffect(ttsReady) {
         if (ttsReady) { ttsSupported = tts.setLanguage(Locale.SIMPLIFIED_CHINESE) >= 0; tts.setSpeechRate(0.85f) }
     }
+    fun stopRouteSpeech() {
+        if (prefs.getBoolean("route_speech_active", false)) tts.stop()
+        prefs.edit().remove("route_speech_query").remove("route_speech_task").putBoolean("route_speech_active", false).apply()
+    }
+    fun speakRoute(text: String, queryId: String) {
+        if (queryId.isBlank() || task?.optString("query_id") != queryId || text.isBlank()) return
+        if (!ttsReady || !ttsSupported) { speechStatus = "当前语音播报不可用，请查看路线文字。"; return }
+        prefs.edit().putString("route_speech_query", queryId).putString("route_speech_task", taskId).putBoolean("route_speech_active", true).apply()
+        if (tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "route:$queryId") == TextToSpeech.ERROR) {
+            stopRouteSpeech(); speechStatus = "本次播报未完成，请查看路线文字。"
+        }
+    }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_STOP) stopRouteSpeech() }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer); stopRouteSpeech() }
+    }
+    LaunchedEffect(Unit) { stopRouteSpeech() }
     val state = task?.optString("state").orEmpty()
     val message = task?.optString("message").orEmpty()
     val active = task != null && state !in terminalStates
     fun changed() { requestKey = UUID.randomUUID().toString() }
     fun newTask() {
+        stopRouteSpeech(); transitFormOpen = false
         dismissedTaskId = taskId.ifBlank { dismissedTaskId }
         prefs.edit().remove("task_id").putString("dismissed_task", dismissedTaskId)
             .remove("live_task").remove("live_events").remove("events_task")
@@ -163,7 +192,7 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
         body = parsed.body
         parsed.url?.let { webpage = it; source = "manual" }
         changed()
-        result = if (recipient.isBlank()) "需要补充收件人的完整邮箱；不会根据称呼猜测。" else "已填入明确的信息，请核对下面的收件人、主题和正文。"
+        result = "已填入您明确说出的内容。点击按钮后，小银会确认任务，并提示需要补充的信息。"
     }
     fun accept(response: JSONObject) {
         if (dismissedTaskId.isNotBlank() && response.optJSONObject("task")?.optString("id") == dismissedTaskId) return
@@ -171,10 +200,15 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
             if (task != null && task!!.optString("id") != incoming.optString("id") && incoming.optString("created_at") < task!!.optString("created_at")) return
             if (task != null && task!!.optString("id") == incoming.optString("id") && incoming.optString("updated_at") < task!!.optString("updated_at")) return
             if (task?.optString("id") != incoming.optString("id") || task?.optString("updated_at").orEmpty() <= incoming.optString("updated_at")) {
+                val queryChanged = task?.optString("query_id").orEmpty() != incoming.optString("query_id")
+                // Viewing a completed route reuses the query, but its old socket
+                // has already closed. Reconnect for that new active operation.
+                val becameActive = task?.optString("state") in terminalStates && incoming.optString("state") !in terminalStates
+                if (queryChanged || incoming.optString("state") == "cancelled") stopRouteSpeech()
                 task = incoming; taskId = incoming.getString("id")
                 prefs.edit().putString("task_id", taskId).apply()
                 if (prefs.getString("live_task", "") != incoming.toString()) prefs.edit().putString("live_task", incoming.toString()).apply()
-                if (watchedTask != taskId) { watchedTask = taskId; TaskConnectionService.watch(context, taskId) }
+                if (watchedTask != taskId || queryChanged || becameActive) { watchedTask = taskId; TaskConnectionService.watch(context, taskId) }
             }
         }
         result = response.optString("message", result)
@@ -212,6 +246,7 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     }
     val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     fun startGoal(text: String) {
+        stopRouteSpeech()
         val demo = DemoCases.find(selectedDemoId)?.takeIf { text == selectedDemoPrompt }
         if (demo?.recoveryFault != null && !demoRecoverySupported) {
             result = "恢复演示暂不可用，请检查电脑连接后重新打开演示案例。"
@@ -310,7 +345,7 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
             }
             TextButton(onClick = { openDemoPicker() }) { Text("演示案例", fontSize = 17.sp) }
         }
-        Text("扫码打开网页，核对后分享给家人。", fontSize = 20.sp)
+        Text("扫码分享网页，也能查询公交地铁路线。", fontSize = 20.sp)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("语音播报任务进度", fontSize = 18.sp)
             Switch(speakEnabled, onCheckedChange = { speakEnabled = it; prefs.edit().putBoolean("speak_enabled", it).apply(); if (!it) tts.stop() })
@@ -327,6 +362,13 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
         if (task != null && state in terminalStates)
             Button(onClick = { newTask() }, enabled = !loading, modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) { Text("准备新的任务", fontSize = 21.sp) }
         task?.let { current ->
+            if (current.optString("task_type") == "plan_transit") {
+                key(taskId, current.optString("query_id")) {
+                    TransitTaskCard(current, loading, timeline,
+                        onAction = { path, payload -> action(path, payload) },
+                        onSpeak = { text, query -> speakRoute(text, query) }, onStop = { stopRouteSpeech() })
+                }
+            } else {
             val draft = current.getJSONObject("draft")
             val fingerprint = current.getString("draft_digest")
             var checked by remember(taskId, fingerprint, state) { mutableStateOf(false) }
@@ -418,8 +460,15 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
                     } }) { Text("解释当前步骤", fontSize = 19.sp) }
                 }
             }
+            }
         }
         if (task == null) {
+            OutlinedButton(onClick = { transitFormOpen = !transitFormOpen }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+                Text(if (transitFormOpen) "收起路线填写" else "公交 / 地铁路线", fontSize = 20.sp)
+            }
+            if (transitFormOpen) TransitRequestCard(enabled = !loading, onStart = { text ->
+                selectedDemoId = ""; selectedDemoPrompt = ""; changed(); startGoal(text)
+            })
             DemoCases.find(selectedDemoId)?.let { demo ->
                 SelectedDemoCaseCard(case = demo, onClear = {
                     selectedDemoId = ""; selectedDemoPrompt = ""; instruction = ""; changed()
@@ -431,10 +480,10 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
                 changed()
             }, label = { Text("告诉小银想做什么") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
             Button(onClick = { startGoal(instruction) }, enabled = !loading && instruction.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) {
-                Text(if (DemoCases.find(selectedDemoId)?.category == DemoCategory.SUCCESS) "开始完整演示" else "让小银完成这个任务", fontSize = 21.sp)
+                Text(DemoCases.find(selectedDemoId)?.startLabel ?: "让小银完成这个任务", fontSize = 21.sp)
             }
             LocalVoiceInput(enabled = !loading, onRecognized = { text ->
-                if (listOf("主题", "正文", "内容").any { it in text } && listOf("扫码", "扫描", "二维码", "打开", "发给", "发送", "分享").none { it in text }) {
+                if (listOf("主题", "正文", "内容").any { it in text } && listOf("扫码", "扫描", "二维码", "打开", "发给", "发送", "分享", "公交", "地铁", "路线", "出发", "换乘").none { it in text }) {
                     fillInstruction(text); manualMode = true
                 } else { changed(); startGoal(text) }
             }, onMessage = { result = it })
@@ -509,7 +558,7 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
             action("/tasks/$taskId/received", JSONObject().put("draft_digest", task!!.getString("draft_digest")).put("confirmed", true))
         }) { Text("已核对收到") } }, dismissButton = { TextButton(onClick = { receiptDialog = false }) { Text("还没有确认") } })
     task?.takeIf { current ->
-        state == "completed" && if (current.optString("task_type") == "open_url")
+        current.optString("task_type") != "plan_transit" && state == "completed" && if (current.optString("task_type") == "open_url")
             current.optBoolean("webpage_verified") else current.optBoolean("delivery_confirmed")
     }?.let { completed ->
         AlertDialog(

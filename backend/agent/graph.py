@@ -12,16 +12,48 @@ class GraphState(TypedDict, total=False):
 
 def build_graph(engine):
     graph = StateGraph(GraphState)
+
     def task(state):
         return engine.store.get(state["task_id"])
+
+    def next_intake(current):
+        if engine._missing(current):
+            return "transit_clarify" if current.get("task_type") == "plan_transit" else "clarify"
+        return "transit_precheck" if current.get("task_type") == "plan_transit" else "scan"
+
     def understand(state):
         engine._understand(state["task_id"])
-        return {"decision": "clarify" if engine._missing(task(state)) else "scan"}
+        return {"decision": next_intake(task(state))}
+
     def clarify(state):
         engine._question(state["task_id"])
         answer = interrupt({"kind": "clarification", "fields": engine._missing(task(state)), "message": task(state)["message"]})
         engine._apply_clarification(state["task_id"], answer)
-        return {"decision": "clarify" if engine._missing(task(state)) else "scan"}
+        return {"decision": next_intake(task(state))}
+
+    def transit_clarify(state):
+        engine._question(state["task_id"])
+        current = task(state)
+        answer = interrupt({"kind": "transit_clarification", "query_id": current["query_id"],
+                            "fields": engine._missing(current), "message": current["message"]})
+        engine._apply_transit_clarification(state["task_id"], answer)
+        return {"decision": next_intake(task(state))}
+
+    def transit_precheck(state):
+        engine._transit_precheck(state["task_id"])
+        return {}
+
+    def transit_query(state):
+        return {"decision": engine._query_transit(state["task_id"])}
+
+    def transit_choice(state):
+        # This node has no GUI side effects before interrupt. Resuming a human
+        # choice never replays the device query which produced the candidate set.
+        current = task(state)
+        answer = interrupt({"kind": "transit_place", **current["place_choice"]})
+        engine._apply_place_choice(state["task_id"], answer)
+        return {}
+
     def scan(state):
         current = task(state)
         if current.get("instruction") and current.get("request_qr") and not current.get("qr_received"):
@@ -29,32 +61,46 @@ def build_graph(engine):
             reply = interrupt({"kind": "qr", "scan_nonce": current["scan_nonce"]})
             engine._apply_qr(state["task_id"], reply)
         return {}
+
     def precheck(state):
         engine._precheck(state["task_id"])
         return {}
+
     def browser(state):
         engine._browser(state["task_id"])
         return {"decision": "done" if task(state).get("task_type") == "open_url" else "draft"}
+
     def draft(state):
         engine._draft(state["task_id"])
         return {}
+
     def approval(state):
         current = task(state)
         reply = interrupt({"kind": "approval", "task_id": current["id"], "draft_digest": current["draft_digest"], "approval_nonce": current["approval_nonce"]})
         engine._validate_graph_approval(state["task_id"], reply)
         return {}
+
     def send(state):
         engine._send(state["task_id"])
         return {"decision": "verify" if task(state)["state"] == "verifying" else "done"}
+
     def verify(state):
         engine._verify_result(state["task_id"])
         return {}
+
     for name, node in [("understand", understand), ("clarify", clarify), ("scan", scan), ("precheck", precheck),
-                       ("browser", browser), ("draft", draft), ("approval", approval), ("send", send), ("verify", verify)]:
+                       ("browser", browser), ("draft", draft), ("approval", approval), ("send", send), ("verify", verify),
+                       ("transit_clarify", transit_clarify), ("transit_precheck", transit_precheck),
+                       ("transit_query", transit_query), ("transit_choice", transit_choice)]:
         graph.add_node(name, node)
-    graph.add_conditional_edges(START, lambda s: "understand" if task(s).get("instruction") and not task(s).get("intake_complete") else "precheck")
+    graph.add_conditional_edges(START, lambda s: "understand" if task(s).get("instruction") and not task(s).get("intake_complete")
+                                else next_intake(task(s)) if task(s).get("task_type") == "plan_transit" else "precheck")
     graph.add_conditional_edges("understand", lambda s: s["decision"])
     graph.add_conditional_edges("clarify", lambda s: s["decision"])
+    graph.add_conditional_edges("transit_clarify", lambda s: s["decision"])
+    graph.add_edge("transit_precheck", "transit_query")
+    graph.add_conditional_edges("transit_query", lambda s: END if s["decision"] == "done" else s["decision"])
+    graph.add_edge("transit_choice", "transit_query")
     graph.add_edge("scan", "precheck")
     graph.add_edge("precheck", "browser")
     graph.add_conditional_edges("browser", lambda s: END if s["decision"] == "done" else "draft")

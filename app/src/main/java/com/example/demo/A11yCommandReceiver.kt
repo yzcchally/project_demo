@@ -7,12 +7,20 @@ import android.util.Base64
 
 class A11yCommandReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        setResultCode(0)
+        setResultData(null)
+        val operation = intent.getStringExtra("op")
+        if (operation == "dump_transit_ui" || operation == "set_transit_field") {
+            setResultData("content_bridge_required")
+            return
+        }
         val service = MailAccessibilityService.instance
         if (service == null) {
             setResultCode(0)
+            setResultData("service_unavailable")
             return
         }
-        when (intent.getStringExtra("op")) {
+        when (operation) {
             "set_field" -> {
                 val value = decode(intent.getStringExtra("text").orEmpty())
                 setResultCode(if (service.setMailField(intent.getStringExtra("field").orEmpty(), value,
@@ -36,6 +44,7 @@ class A11yCommandReceiver : BroadcastReceiver() {
         if (encoded.isBlank()) {
             return ""
         }
-        return String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
+        return try { String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8) }
+        catch (_: IllegalArgumentException) { "" }
     }
 }
