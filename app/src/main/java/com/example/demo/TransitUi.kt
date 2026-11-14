@@ -24,7 +24,7 @@ internal fun transitQueryTime(value: String, zone: ZoneId): String = try {
         .withZone(zone).format(OffsetDateTime.parse(value).toInstant())
 } catch (_: Exception) { "待核对" }
 
-private fun deviceQueryTime(value: String): String =
+internal fun deviceQueryTime(value: String): String =
     if (Build.VERSION.SDK_INT >= 26) transitQueryTime(value, ZoneId.systemDefault()) else "待核对"
 
 internal fun transitClarificationReady(origin: String, destination: String, city: String, missing: Set<String>): Boolean {
@@ -235,6 +235,9 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
                 }
                 Button(onClick = { onSpeak(speech, queryId) }, enabled = !loading && steps.isNotEmpty(), modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) { Text("朗读这条路线", fontSize = 21.sp) }
                 OutlinedButton(onClick = onStop, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) { Text("停止朗读", fontSize = 20.sp) }
+                transitRouteShareText(task)?.let { text ->
+                    TransitRouteShareButton(text, enabled = !loading, onOpen = onStop)
+                }
                 OutlinedButton(onClick = { act("show") }, enabled = !loading && !active, modifier = Modifier.fillMaxWidth()) { Text("查看高德详情", fontSize = 20.sp) }
                 if (verified) {
                     Text("您还想知道", fontSize = 19.sp)

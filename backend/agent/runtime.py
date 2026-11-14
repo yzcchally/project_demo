@@ -553,8 +553,11 @@ class Engine:
         if reply.get("scan_nonce") != task["scan_nonce"]:
             raise WorkflowError("扫码结果已过期，请重新扫描")
         task["draft"]["url"] = validate_url(reply["url"])
-        task.update(source="qr", qr_received=True)
-        self.store.save(task, "二维码已识别，接下来打开并核对网页")
+        scan_source = reply.get("scan_source", "in_app_camera")
+        external = scan_source == "external_share"
+        task.update(source="manual" if external else "qr", qr_received=True, scan_source=scan_source)
+        self.store.save(task, "已接收您确认的分享链接，接下来打开并核对网页" if external
+                        else "二维码已识别，接下来打开并核对网页")
 
     def _human_resume(self, task_id, expected, reply):
         with self.lock:
@@ -578,12 +581,17 @@ class Engine:
             validate_url(reply["url"])
         return self._human_resume(task_id, "needs_clarification", reply)
 
-    def submit_qr(self, task_id, url, scan_nonce):
+    def submit_qr(self, task_id, url, scan_nonce, scan_source="in_app_camera"):
         task = self.store.get(task_id)
         self._require_mail(task)
         if scan_nonce != task.get("scan_nonce"):
             raise WorkflowError("扫码结果已过期，请重试")
-        return self._human_resume(task_id, "awaiting_qr", {"url": validate_url(url), "scan_nonce": scan_nonce})
+        if scan_source not in {"in_app_camera", "external_share"}:
+            raise WorkflowError("扫码结果来源无效")
+        reply = {"url": validate_url(url), "scan_nonce": scan_nonce}
+        if scan_source == "external_share":
+            reply["scan_source"] = scan_source
+        return self._human_resume(task_id, "awaiting_qr", reply)
 
     def edit(self, task_id, changes):
         with self.lock:

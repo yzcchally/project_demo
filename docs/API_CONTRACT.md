@@ -8,7 +8,7 @@ Base: `http://127.0.0.1:8000`. OpenAPI: `/docs`. API version: 2.0. Compatibility
 | `GET /api/tasks/latest` | Latest durable task; `null` before the first task. |
 | `GET /api/tasks/{id}` | Current typed task, proof flags, interaction nonces and user-facing state. Route tasks expose `transit_request`/`transit_result`, not a mail draft. |
 | `POST /api/tasks/{id}/clarify` | Explicit recipient/alias, optional subject/body/URL and `save_contact`. |
-| `POST /api/tasks/{id}/qr` | `{url, scan_nonce}` from the camera result. |
+| `POST /api/tasks/{id}/qr` | `{url, scan_nonce, scan_source?}`. Defaults to `in_app_camera`. A user-confirmed Android share uses `external_share`, recorded as user-provided (`source=manual`), not camera proof. Both require the active scan nonce and an acceptable HTTPS URL. |
 | `PATCH /api/tasks/{id}/draft` | Explicit draft edits; invalidates approval and re-prepares. |
 | `POST /api/tasks/{id}/confirm` | `{draft_digest, approval_nonce, confirmed:true}`. |
 | `POST /api/tasks/{id}/pause`, `/resume`, `/cancel` | Controls; `/control` also accepts `{action}`. |

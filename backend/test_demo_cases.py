@@ -147,13 +147,20 @@ def test_recovery_case_records_one_actual_interruption_and_still_requires_approv
     assert event["real_device"] is False and event["external_send_triggered_by_driver"] is False
 
 
-def test_graph_qr_interrupt_keeps_the_fault_pending_until_the_composer(engine):
+@pytest.mark.parametrize("scan_source", ["in_app_camera", "external_share"])
+def test_graph_qr_interrupt_keeps_the_fault_pending_until_the_composer(engine, scan_source):
     engine.models.task_type = "scan_and_share"
     task = recovery_goal(engine, "帮我扫描二维码，把网址发给 receiver@example.org")
     assert task["state"] == "awaiting_qr"
     assert not task["demo_fault_injected"] and engine.device.home_calls == 0
-    task = settle(engine, engine.submit_qr(task["id"], "https://example.org/", task["scan_nonce"]))
+    with pytest.raises(WorkflowError, match="已过期"):
+        engine.submit_qr(task["id"], "https://example.org/", "old-scan-round", scan_source)
+    with pytest.raises(WorkflowError, match="HTTPS"):
+        engine.submit_qr(task["id"], "http://example.org/", task["scan_nonce"], scan_source)
+    task = settle(engine, engine.submit_qr(task["id"], "https://example.org/", task["scan_nonce"], scan_source))
     assert task["state"] == "awaiting_confirmation"
+    assert task["scan_source"] == scan_source
+    assert task["source"] == ("manual" if scan_source == "external_share" else "qr")
     assert task["demo_fault_injected"] and task["demo_fault_status"] == "observed"
     assert engine.device.home_calls == 1 and task["send_attempts"] == 0
 

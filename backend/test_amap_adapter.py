@@ -253,7 +253,7 @@ def test_map_observation_reports_known_bridge_failure_without_claiming_usb_is_di
     adapter.base.transport = SimpleNamespace(last_bridge_reason=reason)
     adapter.base.observe.side_effect = WorkflowError("请检查 USB 连接")
     with pytest.raises(WorkflowError, match=expected): adapter._observe(lambda: None)
-    assert json.loads((adapter.folder / "observation-error.json").read_text())["reason"] == reason
+    assert json.loads((adapter.folder / "observation-error.json").read_text(encoding="utf-8"))["reason"] == reason
 
 
 def test_unknown_bridge_failure_keeps_the_original_exception(adapter):
@@ -1063,7 +1063,7 @@ def test_show_backfills_legacy_context_only_from_current_query_trusted_xml(adapt
     route=long_shown_route();frames=[shown_detail_frame(0),shown_detail_frame(1)]
     context=prepare_shown_frames(adapter,route,frames,trusted=False)
     folder=adapter._context_path(adapter._context_key(route)).parent;folder.mkdir(parents=True,exist_ok=True)
-    source=folder/"actual-detail.xml";source.write_text(frames[0])
+    source=folder/"actual-detail.xml";source.write_text(frames[0], encoding="utf-8")
     route["evidence"]=[{"query_id":route["query_id"],"route_id":route["route_id"],"page_kind":"route_detail","xml_path":str(source)}]
     adapter.show_details(route,lambda:None)
     assert context["detail_strip_fingerprint"]
@@ -1074,7 +1074,7 @@ def test_show_does_not_backfill_model_text_or_other_query_files(adapter,tmp_path
     route=long_shown_route();frames=[shown_detail_frame(0),shown_detail_frame(1)]
     prepare_shown_frames(adapter,route,frames,trusted=False)
     folder=adapter._context_path(adapter._context_key(route)).parent;folder.mkdir(parents=True,exist_ok=True)
-    source=(tmp_path if problem=="outside_directory" else folder)/"untrusted.xml";source.write_text(frames[0])
+    source=(tmp_path if problem=="outside_directory" else folder)/"untrusted.xml";source.write_text(frames[0], encoding="utf-8")
     route["evidence"]=[{"query_id":"another-query" if problem=="wrong_query" else route["query_id"],
         "route_id":route["route_id"],"page_kind":"route_list" if problem=="list_summary_only" else "route_detail",
         "xml_path":str(source),"text":"30分钟1号线2号线步行200米"}]

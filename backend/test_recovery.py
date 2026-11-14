@@ -209,7 +209,7 @@ def test_hint_that_disappears_before_the_click_is_not_clicked_at_its_old_positio
     with patch("device.huawei.time.sleep"):
         assert device._observe_composer(stage="draft") == ready
     device.tap.assert_not_called()
-    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event["outcome"] == "skipped" for event in events)
 
 
@@ -242,7 +242,7 @@ def test_pause_resume_at_final_tap_checkpoint_skips_the_old_hint_and_reobserves(
     device.transport.tap.assert_not_called()
     device.shell.assert_not_called()
     assert device.observe.call_count >= 3
-    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event["outcome"] == "skipped" for event in events)
 
 
@@ -278,7 +278,7 @@ def test_observe_discards_xml_read_across_a_resume_and_saves_only_the_fresh_scre
     assert device.observe(evidence=True) == fresh
     assert device.transport.xml.call_count == 2
     screens = list((tmp_path / device.task_id).glob("screen-*.xml"))
-    assert len(screens) == 1 and screens[0].read_text() == fresh
+    assert len(screens) == 1 and screens[0].read_text(encoding="utf-8") == fresh
 
 
 def test_continuously_changing_context_stops_observation_at_the_read_limit(tmp_path):
@@ -384,7 +384,7 @@ def test_browser_hint_is_dismissed_and_the_native_full_address_is_read_again(tmp
     starts = [call.args for call in device.shell.call_args_list if call.args[:2] == ("am", "start")]
     assert len(starts) == 1
     assert "android.intent.action.VIEW" in starts[0]
-    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event["outcome"] == "recovered" for event in events)
 
 
@@ -447,7 +447,7 @@ def test_input_retry_is_freshly_located_and_reported_recovered_only_after_matchi
     assert len(broadcasts) == 2
     assert broadcasts[0][-1] == "false" and broadcasts[1][-1] == "true"
     assert device.observe.call_count >= 4
-    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event["action"] == "retry_input" and event["outcome"] == "attempting" for event in events)
     assert any(event["outcome"] == "recovered" for event in events) is second_write_works
     assert not any(expected in json.dumps(event, ensure_ascii=False) for event in events)
@@ -471,7 +471,7 @@ def test_restored_composer_with_same_recipient_and_subject_but_another_task_mark
         device._observe_composer(stage="draft")
     device.tap.assert_not_called()
     assert all(call.args[:2] != ("am", "broadcast") for call in device.shell.call_args_list)
-    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (tmp_path / device.task_id / "recoveries.jsonl").read_text(encoding="utf-8").splitlines()]
     assert not any(event["outcome"] == "recovered" for event in events)
 
 

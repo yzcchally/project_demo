@@ -72,7 +72,11 @@ internal suspend fun request(path: String, payload: JSONObject? = null, method: 
     }
 
 @Composable
-fun WorkflowScreen(modifier: Modifier = Modifier) {
+internal fun WorkflowScreen(
+    modifier: Modifier = Modifier,
+    sharedScan: SharedScan? = null,
+    onDismissSharedScan: () -> Unit = {},
+) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val lifecycleState by lifecycle.currentStateFlow.collectAsState()
@@ -114,6 +118,8 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     var receiptDialog by remember { mutableStateOf(false) }
     var speechStatus by remember { mutableStateOf("") }
     var showDemoPicker by rememberSaveable { mutableStateOf(false) }
+    var showFamilyContact by rememberSaveable { mutableStateOf(false) }
+    var externalScanner by rememberSaveable { mutableStateOf(prefs.getBoolean("external_scanner", false)) }
     var selectedDemoId by rememberSaveable { mutableStateOf("") }
     var selectedDemoPrompt by rememberSaveable { mutableStateOf("") }
     var demoMetadataSupported by rememberSaveable { mutableStateOf(false) }
@@ -326,8 +332,8 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
             .setPrompt("将镜头对准网页二维码").setOrientationLocked(false).setBeepEnabled(false).setTimeout(45000))
     }
 
-    LaunchedEffect(state, taskId, task?.optString("scan_nonce"), lifecycleState, scanInFlight) {
-        if (!scanInFlight && state == "awaiting_qr" && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)) {
+    LaunchedEffect(state, taskId, task?.optString("scan_nonce"), lifecycleState, scanInFlight, externalScanner, sharedScan) {
+        if (!scanInFlight && sharedScan == null && !externalScanner && state == "awaiting_qr" && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)) {
             val marker = taskId + task!!.optString("scan_nonce")
             if (launchedScan != marker) {
                 launchedScan = marker
@@ -346,6 +352,20 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
             TextButton(onClick = { openDemoPicker() }) { Text("演示案例", fontSize = 17.sp) }
         }
         Text("扫码分享网页，也能查询公交地铁路线。", fontSize = 20.sp)
+        OutlinedButton(onClick = { showFamilyContact = true },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) {
+            Text("联系家人", fontSize = 22.sp)
+        }
+        if (!active || state == "awaiting_qr") {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("使用手机自带扫码工具", Modifier.weight(1f), fontSize = 18.sp)
+                Switch(externalScanner, onCheckedChange = {
+                    externalScanner = it
+                    prefs.edit().putBoolean("external_scanner", it).apply()
+                })
+            }
+            if (externalScanner) Text("用手机相机或系统扫码工具扫码，在结果页点分享，选择小银助手（Demo）。", fontSize = 17.sp)
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("语音播报任务进度", fontSize = 18.sp)
             Switch(speakEnabled, onCheckedChange = { speakEnabled = it; prefs.edit().putBoolean("speak_enabled", it).apply(); if (!it) tts.stop() })
@@ -397,7 +417,7 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
                     }
                     if (state == "awaiting_qr") Button(onClick = {
                         openScanner()
-                    }) { Text("再次打开扫码", fontSize = 20.sp) }
+                    }) { Text(if (externalScanner) "改用小银内置扫码" else "再次打开扫码", fontSize = 20.sp) }
                     if (current.optString("verification_detail").isNotBlank()) Text(current.getString("verification_detail"), fontSize = 18.sp)
                     if (current.optString("task_type") == "open_url") {
                         Text("识别网址 → 打开网页 → 核对地址", fontSize = 16.sp)
@@ -546,11 +566,54 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
         }
         Spacer(Modifier.height(24.dp))
     }
+    if (showFamilyContact) FamilyContactDialog(onDismiss = { showFamilyContact = false })
     if (showDemoPicker) DemoCasePickerSheet(
         onDismiss = { showDemoPicker = false }, onSelect = { useDemo(it) },
         canSelect = !active && !loading, recoverySupported = demoRecoverySupported,
         recoveryStatus = demoRecoveryStatus,
     )
+    sharedScan?.let { share ->
+        // Bind confirmation to the displayed QR round. A pause, cancel or new
+        // scan round must never reuse a link received for an earlier round.
+        val currentNonce = task?.optString("scan_nonce").orEmpty()
+        val boundRound = remember(share.id) {
+            if (state == "awaiting_qr" && taskId.isNotBlank() && currentNonce.isNotBlank())
+                taskId to currentNonce else null
+        }
+        val canContinue = boundRound != null && boundRound == (taskId to currentNonce) &&
+            state == "awaiting_qr" && !loading && !scanInFlight
+        val canFill = boundRound == null && taskId.isBlank() && !loading && !scanInFlight
+        AlertDialog(
+            onDismissRequest = onDismissSharedScan,
+            title = { Text("核对分享过来的网址", fontSize = 24.sp) },
+            text = {
+                Column(Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                    Text(share.url ?: "没有收到单独的 HTTPS 网页链接，请从扫码结果页分享网址。", fontSize = 19.sp)
+                    if (share.url != null) Text(
+                        when {
+                            canContinue -> "确认后，小银会在当前任务中打开并核对网址。"
+                            canFill -> "确认后只填入邮件表单，不会开始任务。"
+                            else -> "当前任务无法接受此链接，请返回查看进度，再重新分享。"
+                        }, fontSize = 17.sp,
+                    )
+                }
+            },
+            confirmButton = {
+                val url = share.url
+                if (url != null && (canContinue || canFill)) TextButton(onClick = {
+                    onDismissSharedScan()
+                    if (canContinue) {
+                        action("/api/tasks/$taskId/qr", JSONObject().put("url", url)
+                            .put("scan_nonce", currentNonce).put("scan_source", "external_share"))
+                    } else {
+                        webpage = url; source = "manual"; manualMode = true; transitFormOpen = false; changed()
+                        result = "已填入分享的网址，提交后还会核对网页。"
+                    }
+                }) { Text(if (canContinue) "确认网址，继续" else "填入表单", fontSize = 19.sp) }
+            },
+            dismissButton = { TextButton(onClick = onDismissSharedScan) { Text("返回", fontSize = 19.sp) } },
+        )
+    }
     if (receiptDialog && task != null) AlertDialog(onDismissRequest = { receiptDialog = false }, title = { Text("确认已经收到？") },
         text = { Text("请仅在收件箱中找到这封邮件，并核对主题和正文后确认。此结果会记录为您人工核对。") },
         confirmButton = { TextButton(onClick = {

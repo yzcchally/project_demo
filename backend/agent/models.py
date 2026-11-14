@@ -55,7 +55,7 @@ class ModelGateway:
         finally:
             record["latency_ms"] = round((time.monotonic() - started) * 1000)
             self.directory.mkdir(parents=True, exist_ok=True)
-            with (self.directory / "calls.jsonl").open("a") as log:
+            with (self.directory / "calls.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def understand(self, instruction, aliases):
