@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from fastapi.testclient import TestClient
 
 import gmail_demo
 import recognize
@@ -42,8 +43,19 @@ class AdbDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory)
             adb = self.make_adb(sdk)
-            with patch.dict(os.environ, {"ANDROID_HOME": str(sdk)}, clear=True), patch("gmail_demo.shutil.which", return_value=None), patch("gmail_demo.sys.platform", "darwin"):
+            with patch.dict(os.environ, {"ANDROID_HOME": str(sdk)}, clear=True), patch("gmail_demo.shutil.which", return_value=None), patch("gmail_demo.sys.platform", "darwin"), patch("gmail_demo.Path.home", return_value=sdk):
                 self.assertEqual(gmail_demo._adb(), str(adb))
+
+
+class BackendHostTests(unittest.TestCase):
+    def test_loopback_and_android_emulator_hosts_are_allowed_but_external_host_is_rejected(self):
+        for host in ("127.0.0.1", "10.0.2.2"):
+            with TestClient(gmail_demo.app, base_url=f"http://{host}:8000") as client:
+                response = client.get("/health")
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["ok"])
+        with TestClient(gmail_demo.app, base_url="http://untrusted.example:8000") as client:
+            self.assertEqual(client.get("/health").status_code, 400)
 
 
 class ModelTaskLifecycleTests(unittest.TestCase):

@@ -149,17 +149,23 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(WorkflowError):
             self.engine.control(task["id"], "retry_prepare")
         restarted = Engine(self.store, self.device)
-        self.assertEqual(restarted.store.get(task["id"])["send_attempts"], 1)
-        self.assertEqual(sum(c[0] == "send" for c in self.device.calls), 1)
+        try:
+            self.assertEqual(restarted.store.get(task["id"])["send_attempts"], 1)
+            self.assertEqual(sum(c[0] == "send" for c in self.device.calls), 1)
+        finally:
+            restarted.close()
 
     def test_restart_at_send_intent_cannot_replay_side_effect(self):
         task = self.settle(self.create())
         task.update(state="sending", send_attempts=1)
         self.store.save(task, "simulated crash after durable send intent")
         restarted = Engine(self.store, self.device)
-        recovered = restarted.store.get(task["id"])
-        self.assertEqual(recovered["state"], "outcome_unknown")
-        self.assertEqual(sum(c[0] == "send" for c in self.device.calls), 0)
+        try:
+            recovered = restarted.store.get(task["id"])
+            self.assertEqual(recovered["state"], "outcome_unknown")
+            self.assertEqual(sum(c[0] == "send" for c in self.device.calls), 0)
+        finally:
+            restarted.close()
 
     def test_unconfirmed_record_can_be_rechecked_without_send(self):
         task = self.settle(self.create())

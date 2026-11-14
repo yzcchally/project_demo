@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from domain import WorkflowError, now
 from api.events import hub
@@ -17,10 +18,15 @@ class Store:
                 CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, data TEXT NOT NULL);
             """)
 
+    @contextmanager
     def connect(self):
         c = sqlite3.connect(self.db, timeout=10)
-        c.execute("PRAGMA synchronous=FULL")
-        return c
+        try:
+            c.execute("PRAGMA synchronous=FULL")
+            with c:
+                yield c
+        finally:
+            c.close()
 
     def all(self) -> list[dict]:
         with self.lock, self.connect() as c:
