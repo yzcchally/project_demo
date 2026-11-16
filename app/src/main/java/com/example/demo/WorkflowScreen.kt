@@ -72,7 +72,11 @@ internal suspend fun request(path: String, payload: JSONObject? = null, method: 
     }
 
 @Composable
-fun WorkflowScreen(modifier: Modifier = Modifier) {
+internal fun WorkflowScreen(
+    modifier: Modifier = Modifier,
+    sharedScan: SharedScan? = null,
+    onDismissSharedScan: () -> Unit = {},
+) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val lifecycleState by lifecycle.currentStateFlow.collectAsState()
@@ -112,6 +116,7 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
     var ttsReady by remember { mutableStateOf(false) }
     var ttsSupported by remember { mutableStateOf(true) }
     var receiptDialog by remember { mutableStateOf(false) }
+    var viewedTransitCompletion by rememberSaveable { mutableStateOf("") }
     var speechStatus by remember { mutableStateOf("") }
     var showDemoPicker by rememberSaveable { mutableStateOf(false) }
     var selectedDemoId by rememberSaveable { mutableStateOf("") }
@@ -168,13 +173,14 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
         dismissedTaskId = taskId.ifBlank { dismissedTaskId }
         prefs.edit().remove("task_id").putString("dismissed_task", dismissedTaskId)
             .remove("live_task").remove("live_events").remove("events_task")
-            .remove("connection_error").remove("active_scan_task").apply()
+            .remove("connection_error").remove("active_scan_task")
+            .remove("external_scan_task").remove("external_scan_nonce").apply()
         TaskConnectionService.dismiss(context, dismissedTaskId)
         watchedTask = ""
         editMode = false; editRecipient = ""; editSubject = ""; editBody = ""
         manualMode = false; contactsOpen = false; advanced = false
         contactAlias = ""; contactAddress = ""
-        receiptDialog = false; showDemoPicker = false; launchedScan = ""
+        receiptDialog = false; viewedTransitCompletion = ""; showDemoPicker = false; launchedScan = ""
         scanInFlight = false; scanOwner = ""; scanNonce = ""
         task = null; taskId = ""; timeline = ""; result = ""; changed()
         instruction = ""; webpage = ""; body = ""; subject = "网页分享"; source = "text"
@@ -214,6 +220,11 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
         result = response.optString("message", result)
     }
     fun action(path: String, payload: JSONObject = JSONObject()) {
+        if (path in setOf("/tasks/$taskId/control", "/api/tasks/$taskId/control") && payload.optString("action") in setOf("pause", "resume", "cancel")) {
+            result = ""
+            TaskConnectionService.submitControl(context, taskId, payload.getString("action"))
+            return
+        }
         scope.launch {
             loading = true
             try { accept(request(path, payload, "POST")) }
@@ -326,8 +337,8 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
             .setPrompt("将镜头对准网页二维码").setOrientationLocked(false).setBeepEnabled(false).setTimeout(45000))
     }
 
-    LaunchedEffect(state, taskId, task?.optString("scan_nonce"), lifecycleState, scanInFlight) {
-        if (!scanInFlight && state == "awaiting_qr" && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)) {
+    LaunchedEffect(state, taskId, task?.optString("scan_nonce"), lifecycleState, scanInFlight, sharedScan) {
+        if (!scanInFlight && sharedScan == null && state == "awaiting_qr" && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)) {
             val marker = taskId + task!!.optString("scan_nonce")
             if (launchedScan != marker) {
                 launchedScan = marker
@@ -551,12 +562,119 @@ fun WorkflowScreen(modifier: Modifier = Modifier) {
         canSelect = !active && !loading, recoverySupported = demoRecoverySupported,
         recoveryStatus = demoRecoveryStatus,
     )
+    sharedScan?.let { share ->
+        // The share may cold-start the Activity before task restoration. Bind
+        // once only after a successful fresh backend snapshot, and persist that
+        // binding through rotation so a new QR round cannot inherit an old link.
+        var bindingKind by rememberSaveable(share.id) { mutableStateOf("pending") }
+        var boundTask by rememberSaveable(share.id) { mutableStateOf("") }
+        var boundNonce by rememberSaveable(share.id) { mutableStateOf("") }
+        val initialTaskId = rememberSaveable(share.id) { taskId.ifBlank { prefs.getString("external_scan_task", "").orEmpty() } }
+        val initialNonce = rememberSaveable(share.id) {
+            preparedScanNonce(initialTaskId, prefs.getString("external_scan_task", "").orEmpty(),
+                prefs.getString("external_scan_nonce", "").orEmpty())
+        }
+        fun dismissShare() {
+            prefs.edit().remove("external_scan_task").remove("external_scan_nonce").apply()
+            onDismissSharedScan()
+        }
+        var lookupFailed by remember(share.id) { mutableStateOf(false) }
+        var retryLookup by remember(share.id) { mutableIntStateOf(0) }
+        LaunchedEffect(share.id, retryLookup) {
+            if (bindingKind == "pending") {
+                lookupFailed = false
+                try {
+                    val response = request("/api/tasks/latest")
+                    val snapshot = response.optJSONObject("task")
+                    val snapshotId = snapshot?.optString("id").orEmpty()
+                    val resolved = if (snapshotId.isNotBlank() && snapshotId == dismissedTaskId)
+                        ShareBinding(if (initialTaskId.isBlank() && taskId.isBlank() && snapshot?.optString("state").orEmpty() in terminalStates) "form" else "blocked")
+                    else bindSharedScan(true, snapshotId, snapshot?.optString("state").orEmpty(),
+                        snapshot?.optString("scan_nonce").orEmpty(), initialTaskId, initialNonce)
+                    if (resolved.kind != "form") accept(response)
+                    boundTask = resolved.taskId; boundNonce = resolved.nonce; bindingKind = resolved.kind
+                } catch (_: Exception) { lookupFailed = true }
+            }
+        }
+        val currentNonce = task?.optString("scan_nonce").orEmpty()
+        val binding = ShareBinding(bindingKind, boundTask, boundNonce)
+        val canContinue = shareBindingCurrent(binding, taskId, state, currentNonce) && !loading && !scanInFlight
+        val canFill = bindingKind == "form" && taskId.isBlank() && !loading && !scanInFlight
+        AlertDialog(
+            onDismissRequest = { dismissShare() },
+            title = { Text("核对分享过来的网址", fontSize = 24.sp) },
+            text = {
+                Column(Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                    Text(share.url ?: "没有收到单独的 HTTPS 网页链接，请从扫码结果页分享网址。", fontSize = 19.sp)
+                    if (share.url != null) Text(
+                        when {
+                            bindingKind == "pending" && lookupFailed -> "暂时无法核对当前任务，请检查连接后重试。"
+                            bindingKind == "pending" -> "正在核对当前任务，请稍候。"
+                            canContinue -> "确认后，小银会在当前任务中打开并核对网址。"
+                            canFill -> "确认后只填入邮件表单，不会开始任务。"
+                            else -> "当前扫码轮次无法确认或已经变化，请返回查看进度，再重新分享。"
+                        }, fontSize = 17.sp,
+                    )
+                }
+            },
+            confirmButton = {
+                val url = share.url
+                if (bindingKind == "pending" && lookupFailed) TextButton(onClick = { retryLookup++ }) { Text("重试", fontSize = 19.sp) }
+                else if (url != null && (canContinue || canFill)) TextButton(onClick = {
+                    dismissShare()
+                    if (canContinue) {
+                        action("/api/tasks/$taskId/qr", JSONObject().put("url", url)
+                            .put("scan_nonce", currentNonce).put("scan_source", "external_share"))
+                    } else {
+                        webpage = url; source = "manual"; manualMode = true; transitFormOpen = false; changed()
+                        result = "已填入分享的网址，提交后还会核对网页。"
+                    }
+                }) { Text(if (canContinue) "确认网址，继续" else "填入表单", fontSize = 19.sp) }
+            },
+            dismissButton = { TextButton(onClick = { dismissShare() }) { Text("返回", fontSize = 19.sp) } },
+        )
+    }
     if (receiptDialog && task != null) AlertDialog(onDismissRequest = { receiptDialog = false }, title = { Text("确认已经收到？") },
         text = { Text("请仅在收件箱中找到这封邮件，并核对主题和正文后确认。此结果会记录为您人工核对。") },
         confirmButton = { TextButton(onClick = {
             receiptDialog = false
             action("/tasks/$taskId/received", JSONObject().put("draft_digest", task!!.getString("draft_digest")).put("confirmed", true))
         }) { Text("已核对收到") } }, dismissButton = { TextButton(onClick = { receiptDialog = false }) { Text("还没有确认") } })
+    task?.takeIf { current ->
+        val route = current.optJSONObject("transit_result")
+        val query = current.optString("query_id")
+        val id = current.optString("id")
+        current.optString("task_type") == "plan_transit" && route != null && id.isNotBlank() && query.isNotBlank() &&
+            transitCompletionReady(current.optString("state"), current.optBoolean("route_verified") && route.optBoolean("route_verified"),
+                route.optString("classification"), route.optString("task_id") == id && route.optString("query_id") == query,
+                current.optBoolean("dingtalk_requested"), current.optString("dingtalk_status")) &&
+            viewedTransitCompletion != "$id:$query"
+    }?.let { completed ->
+        val route = completed.getJSONObject("transit_result")
+        val label = listOf(route.optJSONObject("origin")?.optString("name").orEmpty(),
+            route.optJSONObject("destination")?.optString("name").orEmpty()).filter { it.isNotBlank() }.joinToString(" → ")
+        AlertDialog(
+            onDismissRequest = { },
+            title = { Text("任务已完成", fontSize = 26.sp) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("任务已完成，请点击确认。", fontSize = 21.sp)
+                    if (label.isNotBlank()) Text(label, fontSize = 19.sp)
+                    Text(if (completed.optBoolean("dingtalk_requested")) "路线已核对，并已发送到您的钉钉文件助手。"
+                        else "高德路线已查询并核对。", fontSize = 19.sp)
+                }
+            },
+            confirmButton = {
+                Button(onClick = { newTask() }, enabled = !loading,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) {
+                    Text("确认，返回首页", fontSize = 21.sp)
+                }
+            },
+            dismissButton = { TextButton(onClick = { viewedTransitCompletion = "${completed.optString("id")}:${completed.optString("query_id")}" }) {
+                Text("查看路线", fontSize = 19.sp)
+            } },
+        )
+    }
     task?.takeIf { current ->
         current.optString("task_type") != "plan_transit" && state == "completed" && if (current.optString("task_type") == "open_url")
             current.optBoolean("webpage_verified") else current.optBoolean("delivery_confirmed")

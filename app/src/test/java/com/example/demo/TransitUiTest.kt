@@ -4,6 +4,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class TransitUiTest {
+    @Test fun completionRequiresVerifiedCurrentRouteAndConfirmedDingTalkWhenRequested() {
+        assertTrue(transitCompletionReady("completed", true, "COMPLETE", true, false, "not_requested"))
+        assertTrue(transitCompletionReady("completed", true, "COMPLETE", true, true, "sent"))
+        assertFalse(transitCompletionReady("completed", true, "COMPLETE", true, true, "unknown"))
+        assertFalse(transitCompletionReady("completed", true, "COMPLETE", false, true, "sent"))
+        assertFalse(transitCompletionReady("completed", false, "COMPLETE", true, false, "not_requested"))
+        assertFalse(transitCompletionReady("completed", true, "PARTIAL", true, false, "not_requested"))
+        for (state in listOf("failed", "cancelled", "partial", "no_route", "outcome_unknown", "interrupted", "sharing_transit")) {
+            assertFalse(transitCompletionReady(state, true, "COMPLETE", true, true, "sent"))
+        }
+    }
     @Test fun clarificationRequiresAnExplicitOriginBeforeSubmitting() {
         assertFalse(transitClarificationReady("", "广东省博物馆", "广州市", setOf("origin")))
         assertFalse(transitClarificationReady("  ", "广东省博物馆", "广州市", setOf("origin")))

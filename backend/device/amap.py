@@ -26,6 +26,14 @@ PACKAGE = "com.autonavi.minimap"
 ID = PACKAGE + ":id/"
 
 
+class ExpectedTransitControlMissing(WorkflowError):
+    """Only a bounded search on a verified route page missed its target."""
+
+
+class TransitHomeInterrupted(ScreenContextChanged):
+    """A recorded Amap task was replaced by the verified Huawei launcher."""
+
+
 def clean(value):
     return html.unescape(re.sub(r"<[^>]*>", "", value or "")).strip()
 
@@ -70,6 +78,9 @@ class AmapDevice:
         self.route_id = None
         self._detail_contexts = {}
         self.progress_callback = None
+        self._assist_sessions = {}
+        self._resume_attempts = {}
+        self._resume_actions = {}
 
     def _progress(self, stage, message, checkpoint):
         self._check(checkpoint)
@@ -78,6 +89,12 @@ class AmapDevice:
 
     def _check(self, checkpoint):
         checkpoint()
+        if (getattr(self, "_query_in_progress", False)
+                and getattr(self, "_query_epoch", self.base.context_epoch) != self.base.context_epoch
+                and getattr(self.base, "transit_resume_epoch", None) == self.base.context_epoch):
+            # Test the explicit resume before the wall-clock budget: the user
+            # may deliberately have kept the task paused for several minutes.
+            raise ScreenContextChanged("暂停前的高德页面已失效，需要全新查询")
         if time.monotonic() - self.started > self.total_seconds:
             raise WorkflowError("高德查询超过本轮时限，请检查网络后重新查询")
 
@@ -90,6 +107,7 @@ class AmapDevice:
     def _audit_action(self,target,action,*,status="executed"):
         if not getattr(self,"folder",None):return
         record={"time":now(),"query_id":self.query_id,"action":action,"status":status,
+                "attempt":getattr(self,"query_attempt",0),
                 **{k:target.get(k) for k in ["target_id","observation_id","role","bounds","resource_id"]}}
         with (self.folder/"gui-actions.jsonl").open("a",encoding="utf-8") as f:
             f.write(json.dumps(record,ensure_ascii=False)+"\n")
@@ -123,11 +141,22 @@ class AmapDevice:
         epoch = self.base.context_epoch
         try:
             xml = self.base.observe(checkpoint)
+        except (Cancelled, ScreenContextChanged):
+            raise
         except WorkflowError:
+            # A protected read can fail while its caller was paused. The
+            # explicit resume invalidation takes precedence over that old
+            # read's error, just as it does over a late successful frame.
+            self._check(checkpoint)
             reason = getattr(self.base.transport, "last_bridge_reason", None)
+            if (reason == "root_package" and getattr(self, "_query_in_progress", False)
+                    and getattr(self, "_query_map_context", None)):
+                self._check_home_recovery(self._query_map_context, checkpoint)
+                raise TransitHomeInterrupted("已离开高德回到桌面，需要重新核对本轮路线") from None
             messages = {
                 "root_package": "高德当前窗口不在前台，请关闭遮挡弹窗并返回高德后重新查询",
                 "service_unavailable": "Demo 无障碍服务当前不可用，请重新开启服务后再查询",
+                "tree_changed": "高德页面正在变化，暂时无法稳定读取，请等待页面加载完成后重新查询",
                 "bridge_busy": "高德页面读取繁忙，请稍后重新查询",
                 "bridge_timeout": "高德页面读取超时，请稍后重新查询",
                 "bridge_unavailable": "App 尚未提供高德读取接口，请更新 Demo 后重新查询",
@@ -140,23 +169,45 @@ class AmapDevice:
                 raise WorkflowError(messages[reason]) from None
             raise
         self._check(checkpoint)
-        ns = [n for n in ET.fromstring(xml).iter("node") if n.get("package") == PACKAGE]
+        all_nodes = list(ET.fromstring(xml).iter("node"))
+        ns = [n for n in all_nodes if n.get("package") == PACKAGE]
         if not ns:
             raise WorkflowError("高德不在当前页面，请返回高德后重新查询")
+        if getattr(self, "_query_in_progress", False) and not getattr(self, "_query_map_context", None):
+            snapshot = self.base.shell("dumpsys", "activity", "activities")
+            self._check(checkpoint)
+            identity = self._resumed_map_identity(snapshot)
+            if identity is not None:
+                context = {"android_task_id": identity[0], "activity": identity[1]}
+                if self._map_task_still_exists(snapshot, context):
+                    self._query_map_context = context
         oid = uuid.uuid4().hex
         file = self.folder / (oid + ".xml")
         file.write_text(xml, encoding="utf-8")
         actual_page = page
+        evidence_nodes = ns
         if page == "route_detail":
-            detail_marker = any(label(n) == "公交详情页面" and bounds(n) for n in ns)
+            parents = {child: parent for parent in all_nodes for child in parent}
+            def current_native(node):
+                while node is not None:
+                    if (node.get("package") != PACKAGE or node.get("visible-to-user") == "false"
+                            or node.get("enabled") == "false"):
+                        return False
+                    node = parents.get(node)
+                return True
+            # Hidden or foreign ancestor branches are neither page markers
+            # nor textual evidence for the selected itinerary. Keep the full
+            # original XML on disk without promoting its invisible captions.
+            evidence_nodes = [n for n in ns if current_native(n)]
+            detail_marker = any(label(n) == "公交详情页面" and bounds(n) for n in evidence_nodes)
             query_fields = any(n.get("resource-id") in {ID + "route_edit_summary_start", ID + "route_edit_summary_end"}
-                               and bounds(n) for n in ns)
+                               and bounds(n) for n in evidence_nodes)
             # Waiting *for* details does not make an old list/loading frame
             # into detail evidence. Do not mix its other route candidates into
             # either the native parser or the model's selected itinerary.
             actual_page = "route_detail" if detail_marker and not query_fields else "route_list" if query_fields else "screen"
         evidence = {"evidence_id": oid, "query_id": self.query_id, "route_id": self.route_id,
-                    "observation_id": oid, "text": screen_text(ns), "xml_path": str(file),
+                    "observation_id": oid, "text": screen_text(evidence_nodes), "xml_path": str(file),
                     "page_kind": actual_page}
         if screenshot:
             png = self._png()
@@ -168,7 +219,7 @@ class AmapDevice:
             raise WorkflowError("高德提示网络不佳，请检查手机网络后重新查询")
         return {"xml": xml, "nodes": ns, "epoch": epoch, "evidence": evidence}
 
-    def _wait(self, predicate, checkpoint, page="screen", attempts=8):
+    def _wait(self, predicate, checkpoint, page="screen", attempts=8, *, missing_error=WorkflowError):
         for attempt in range(attempts):
             shot = self._observe(checkpoint, page)
             value = predicate(shot)
@@ -177,7 +228,164 @@ class AmapDevice:
             self._check(checkpoint)
             if attempt + 1 < attempts:
                 time.sleep(.5)
-        raise WorkflowError("高德页面未出现预期控件，请检查网络或弹窗后重新查询")
+        raise missing_error("高德页面未出现预期控件，请检查网络或弹窗后重新查询")
+
+    def _assist_page_safe(self, shot, checkpoint):
+        """Fail closed before an assist call or its postcondition.
+
+        `_observe` exposes filtered Amap nodes for the rules adapter; inspect
+        its *complete* original XML here so a foreign ancestor/window cannot
+        be silently dropped. Never use this as proof of a successful click.
+        """
+        from autoglm.executor import AutoGLMTransitDevice
+        self._check(checkpoint)
+        if AutoGLMTransitDevice._foreground(self) != PACKAGE:
+            raise WorkflowError("高德不在前台，不能使用 AutoGLM 辅助")
+        try:
+            full = list(ET.fromstring(shot["xml"]).iter("node"))
+        except (ET.ParseError, TypeError, KeyError):
+            raise WorkflowError("无法完整核对高德窗口，未使用 AutoGLM 辅助") from None
+        if not full:
+            raise WorkflowError("无法完整核对高德窗口，未使用 AutoGLM 辅助")
+        parents = {child: node for node in full for child in node}
+        def visible(node):
+            while node is not None:
+                if node.get("visible-to-user") == "false" or node.get("enabled") == "false":
+                    return False
+                node = parents.get(node)
+            return True
+        visible_nodes = [n for n in full if visible(n)]
+        for node in visible_nodes:
+            package = node.get("package", "")
+            if package and package != PACKAGE and bounds(node):
+                raise WorkflowError("当前页面存在其他应用的可见覆盖，未使用 AutoGLM 辅助")
+            if package == PACKAGE and bounds(node):
+                ancestor = parents.get(node)
+                while ancestor is not None:
+                    ancestor_package = ancestor.get("package", "")
+                    if ancestor_package and ancestor_package != PACKAGE:
+                        raise WorkflowError("当前高德控件位于其他应用窗口内，未使用 AutoGLM 辅助")
+                    ancestor = parents.get(ancestor)
+            rid = node.get("resource-id", "").lower()
+            cls = node.get("class", "").lower()
+            text = label(node)
+            if (any(mark in rid for mark in ("loading_view", "loading_text", "permission", "parentpanel"))
+                    or any(mark in cls for mark in ("dialog", "popupwindow"))
+                    or re.search(r"正在加载|网络不佳|网络不可用|网络连接失败|登录账号|登录账户|输入密码|验证码|权限请求|允许访问", text)):
+                raise WorkflowError("高德页面有加载、权限、登录或错误提示，未使用 AutoGLM 辅助")
+        for suffix in ("route_edit_summary_start", "route_edit_summary_end"):
+            fields = [n for n in visible_nodes if n.get("package") == PACKAGE
+                      and n.get("resource-id") == ID + suffix and bounds(n)]
+            if len(fields) != 1:
+                raise WorkflowError("当前高德路线字段未完整可见，未使用 AutoGLM 辅助")
+        self._check(checkpoint)
+        if shot.get("epoch") != self.base.context_epoch:
+            raise ScreenContextChanged("高德页面上下文已变化，辅助动作已废弃")
+
+    def _select_public_transit(self, places, checkpoint):
+        """Rules first; only this verified route-page miss can invoke assist.
+
+        A successful assist owns the click and its postcondition, so there is
+        no second rule click. Wrong pages, bridge errors and cancellation are
+        not target misses and propagate unchanged.
+        """
+        def route_page(shot, *, verify_assist=False):
+            if verify_assist:
+                self._assist_page_safe(shot, checkpoint)
+            fields = {}
+            for role, suffix in (("origin", "route_edit_summary_start"), ("destination", "route_edit_summary_end")):
+                nodes = [n for n in shot["nodes"] if n.get("resource-id") == ID + suffix and bounds(n)]
+                if len(nodes) != 1:
+                    raise WorkflowError("当前页面不是可核对起终点的高德路线页")
+                fields[role] = clean(nodes[0].get("text"))
+            expected = self.request.get("origin")
+            if ((place_key(fields["origin"]) != place_key(places["origin"]["name"]) if expected
+                 else fields["origin"] != "我的位置")
+                    or place_key(fields["destination"]) != place_key(places["destination"]["name"])):
+                raise WorkflowError("高德起终点与本次明确需求不一致，未操作公共交通入口")
+
+        def target(shot):
+            route_page(shot)
+            # Preserve the existing exact-label rule and its clickable-parent
+            # preference; assistance must not replace a working rule.
+            original = self._text_target(shot, "公共交通")
+            if original is not None:
+                return original
+            # Known text aliases are accepted only on the verified native
+            # route-mode control, not arbitrary map/search text.
+            aliases = {"公交", "公交地铁", "公交/地铁"}
+            candidates = [n for n in shot["nodes"] if n.get("resource-id") == ID + "route_input_conbine_text"
+                          and label(n) in aliases and bounds(n) and n.get("visible-to-user") != "false"
+                          and n.get("enabled") != "false"]
+            if len(candidates) > 1:
+                raise WorkflowError("高德公共交通入口存在歧义，未执行点击")
+            if candidates:
+                return candidates[0]
+            # Normal rule hits retain their established path. Only a real
+            # miss that might later invoke the model needs the stricter full
+            # window/foreground preflight on every bounded observation.
+            if os.environ.get("SILVERGUIDE_AUTOGLM_ASSIST_ENABLED", "false").lower() == "true":
+                self._assist_page_safe(shot, checkpoint)
+            return None
+
+        def completed(shot):
+            route_page(shot, verify_assist=True)
+            # Amap marks multiple transport tabs selected=true simultaneously;
+            # those flags do not prove transit mode. Require the distinct,
+            # current public-transit preference strip instead.
+            parents = {child: parent for parent in shot["nodes"] for child in parent}
+            strips = [n for n in shot["nodes"]
+                      if n.get("class", "").endswith("SpringHorizontalScrollView")
+                      and n.get("scrollable") == "true" and bounds(n)]
+            valid = []
+            def visible(node):
+                while node is not None:
+                    if node.get("package") not in (None, "", PACKAGE) or node.get("visible-to-user") == "false" or node.get("enabled") == "false":
+                        return False
+                    node = parents.get(node)
+                return True
+            for strip in strips:
+                if not visible(strip):
+                    continue
+                names = {label(n) for n in strip.iter("node") if visible(n) and bounds(n)}
+                if (len(names & {"高德推荐", "地铁优先", "步行少", "换乘少", "时间短", "不坐地铁"}) >= 2
+                        and names & {"地铁优先", "换乘少", "不坐地铁"}):
+                    valid.append(strip)
+            return len(valid) == 1
+
+        try:
+            shot, node = self._wait(target, checkpoint, "route_list", attempts=8,
+                                    missing_error=ExpectedTransitControlMissing)
+        except ExpectedTransitControlMissing:
+            if os.environ.get("SILVERGUIDE_AUTOGLM_ASSIST_ENABLED", "false").lower() != "true":
+                raise
+            self._assist_trigger = "expected_control_not_found"
+        else:
+            inject = False
+            if (os.environ.get("SILVERGUIDE_AUTOGLM_ASSIST_ENABLED", "false").lower() == "true"
+                    and os.environ.get("SILVERGUIDE_AUTOGLM_ASSIST_TEST_MISS", "").lower() == "transit"):
+                self._assist_page_safe(shot, checkpoint)
+                # Persistent exclusive claim: restarting/re-entering the same
+                # task/query cannot inject a second artificial rules miss.
+                try:
+                    with (self.folder / "autoglm-assist-controlled-test.claim").open("x", encoding="utf-8") as claim:
+                        claim.write("transit\n")
+                    inject = True
+                except FileExistsError:
+                    pass
+            if not inject:
+                self._tap(shot, node, checkpoint, role="transit", page="route_list")
+                return
+            self._assist_trigger = "controlled_test_miss"
+        from autoglm.assist import AutoGLMAssist
+        if self._assist is None:
+            self._assist = AutoGLMAssist(self)
+            self._assist_sessions[(self.task_id, self.query_id)] = self._assist
+        self._assist.tap("transit", checkpoint, completed, precondition=route_page)
+        self._check(checkpoint)
+        # The step is confirmed and control has returned to the rules flow;
+        # this explicitly does not assert that the final route is verified.
+        self._assist._record(step="transit", status="continued_rules", call_number=self._assist.calls)
 
     def _guard(self, shot, node, role, page, *, action="tap_element", text=""):
         from perception.transit import describe_transit
@@ -270,9 +478,72 @@ class AmapDevice:
                     or not 300 < rect[1] < 2000 or not 2 <= len(text) <= 120):
                 continue
             leaves = [label(n) for n in node.iter("node") if n is not node and n in visible and not list(n) and bounds(n) and label(n)]
-            if text in leaves or leaves and all(len(s) == 1 for s in leaves) and "".join(leaves) == text:
+            # A compact station preview appends category/recent-view badges
+            # after the exact title glyphs. Those badges are not part of the
+            # identity and no arbitrary trailing text is discarded.
+            glyphs = leaves[:len(text)]
+            split_title = (glyphs and all(len(s) == 1 for s in glyphs) and "".join(glyphs) == text
+                           and all(s in {"地铁站", "最近浏览", "浏览过", "刚刚浏览"} for s in leaves[len(text):]))
+            if text in leaves or split_title:
                 names.add(text)
         return names
+
+    @staticmethod
+    def _compact_poi_header(shot):
+        """Recognize one actual compact main-POI header, never a result row.
+
+        The POI footer distinguishes this page from search/history. Identity
+        and a literal address must share a bounded, full-width native header
+        above gates and recommendation sections. Returned bounds are original
+        device bounds; no coordinates or evidence are shifted into a header.
+        """
+        ns = [n for n in AmapDevice._visible_place_nodes(shot.get("nodes", []))
+              if n.get("package") == PACKAGE and n.get("enabled") != "false"]
+        labels = {label(n) for n in ns}
+        if not {"周边", "分享", "导航", "路线"} <= labels:
+            return None
+        if labels.intersection({"搜索历史", "历史记录", "历史搜索", "清空历史", "清除历史", "最近搜索", "搜索发现"}):
+            return None
+        rects = [bounds(n) for n in ns if bounds(n)]
+        full = [r for r in rects if r[:2] == [0, 0]]
+        width = shot.get("width") or max((r[2] for r in full), default=0)
+        height = shot.get("height") or max((r[3] for r in full), default=0)
+        if not width or not height:
+            return None
+        parents = {child: parent for parent in ns for child in parent}
+        visible = set(ns)
+        names = AmapDevice._poi_title_names({"nodes": ns})
+        excluded = re.compile(r"^(?:相似服务推荐|相关推荐|热门推荐|用户评价|用户评论|用户点评|全部评价|全部评论|网友评论|热门评论|精选评论)")
+        stop = min((bounds(n)[1] for n in ns if bounds(n) and excluded.match(label(n))), default=height)
+        footer_top = min((bounds(n)[1] for n in ns if bounds(n) and label(n) in {"周边", "分享", "导航", "路线"}), default=height)
+        administrative = r"(?:[\u4e00-\u9fff]{2,}(?:省|市|区|县|自治区|自治州)){1,5}"
+        def contained(inner, outer):
+            return outer[0] <= inner[0] < inner[2] <= outer[2] and outer[1] <= inner[1] < inner[3] <= outer[3]
+        found = {}
+        for title in ns:
+            tr = bounds(title)
+            if (label(title) not in names or title.get("class") != "android.view.ViewGroup" or not tr
+                    or tr[1] < 800 or tr[1] >= stop):
+                continue
+            parent = parents.get(title)
+            while parent is not None:
+                rect = bounds(parent)
+                if (parent in visible and rect and not label(parent) and parent.get("class") == "android.view.ViewGroup"
+                        and rect[2] - rect[0] >= width * .85 and 180 <= rect[3] - rect[1] <= min(600, height * .28)
+                        and 0 <= tr[1] - rect[1] <= 120 and rect[3] <= min(stop, footer_top) and contained(tr, rect)):
+                    children = [n for n in parent.iter("node") if n in visible and bounds(n) and contained(bounds(n), rect)]
+                    primary = {label(n) for n in children if n.get("class") == "android.view.ViewGroup" and label(n) in names}
+                    addresses = [n for n in children if not list(n) and bounds(n)[1] >= tr[3] and len(clean(n.get("text"))) > 1
+                                 and (re.fullmatch(administrative, clean(n.get("text"))) or re.search(
+                                     r"[\u4e00-\u9fffA-Za-z\d]{2,}(?:路|街|大道|巷|弄|道|村|镇|乡)", clean(n.get("text"))))
+                                 and not re.search(r"榜|排名|搜索|评价|评论|评分|人气|推荐|附近|途经线路|开往|号线", clean(n.get("text")))]
+                    forbidden = any(excluded.match(label(n)) or re.fullmatch(r"[A-Z]口", label(n)) for n in children)
+                    if primary == {label(title)} and addresses and not forbidden:
+                        key = (label(title), tuple(rect))
+                        found[key] = {"name": label(title), "bounds": list(rect), "title_node": title}
+                        break
+                parent = parents.get(parent)
+        return next(iter(found.values())) if len(found) == 1 else None
 
     def _text_target(self, shot, text):
         matches = [n for n in shot["nodes"] if label(n) == text and bounds(n)]
@@ -511,14 +782,21 @@ class AmapDevice:
             raise
         return {"kind":"place","place":self._read_place(detail,name,selected=chosen,candidate=candidate)}
 
-    def _read_place(self,detail,name,*,selected=None,candidate=None):
+    def _read_place(self,detail,name,*,selected=None,candidate=None,header_bounds=None):
         city=self.request.get("city", "")
         visible_nodes = self._visible_place_nodes(detail["nodes"])
+        if header_bounds is not None:
+            compact = self._compact_poi_header(detail)
+            if not compact or compact["bounds"] != list(header_bounds) or compact["name"] != name:
+                raise WorkflowError("高德紧凑地点主卡片无法独立核对，未采纳地点字段")
+            visible_nodes = [n for n in visible_nodes if bounds(n) and
+                             header_bounds[0] <= bounds(n)[0] < bounds(n)[2] <= header_bounds[2] and
+                             header_bounds[1] <= bounds(n)[1] < bounds(n)[3] <= header_bounds[3]]
         administrative = r"(?:[\u4e00-\u9fff]{2,}(?:省|市|区|县|自治区|自治州)){1,5}"
         addresses=[]
         for n in visible_nodes:
             text=clean(n.get("text"))
-            if (not bounds(n) or bounds(n)[1]>=800 or len(text)<=1
+            if (not bounds(n) or (header_bounds is None and bounds(n)[1]>=800) or len(text)<=1
                     or place_key(text,city)==place_key(name,city)
                     or re.search(r"榜|排名|搜索|评价|评论|评分|人气|推荐|附近|途经线路|开往|景区|共省",text)
                     or "号线" in text or re.fullmatch(r"(?:夜|高峰快线)?\d+路",text)):
@@ -744,16 +1022,150 @@ class AmapDevice:
         transport=getattr(self.base,"transport",None)
         previous=getattr(transport,"prefer_transit_bridge",False) if transport else False
         if transport: transport.prefer_transit_bridge=True
+        self._query_in_progress = True
         try:
-            return self._query(request,task_id,query_id,checkpoint,choices)
+            identity = (task_id, query_id)
+            epoch = self.base.context_epoch
+            attempt = self._resume_attempts.get(identity, 0)
+            try:
+                if attempt:
+                    outcome = self._query(request,task_id,query_id,checkpoint,choices,attempt=attempt,
+                                          action_offset=self._resume_actions.get(identity, 0))
+                else:
+                    outcome = self._query(request,task_id,query_id,checkpoint,choices)
+                checkpoint()
+                if epoch != self.base.context_epoch:
+                    raise ScreenContextChanged("暂停恢复后，旧轮次采集结果已废弃")
+                outcome["context_epoch"] = epoch
+                return outcome
+            except ScreenContextChanged as error:
+                checkpoint()
+                # A single explicit resume can restart the *query*, never the
+                # old click/model action. Do not hide arbitrary context errors.
+                home = isinstance(error, TransitHomeInterrupted)
+                if (attempt >= 1 or not home and (epoch == self.base.context_epoch
+                        or getattr(self.base, "transit_resume_epoch", None) != self.base.context_epoch)):
+                    raise
+                context = dict(self._query_map_context) if home else None
+                self._discard_resumed_attempt(task_id, query_id, checkpoint, cause="home" if home else "resume")
+                self._resume_attempts[identity] = 1
+                if home:
+                    self._restore_query_from_home(context, checkpoint)
+                actions_used = self.actions
+                # New UI reads, native place resolution and location consent
+                # start from scratch. Action allowance is shared across both
+                # attempts; a long user pause gets a new bounded read budget.
+                resumed_epoch = self.base.context_epoch
+                outcome = self._query(request, task_id, query_id, checkpoint, {},
+                                      attempt=1, action_offset=actions_used)
+                checkpoint()
+                if resumed_epoch != self.base.context_epoch:
+                    raise ScreenContextChanged("恢复期间页面再次变化，请重新查询")
+                outcome["context_epoch"] = resumed_epoch
+                event = {"time": now(), "stage": "transit_query", "action": "restart_transit_query",
+                         "outcome": "reobserved", "attempt": 1, "query_id": query_id,
+                         "cause": "home" if home else "resume",
+                         "message": "已重新读取中断后的高德页面；地点仍需本轮确认，路线仍须独立核对"}
+                callback = getattr(self.base, "recovery_callback", None)
+                if callback:
+                    callback(event)
+                with (self.base.evidence_root / task_id / "recoveries.jsonl").open("a", encoding="utf-8") as log:
+                    log.write(json.dumps(event, ensure_ascii=False) + "\n")
+                return outcome
         finally:
+            if self._resume_attempts.get((task_id, query_id), 0):
+                self._resume_actions[(task_id, query_id)] = self.actions
+            self._query_in_progress = False
             if transport: transport.prefer_transit_bridge=previous
 
-    def _query(self, request, task_id, query_id, checkpoint, choices=None):
-        self.started=time.monotonic();self.actions=0;self.request=dict(request)
+    def _check_home_recovery(self, context, checkpoint):
+        """Allow only HOME, never an unknown app, dialog or lock screen."""
+        for attempt in range(3):
+            self._check(checkpoint)
+            policy = self.base.shell("dumpsys", "window", "policy")
+            self._check(checkpoint)
+            if re.search(r"\b(?:showing|mShowingLockscreen|mDreamingLockscreen)=true\b", policy):
+                raise WorkflowError("手机已锁屏，不能自动恢复高德，请解锁后重新查询")
+            snapshot = self.base.shell("dumpsys", "activity", "activities")
+            self._check(checkpoint)
+            if not re.search(r"mResumedActivity:\s*ActivityRecord\{[^}\n]*\scom\.huawei\.android\.launcher/[A-Za-z0-9_.$/]+\s+t\d+\b", snapshot):
+                raise WorkflowError("高德当前窗口被其他应用或提示遮挡，请本人返回高德后重新查询")
+            if not context or not self._map_task_still_exists(snapshot, context):
+                raise WorkflowError("原高德任务已结束或被替换，请重新查询")
+            # Current focus belongs to the display dump, not the windows-only
+            # list on this Huawei build. A HOME animation may briefly expose
+            # an explicit null focus; re-read every guard, never infer focus
+            # from mFocusedApp or a launcher window somewhere in the list.
+            displays = self.base.shell("dumpsys", "window", "displays")
+            self._check(checkpoint)
+            focuses = re.findall(r"^\s*mCurrentFocus=([^\n]+)", displays, re.M)
+            if len(focuses) == 1 and re.fullmatch(
+                    r"Window\{[^}\n]*\scom\.huawei\.android\.launcher/[A-Za-z0-9_.$/]+\}", focuses[0].strip()):
+                return
+            if focuses == ["null"] and attempt < 2:
+                time.sleep(.2)
+                continue
+            raise WorkflowError("当前窗口不是可核对的华为桌面，不能自动恢复高德")
+
+    def _restore_query_from_home(self, context, checkpoint):
+        # Recheck after recording the recovery, immediately before moving the
+        # exact observed task. This counts against the same GUI action limit.
+        self._check_home_recovery(context, checkpoint)
+        self._action(checkpoint)
+        self.base.shell("am", "task", "focus", str(context["android_task_id"]))
+        self._check(checkpoint)
+        expected = (context["android_task_id"], context["activity"])
+        for index in range(3):
+            snapshot = self.base.shell("dumpsys", "activity", "activities")
+            self._check(checkpoint)
+            if self._resumed_map_identity(snapshot) == expected:
+                self.base.context_epoch += 1
+                return
+            if index < 2:
+                time.sleep(.2)
+        raise WorkflowError("高德未恢复到原先记录的任务，已停止自动恢复，请重新查询")
+
+    def _discard_resumed_attempt(self, task_id, query_id, checkpoint, *, cause="resume"):
+        checkpoint()
+        folder = self.base.evidence_root / task_id / "transit" / query_id
+        folder.mkdir(parents=True, exist_ok=True)
+        discarded = {"query_id": query_id, "time": now(), "attempt": 0,
+                     "actions": self.actions, "observations": self.observations,
+                     "route_id": self.route_id}
+        (folder / ("discarded-attempt-" + uuid.uuid4().hex + ".json")).write_text(
+            json.dumps(discarded, ensure_ascii=False, indent=2), encoding="utf-8")
+        for key in list(self._detail_contexts):
+            if key[:2] == (task_id, query_id):
+                del self._detail_contexts[key]
+        context_path = folder / "view-context.json"
+        if context_path.exists():
+            context_path.rename(folder / ("discarded-view-context-" + uuid.uuid4().hex + ".json"))
+        self.observations = []
+        self.route_id = None
+        event = {"time": now(), "stage": "transit_query", "action": "restart_transit_query",
+                 "outcome": "attempting", "attempt": 1, "query_id": query_id,
+                 "cause": cause,
+                 "message": ("离开高德后正在返回已记录的原任务，并从头重新读取路线；本轮不会自动分享到钉钉" if cause == "home"
+                             else "已继续任务：正在废弃暂停前页面并从头重新核对路线；本轮不会自动分享到钉钉")}
+        checkpoint()
+        callback = getattr(self.base, "recovery_callback", None)
+        if callback:
+            callback(event)
+        with (self.base.evidence_root / task_id / "recoveries.jsonl").open("a", encoding="utf-8") as log:
+            log.write(json.dumps(event, ensure_ascii=False) + "\n")
+        checkpoint()
+
+    def _query(self, request, task_id, query_id, checkpoint, choices=None, *, attempt=0, action_offset=0):
+        self.started=time.monotonic();self.actions=action_offset;self.request=dict(request)
+        self._query_epoch=self.base.context_epoch
+        self._query_map_context=None
+        self.query_attempt=attempt
         self.query_id=query_id;self.route_id=None;self.observations=[]
+        self.task_id=task_id;self._assist=self._assist_sessions.get((task_id,query_id));self._assist_trigger=None
         self.base.task_id=task_id
         self.folder=self.base.evidence_root/task_id/"transit"/query_id
+        if attempt:
+            self.folder = self.folder / ("resume-" + str(attempt))
         self.folder.mkdir(parents=True,exist_ok=True)
         self.check_ready(checkpoint)
         queried_at=now();choices=choices or {};places={}
@@ -793,8 +1205,7 @@ class AmapDevice:
             self._set_origin(places["origin"],checkpoint)
         else:
             self._set_current_origin(checkpoint)
-        shot,_=self._wait(lambda s:next((n for n in s["nodes"] if label(n)=="公共交通"),None),checkpoint,"route_list")
-        self._tap_label("公共交通",checkpoint,"route_list")
+        self._select_public_transit(places, checkpoint)
         preference={"fewer_transfers":"换乘少","less_walking":"步行少","recommended":"高德推荐"}[request.get("preference","recommended")]
         shot,_=self._wait(lambda s:self._text_target(s,preference),checkpoint,"route_list")
         self._tap_label(preference,checkpoint,"route_list")
@@ -834,6 +1245,16 @@ class AmapDevice:
             if index<self.scroll_limit:self._scroll_detail(detail,checkpoint)
         self._check(checkpoint)
         self._progress("validating_transit", "正在核对已读取的线路、方向和上下车站", checkpoint)
+        return self.collect_observed_result(request, task_id, query_id, places, queried_at,
+                                            selected_list, collection_complete, checkpoint, last=last)
+
+    def collect_observed_result(self, request, task_id, query_id, places, queried_at,
+                                selected_list, collection_complete, checkpoint, *, last=None):
+        """Extract only observations already collected; never drive GUI navigation.
+
+        Both rules and AutoGLM use this collector and the runtime's independent
+        validator. Calling it does not grant a model's Finish any success status.
+        """
         place_refs = {ref for place in places.values() for refs in place.get("evidence_refs", {}).values() for ref in refs}
         selected=[e for e in self.observations if e["page_kind"] in {"user_request","location","place_detail","route_detail"}
                   or e["evidence_id"] in place_refs]

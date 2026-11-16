@@ -11,6 +11,9 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <queries>
         <package android:name="com.autonavi.minimap" />
+        <package android:name="com.alibaba.android.rimet" />
+        <intent><action android:name="android.media.action.STILL_IMAGE_CAMERA" /></intent>
+        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.APP_CAMERA" /></intent>
         <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
         <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
@@ -40,6 +43,11 @@
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
 
@@ -71,6 +79,12 @@
         <provider
             android:name=".TransitBridgeProvider"
             android:authorities="com.example.demo.transit"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:grantUriPermissions="false" />
+        <provider
+            android:name=".DingtalkBridgeProvider"
+            android:authorities="com.example.demo.dingtalk"
             android:exported="true"
             android:permission="android.permission.DUMP"
             android:grantUriPermissions="false" />

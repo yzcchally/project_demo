@@ -8,3 +8,4 @@ langgraph-checkpoint-sqlite==3.1.2
 websockets==17.3
 mobilerun-core[local]==1.10.1
 mobilerun-core-local==0.7.0
+Pillow==13.0.0

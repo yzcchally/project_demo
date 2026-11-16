@@ -105,19 +105,36 @@ class MobilerunTransport:
             self._device = Mobilerun().connect(serial, backend="local-android-adb")
         return self._device
 
-    def xml(self):
+    def xml(self, checkpoint=lambda: None):
+        checkpoint()
         if self.prefer_transit_bridge:
             import time
-            for attempt in range(6):
-                protected = self._protected_transit_xml()
+            # A changing tree is common during a real Amap page transition.
+            # Re-read it a few times, with fresh bridge nonces, but never use
+            # the unstable tree as evidence. Other failures keep the smaller
+            # two-call budget; callers must not add a second retry loop.
+            for attempt in range(4):
+                checkpoint()
+                # An exception before the bridge returns a new reason must not
+                # inherit a tree_changed (or other) reason from an earlier read.
+                self.last_bridge_reason = None
+                try:
+                    protected = self._protected_transit_xml()
+                except Exception:
+                    self.last_bridge_reason = None
+                    raise
+                checkpoint()
                 if protected is not None:
                     return protected
-                if attempt < 5: time.sleep(.25)
-            else:
-                # Starting UiAutomation now could unbind the very service which
-                # must perform the next Unicode input. A known bridge failing
-                # temporarily is retried; it never triggers another serializer.
-                raise RuntimeError("高德无障碍窗口暂不可用，请重新开启 Demo 无障碍服务后再试")
+                if attempt >= 1 and self.last_bridge_reason != "tree_changed":
+                    break
+                if attempt < 3:
+                    checkpoint()
+                    time.sleep(.5 if self.last_bridge_reason == "tree_changed" else .25)
+                    checkpoint()
+            # Starting UiAutomation now could unbind the very service which
+            # must perform the next Unicode input. Never fall back to it here.
+            raise RuntimeError("高德无障碍窗口暂不可用，请检查页面状态后重试")
         if self.file_xml_mode:
             return self._compatible_xml()
         try:

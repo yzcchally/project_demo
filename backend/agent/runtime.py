@@ -1,8 +1,11 @@
 from __future__ import annotations
 import hashlib
+import hmac
 import json
+import math
 import re
 import threading
+import time
 import uuid
 import secrets
 import os
@@ -12,6 +15,32 @@ from domain import *
 from storage.tasks import Store
 from storage.contacts import Contacts
 from agent.models import ModelGateway
+
+
+def dingtalk_self_requested(instruction):
+    """Only explicit requests to send to the user's own file assistant qualify."""
+    if "钉钉" not in instruction:
+        return False
+    # A model or a target name must never turn a negation, hypothetical or
+    # question into authority to send. Multiple recipients/actions require
+    # clarification; this first version only acts on a single self request.
+    blocked = ("不", "勿", "未", "没", "无需", "无须", "毋须", "无意", "暂不", "别", "禁止",
+               "如果", "假如", "假设", "倘若", "是否", "能否", "可否", "能不能", "可不可以", "会不会",
+               "如何", "怎么", "请问", "想知道", "可以", "可能", "应该", "吗", "？", "?", "暂缓", "等我", "我确认", "我同意", "我批准",
+               "老师", "同学", "朋友", "家人", "同事", "领导", "别人", "其他人", "联系人", "好友", "群聊", "所有人", "同时")
+    actions = re.findall(r"发送到|发送至|发送给|分享到|分享至|分享给|转发到|转发至|转发给|发到|发至|发给|发送|分享|转发", instruction)
+    target = re.search(r"(?:发送|分享|转发|发)(?:到|至|给)(?:我自己的|我的|本人(?:的)?|自己(?:的)?)(?:钉钉)?文件助手[。.!！\s]*$", instruction)
+    if any(word in instruction for word in blocked) or len(actions) != 1 or target is None or "给" in instruction[:target.start()]:
+        raise WorkflowError("钉钉自动分享仅支持明确请求发送到本人文件助手；请去掉否定、疑问或其他接收人后重新描述")
+    return True
+
+
+def dingtalk_text_version(task):
+    """Missing version means legacy v1; malformed/unknown never downgrade."""
+    version = task.get("dingtalk_text_version", 1)
+    if type(version) is not int or version not in {1, 2}:
+        raise WorkflowError("钉钉路线消息格式版本无效，无法核验，请手动检查且不要重发")
+    return version
 
 class Engine:
     def __init__(self, store: Store, device, interpreter=None):
@@ -24,6 +53,8 @@ class Engine:
         self.resume_pending = False
         self.current_task_id = None
         self.transit_device = None
+        self.autoglm_transit_device = None
+        self.autoglm_query_identity = None
         self.contacts = Contacts(store)
         self.models = interpreter or ModelGateway(store.directory / "model-calls")
         from agent.graph import build_graph
@@ -31,7 +62,9 @@ class Engine:
         # A restart must never replay a possible external send.
         for task in store.all():
             if task["state"] not in TERMINAL:
-                task["state"] = "outcome_unknown" if task.get("send_attempts", 0) else "interrupted"
+                task["state"] = "outcome_unknown" if task.get("send_attempts", 0) or task.get("dingtalk_send_attempts", 0) else "interrupted"
+                if task.get("dingtalk_send_attempts", 0):
+                    task["dingtalk_status"] = "unknown"
                 task["approval_digest"] = None
                 store.save(task, MESSAGES[task["state"]])
 
@@ -50,6 +83,9 @@ class Engine:
             stage = current.get("state", "")
         if restore and current.get("task_type") == "plan_transit":
             self.device.context_epoch = getattr(self.device, "context_epoch", 0) + 1
+            # Only an explicit pause/resume may restart a rules query. Other
+            # context changes must retain their fail-closed behaviour.
+            self.device.transit_resume_epoch = self.device.context_epoch
         elif restore and hasattr(self.device, "resume_context"):
             self.device.resume_context(stage)
 
@@ -251,7 +287,15 @@ class Engine:
                 if task.get("task_type") == "plan_transit":
                     if locals().get("work_query_id") is not None and task.get("query_id") != work_query_id:
                         return
-                    if task["state"] == "cancelled" or self.cancelled or isinstance(error, Cancelled):
+                    if (task.get("state") in {"sharing_transit", "verifying_dingtalk"} or task.get("dingtalk_status") in {"sending", "verifying"}
+                            or task.get("dingtalk_status") == "unknown" and task.get("dingtalk_send_attempts")):
+                        attempted = bool(task.get("dingtalk_send_attempts"))
+                        cancelled = task["state"] == "cancelled" or self.cancelled or isinstance(error, Cancelled)
+                        task.update(state="outcome_unknown" if attempted else "cancelled" if cancelled else "failed",
+                                    dingtalk_status="unknown" if attempted else "cancelled" if cancelled else "failed")
+                        message = "发送结果未知，请勿重复发送" if attempted else "分享已取消，未发送" if cancelled else "分享未完成"
+                        self.store.save(task, "路线已核对；钉钉" + message + "：" + str(error)[:180])
+                    elif task["state"] == "cancelled" or self.cancelled or isinstance(error, Cancelled):
                         task.update(state="cancelled", cancel_worker_finished_at=now())
                         if task.get("cancel_requested_at"):
                             task["cancel_delay_seconds"] = max(0.0, (datetime.fromisoformat(task["cancel_worker_finished_at"]) - datetime.fromisoformat(task["cancel_requested_at"])).total_seconds())
@@ -262,7 +306,9 @@ class Engine:
                     else:
                         task.update(state="failed", route_verified=False)
                         self.store.save(task, "路线查询未完成：" + str(error)[:300])
-                    if not self.cancelled and task["state"] != "cancelled":
+                    if (not self.cancelled and task["state"] != "cancelled"
+                            and (task.get("transit_executor", "rules") != "autoglm"
+                                 or task.get("transit_executor_started"))):
                         try:
                             self._transit_checkpoint(task_id, task["query_id"])()
                             self.device.show_app()
@@ -310,6 +356,25 @@ class Engine:
             task = self.store.get(task_id)
             if self.cancelled or task["state"] in TERMINAL | {"interrupted", "paused"}:
                 return
+            if event.get("action") == "restart_transit_query" and event.get("outcome") == "attempting":
+                if (task.get("task_type") != "plan_transit"
+                        or task["state"] not in {"planning_transit", "reading_transit", "validating_transit"}
+                        or task.get("transit_executor", "rules") != "rules"
+                        or event.get("query_id") != task.get("query_id")
+                        or task.get("transit_query_restarts", task.get("transit_resume_restarts", 0)) >= 1
+                        or task.get("dingtalk_send_attempts", 0)):
+                    raise WorkflowError("本轮路线无法再次自动恢复，请重新查询；不会重新发送")
+                notice = ("离开高德后正在返回原任务并从头重新读取路线，请核对本轮结果。" if event.get("cause") == "home"
+                          else "暂停后已废弃旧页面并从头重新读取路线，请核对本轮结果。")
+                if task.get("dingtalk_requested"):
+                    notice += "自动钉钉分享已暂停，可在核对后主动分享。"
+                task.update(transit_choices={}, place_choice=None, transit_query_restarts=1,
+                            transit_resume_restarts=0 if event.get("cause") == "home" else 1,
+                            transit_recovery_notice=notice, dingtalk_requested=False,
+                            dingtalk_status="not_requested")
+            elif event.get("action") == "restart_transit_query" and event.get("outcome") == "reobserved" and event.get("cause") == "home":
+                task["transit_recovery_notice"] = task.get("transit_recovery_notice", "").replace(
+                    "正在返回原任务并从头重新读取路线", "已返回原任务并重新读取页面")
             if event["outcome"] == "attempting":
                 task["recovery_count"] = task.get("recovery_count", 0) + 1
             task["last_recovery"] = dict(event)
@@ -363,7 +428,10 @@ class Engine:
                     self.cancelled = True
                     self.paused = False
                     self.condition.notify_all()
-                task.update(state="outcome_unknown" if task["send_attempts"] else "cancelled", approval_digest=None)
+                dingtalk_attempted = bool(task.get("dingtalk_send_attempts", 0))
+                task.update(state="outcome_unknown" if task["send_attempts"] or dingtalk_attempted else "cancelled", approval_digest=None)
+                if dingtalk_attempted:
+                    task["dingtalk_status"] = "unknown"
                 if task.get("task_type") == "plan_transit":
                     task.update(cancel_requested_at=now(), place_choice=None)
             else:
@@ -469,7 +537,10 @@ class Engine:
             if explicit_from and not request["origin"] and not any(w in instruction for w in ("当前位置", "我的位置", "现在的位置")):
                 request["use_current_location"] = False
             request = TransitRequest.model_validate(request).model_dump()
+            dingtalk_requested = dingtalk_self_requested(instruction)
             task.update(task_type="plan_transit", transit_request=request, transit_original_request=dict(request),
+                        dingtalk_requested=dingtalk_requested, dingtalk_status="pending" if dingtalk_requested else "not_requested", dingtalk_send_attempts=0,
+                        transit_executor=self._configured_transit_executor(), transit_executor_started=False,
                         transit_place_selections=[], query_id=uuid.uuid4().hex,
                         query_started_at=now(), transit_result=None, route_verified=False,
                         transit_choices={}, place_choice=None, parser="llm", request_qr=False,
@@ -553,8 +624,11 @@ class Engine:
         if reply.get("scan_nonce") != task["scan_nonce"]:
             raise WorkflowError("扫码结果已过期，请重新扫描")
         task["draft"]["url"] = validate_url(reply["url"])
-        task.update(source="qr", qr_received=True)
-        self.store.save(task, "二维码已识别，接下来打开并核对网页")
+        scan_source = reply.get("scan_source", "in_app_camera")
+        external = scan_source == "external_share"
+        task.update(source="manual" if external else "qr", qr_received=True, scan_source=scan_source)
+        self.store.save(task, "已接收您确认的分享链接，接下来打开并核对网页" if external
+                        else "二维码已识别，接下来打开并核对网页")
 
     def _human_resume(self, task_id, expected, reply):
         with self.lock:
@@ -578,12 +652,17 @@ class Engine:
             validate_url(reply["url"])
         return self._human_resume(task_id, "needs_clarification", reply)
 
-    def submit_qr(self, task_id, url, scan_nonce):
+    def submit_qr(self, task_id, url, scan_nonce, scan_source="in_app_camera"):
         task = self.store.get(task_id)
         self._require_mail(task)
         if scan_nonce != task.get("scan_nonce"):
             raise WorkflowError("扫码结果已过期，请重试")
-        return self._human_resume(task_id, "awaiting_qr", {"url": validate_url(url), "scan_nonce": scan_nonce})
+        if scan_source not in {"in_app_camera", "external_share"}:
+            raise WorkflowError("扫码结果来源无效")
+        reply = {"url": validate_url(url), "scan_nonce": scan_nonce}
+        if scan_source == "external_share":
+            reply["scan_source"] = scan_source
+        return self._human_resume(task_id, "awaiting_qr", reply)
 
     def edit(self, task_id, changes):
         with self.lock:
@@ -631,7 +710,28 @@ class Engine:
                     raise Cancelled("路线操作已取消或过期")
         return check
 
-    def _transit_adapter(self):
+    @staticmethod
+    def _configured_transit_executor():
+        mode = os.environ.get("SILVERGUIDE_TRANSIT_EXECUTOR", "rules").strip()
+        if mode not in {"rules", "autoglm"}:
+            raise WorkflowError("SILVERGUIDE_TRANSIT_EXECUTOR 只能配置为 rules 或 autoglm")
+        return mode
+
+    def _transit_adapter(self, task=None):
+        # Legacy tasks are rules tasks. A resumed graph must not adopt a new
+        # process default halfway through its query. Source viewing (no task)
+        # reuses the old independently checked viewer, not a new query loop.
+        mode = (task or {}).get("transit_executor", "rules")
+        if mode == "autoglm":
+            identity = (task["id"], task["query_id"])
+            if self.autoglm_transit_device is None or self.autoglm_query_identity != identity:
+                from autoglm.executor import AutoGLMTransitDevice
+                adapter = AutoGLMTransitDevice(self.device, self.models)
+                self.autoglm_transit_device = adapter
+                self.autoglm_query_identity = identity
+            return self.autoglm_transit_device
+        if mode != "rules":
+            raise WorkflowError("当前查询的高德执行模式无效，请开始新的查询")
         if self.transit_device is None:
             from device.amap import AmapDevice
             self.transit_device = AmapDevice(self.device, self.models)
@@ -641,7 +741,7 @@ class Engine:
         task = self.store.get(task_id)
         check = self._transit_checkpoint(task_id, task["query_id"])
         check()
-        self._transit_adapter().check_ready(check)
+        self._transit_adapter(task).check_ready(check)
         check()
 
     def _query_transit(self, task_id):
@@ -650,13 +750,20 @@ class Engine:
         task = self.store.get(task_id)
         query_id = task["query_id"]
         check = self._transit_checkpoint(task_id, query_id)
-        self._stage(task_id, "planning_transit")
-        adapter = self._transit_adapter()
+        task = self._stage(task_id, "planning_transit")
+        adapter = self._transit_adapter(task)
+        adapter.instruction = task.get("instruction", "")
         adapter.progress_callback = lambda stage, message: self._transit_progress(task_id, query_id, stage, message)
+        adapter.agent_progress_callback = lambda record: self._transit_agent_progress(task_id, query_id, record)
+        if task.get("transit_executor") == "autoglm":
+            task["transit_executor_started"] = True
+            self.store.save(task, "AutoGLM 正在观察手机并逐步决定高德查询动作")
         outcome = adapter.query(dict(task["transit_request"]), task_id, query_id, check,
                                 choices=dict(task.get("transit_choices", {})))
         check()  # A model/system call returning after cancellation cannot commit results.
         with self.condition:
+            if outcome.get("context_epoch", getattr(self.device, "context_epoch", 0)) != getattr(self.device, "context_epoch", 0):
+                raise WorkflowError("暂停恢复后本轮采集结果已过期，请重新查询")
             task = self._transit_task(task_id, query_id)
             if outcome.get("kind") == "clarification":
                 fields = outcome.get("fields", ["origin"])
@@ -705,17 +812,206 @@ class Engine:
                                      collection_complete=bool(outcome.get("collection_complete")),
                                      selected_places=task.get("transit_choices", {}))
             check()
+            if outcome.get("context_epoch", getattr(self.device, "context_epoch", 0)) != getattr(self.device, "context_epoch", 0):
+                raise WorkflowError("核验期间页面已暂停恢复，请重新查询")
             task = self._transit_task(task_id, query_id)
             classification = result["classification"]
             state = {"COMPLETE": "completed", "PARTIAL": "partial", "NO_ROUTE": "no_route", "FAILED": "failed"}[classification]
+            share_requested = bool(task.get("dingtalk_requested")) and state == "completed" and bool(result["route_verified"])
+            if share_requested:
+                state = "sharing_transit"
             task.update(state=state, transit_result=result, route_verified=bool(result["route_verified"]),
                         transit_explanation=explain_result(result), place_choice=None, query_finished_at=now(),
                         transit_missing_fields=[], transit_clarification_message="")
             self.store.save(task, {"completed": "高德路线已核对，已保留分步路线供您查看和朗读",
+                "sharing_transit": "高德路线已核对，正在准备分享到您的钉钉文件助手",
                 "partial": "路线信息只读取了一部分，请查看缺失提示并在高德核对",
                 "no_route": "高德当前没有可用的公交地铁方案，请调整起终点或稍后再查",
                 "failed": "高德路线查询未完成，请查看原因后重新查询"}[state])
+        if share_requested:
+            self._share_transit_to_self(task_id, query_id)
         return "done"
+
+    def _share_transit_to_self(self, task_id, query_id):
+        from device.dingtalk import DingTalkDevice, route_text
+        check = self._transit_checkpoint(task_id, query_id)
+        check()
+        with self.condition:
+            task = self._transit_task(task_id, query_id)
+            route = task.get("transit_result") or {}
+            if (task.get("state") != "sharing_transit" or not task.get("dingtalk_requested")
+                    or task.get("dingtalk_send_attempts", 0) or not task.get("route_verified")
+                    or route.get("classification") != "COMPLETE" or not route.get("route_verified")
+                    or route.get("query_id") != query_id or route.get("task_id") != task_id):
+                raise WorkflowError("钉钉分享与当前核验路线不一致，已停止")
+            task.update(dingtalk_status="sending", dingtalk_query_id=query_id)
+            self.store.save(task, "路线已核对，正在定位您自己的钉钉文件助手")
+        text_version = 2
+        message_digest = hashlib.sha256(route_text(task_id, query_id, route, version=text_version).encode("utf-8")).hexdigest()
+        expected_recipient_digest = None
+
+        def before_send(recipient_digest):
+            nonlocal expected_recipient_digest
+            check()
+            with self.condition:
+                current = self._transit_task(task_id, query_id)
+                route_now = current.get("transit_result") or {}
+                if (current.get("state") != "sharing_transit" or current.get("dingtalk_status") != "sending"
+                        or current.get("dingtalk_send_attempts", 0) or current.get("dingtalk_query_id") != query_id
+                        or not current.get("route_verified") or route_now != route
+                        or not isinstance(recipient_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", recipient_digest)):
+                    raise WorkflowError("钉钉发送上下文已变化，已停止")
+                current.update(dingtalk_send_attempts=1, dingtalk_send_started_at=now(),
+                               dingtalk_recipient_digest=recipient_digest, dingtalk_message_digest=message_digest,
+                               dingtalk_text_version=text_version)
+                self.store.save(current, "已登记本次钉钉单次发送尝试")
+                expected_recipient_digest = recipient_digest
+
+        dingtalk = DingTalkDevice(self.device)
+        result = dingtalk.share_self(task_id, query_id, route, check, before_send, text_version=text_version)
+        check()
+        if not isinstance(result, dict) or result.get("status") not in {"sent", "unknown"}:
+            raise WorkflowError("钉钉分享返回状态无效")
+        def checked_record():
+            task = self._transit_task(task_id, query_id)
+            if (task.get("state") != "sharing_transit" or task.get("dingtalk_status") != "sending"
+                    or task.get("dingtalk_send_attempts") != 1 or task.get("dingtalk_query_id") != query_id
+                    or not task.get("route_verified") or task.get("transit_result") != route
+                    or dingtalk_text_version(task) != text_version
+                    or not isinstance(expected_recipient_digest, str)
+                    or not hmac.compare_digest(task.get("dingtalk_recipient_digest") or "", expected_recipient_digest)
+                    or not hmac.compare_digest(task.get("dingtalk_message_digest") or "", message_digest)
+                    or not hmac.compare_digest(hashlib.sha256(route_text(task_id, query_id, route, version=text_version).encode("utf-8")).hexdigest(), message_digest)):
+                raise WorkflowError("钉钉发送结果与已登记的路线或消息不一致，不能标记为成功")
+            return task
+
+        with self.condition:
+            task = checked_record()
+            if result["status"] == "unknown":
+                self.store.save(task, "首次未能确认钉钉结果，正在再次只读核验；不会重新发送")
+        if result["status"] == "unknown":
+            # The share is already durably attempted. One bounded read-only
+            # recheck may navigate back to the same self chat; it cannot call
+            # share_self or dispatch a second send.
+            try:
+                check()
+                self.device.show_app()
+                check()
+                time.sleep(.5)
+                check()
+                with self.condition:
+                    checked_record()
+                checked = dingtalk.verify_self(task_id, query_id, route, check, expected_recipient_digest, text_version=text_version)
+                check()
+                if not isinstance(checked, dict) or checked.get("status") not in {"sent", "unknown"}:
+                    raise WorkflowError("钉钉只读核验返回状态无效")
+                result = checked
+            except (Cancelled, WorkflowError):
+                raise
+            except Exception:
+                # Device or SDK failures cannot establish success. Cancellation
+                # or context changes discovered by checkpoint still propagate.
+                check()
+                result = {"status": "unknown"}
+        check()
+        with self.condition:
+            task = checked_record()
+            sent = result["status"] == "sent"
+            task.update(state="completed" if sent else "outcome_unknown", dingtalk_status="sent" if sent else "unknown")
+            self.store.save(task, "路线已核对并已发送到您的钉钉文件助手" if sent else "路线已核对；钉钉发送结果未知，请勿重复发送")
+
+    def verify_dingtalk(self, task_id, query_id):
+        """Schedule one read-only recheck of the exact previously attempted share."""
+        from device.dingtalk import route_text
+        with self.condition:
+            task = self._transit_task(task_id, query_id)
+            route = task.get("transit_result") or {}
+            if (task.get("state") != "outcome_unknown" or task.get("dingtalk_status") != "unknown"
+                    or task.get("dingtalk_send_attempts") != 1 or task.get("dingtalk_query_id") != query_id
+                    or not task.get("route_verified") or route.get("classification") != "COMPLETE"
+                    or route.get("route_verified") is not True or route.get("task_id") != task_id
+                    or route.get("query_id") != query_id
+                    or not re.fullmatch(r"[a-f0-9]{64}", task.get("dingtalk_recipient_digest") or "")
+                    or not re.fullmatch(r"[a-f0-9]{64}", task.get("dingtalk_message_digest") or "")):
+                raise WorkflowError("无法绑定原发送的本人会话名称和路线消息，不能自动核验；请手动检查，不要重发")
+            text_version = dingtalk_text_version(task)
+            message_digest = hashlib.sha256(route_text(task_id, query_id, route, version=text_version).encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(message_digest, task["dingtalk_message_digest"]):
+                raise WorkflowError("路线消息与原发送内容不一致，不能自动核验，请手动检查且不要重发")
+            if self.worker and self.worker.is_alive() or any(t["id"] != task_id and t["state"] not in TERMINAL | {"interrupted"} for t in self.store.all()):
+                raise WorkflowError("手机正由其他任务使用，请稍后核查")
+            task.update(state="verifying_dingtalk", dingtalk_status="verifying")
+            self.store.save(task, "正在只读核查钉钉本人会话，不会重新发送")
+            self._launch(self._verify_dingtalk_only, task_id)
+            return task
+
+    def _verify_dingtalk_only(self, task_id):
+        from device.dingtalk import DingTalkDevice, route_text
+        task = self.store.get(task_id)
+        query_id = task["query_id"]
+        route, recipient_digest, message_digest = task["transit_result"], task["dingtalk_recipient_digest"], task["dingtalk_message_digest"]
+        text_version = dingtalk_text_version(task)
+        check = self._transit_checkpoint(task_id, query_id)
+        check()
+        result = DingTalkDevice(self.device).verify_self(task_id, query_id, route, check, recipient_digest, text_version=text_version)
+        check()
+        if not isinstance(result, dict) or result.get("status") not in {"sent", "unknown"}:
+            raise WorkflowError("钉钉只读核验返回状态无效")
+        with self.condition:
+            current = self._transit_task(task_id, query_id)
+            if (current.get("state") != "verifying_dingtalk" or current.get("dingtalk_send_attempts") != 1
+                    or current.get("dingtalk_query_id") != query_id or current.get("dingtalk_recipient_digest") != recipient_digest
+                    or current.get("transit_result") != route or not hmac.compare_digest(current.get("dingtalk_message_digest") or "", message_digest)
+                    or dingtalk_text_version(current) != text_version
+                    or not hmac.compare_digest(hashlib.sha256(route_text(task_id, query_id, route, version=text_version).encode("utf-8")).hexdigest(), message_digest)):
+                raise WorkflowError("钉钉核验上下文已变化，已停止")
+            verified = result["status"] == "sent"
+            current.update(state="completed" if verified else "outcome_unknown", dingtalk_status="sent" if verified else "unknown")
+            self.store.save(current, "已在钉钉本人文件助手核对到本次路线消息" if verified else "钉钉发送结果仍未知，请勿重复发送")
+        try:
+            self.device.show_app()
+        except Exception:
+            pass  # Result has already been durably recorded; never repeat the send.
+
+    def _transit_agent_progress(self, task_id, query_id, record):
+        """Small public audit summaries; raw thoughts/text never enter events."""
+        self._transit_checkpoint(task_id, query_id)()
+        allowed = {"step", "action", "status", "model", "latency_ms", "proposed_point", "executed_point",
+                   "before_observation_id", "after_observation_id", "reason_code"}
+        if not isinstance(record, dict):
+            raise WorkflowError("AutoGLM 进度元数据无效")
+        summary = {key: value for key, value in record.items() if key in allowed and value is not None}
+        if ("reason_code" not in summary and isinstance(record.get("reason"), str)
+                and re.fullmatch(r"[a-z0-9_]{1,80}", record["reason"])):
+            summary["reason_code"] = record["reason"]
+        # Keep the callback a bounded metadata channel, not an alternate route
+        # result/intent writer or a place to persist arbitrary model responses.
+        if not isinstance(summary.get("step"), int) or isinstance(summary["step"], bool) or not 1 <= summary["step"] <= 1000:
+            raise WorkflowError("AutoGLM 进度步骤无效")
+        for key, value in summary.items():
+            if key not in {"step", "latency_ms", "proposed_point", "executed_point"} and (
+                    not isinstance(value, str) or len(value) > 160 or any(ord(ch) < 32 for ch in value)):
+                raise WorkflowError("AutoGLM 进度元数据无效")
+            if key == "latency_ms" and (type(value) is not int or not 0 <= value <= 3600000):
+                raise WorkflowError("AutoGLM 进度耗时无效")
+            if key in {"proposed_point", "executed_point"} and (not isinstance(value, (list, tuple))
+                    or len(value) != 2 or any(type(n) not in {int, float} or not math.isfinite(n) or not 0 <= n <= 100000 for n in value)):
+                raise WorkflowError("AutoGLM 进度坐标无效")
+        with self.condition:
+            task = self._transit_task(task_id, query_id)
+            if task.get("transit_executor") != "autoglm" or task["state"] not in {"planning_transit", "reading_transit", "validating_transit"}:
+                return False
+            summary.update(task_id=task_id, query_id=query_id)
+            task["transit_agent_step"] = summary["step"]
+            task["transit_agent_last_action"] = summary
+            task["transit_agent_events"] = (task.get("transit_agent_events", []) + [summary])[-20:]
+            action_label = {"Launch": "打开高德", "Tap": "点击当前控件", "Type": "填写地点", "Swipe": "滚动页面",
+                            "Back": "返回上一页", "Wait": "等待页面", "Finish": "核对路线结果",
+                            "Take_over": "请求本人协助", "Interact": "请求本人协助"}.get(summary.get("action"), "读取当前页面")
+            status_label = {"executed": "已执行", "rejected": "已停止", "discarded": "已废弃旧动作",
+                            "verification_requested": "准备核验", "proposed": "正在检查"}.get(summary.get("status"), "处理中")
+            self.store.save(task, f"AutoGLM 第 {summary['step']} 步：{action_label}（{status_label}）")
+            return True
 
     def _transit_progress(self, task_id, query_id, stage, message):
         """Publish only this worker's current query; progress cannot finalize it."""
@@ -843,10 +1139,18 @@ class Engine:
             if self.worker and self.worker.is_alive() or any(t["id"] != task_id and t["state"] not in TERMINAL | {"interrupted"} for t in self.store.all()):
                 raise WorkflowError("手机正由其他任务使用，请稍后重新查询")
             if task.get("transit_result"):
-                task.setdefault("transit_history", []).append({"query_id": task["query_id"], "result": task["transit_result"]})
+                task.setdefault("transit_history", []).append({"query_id": task["query_id"], "result": task["transit_result"],
+                    "transit_executor": task.get("transit_executor", "rules")})
             request = dict(task["transit_request"])
             if answer.preference is not None: request["preference"] = answer.preference
+            executor = self._configured_transit_executor()
+            task.pop("dingtalk_text_version", None)
             task.update(query_id=uuid.uuid4().hex, query_started_at=now(), transit_request=TransitRequest.model_validate(request).model_dump(),
+                        dingtalk_requested=False, dingtalk_status="not_requested", dingtalk_send_attempts=0, dingtalk_query_id=None,
+                        dingtalk_recipient_digest=None, dingtalk_message_digest=None,
+                        transit_executor=executor, transit_executor_started=False,
+                        transit_agent_step=0, transit_agent_last_action=None, transit_agent_events=[],
+                        transit_resume_restarts=0, transit_query_restarts=0, transit_recovery_notice="",
                         state="planning_transit", route_verified=False, transit_result=None, transit_explanation="",
                         transit_choices={}, place_choice=None, transit_missing_fields=[], transit_clarification_message="",
                         graph_run=task.get("graph_run", 1) + 1, intake_complete=True)

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 import gmail_demo
 from agent.runtime import Engine
+from device.dingtalk import route_text as canonical_dingtalk_route_text
 from api.schemas import TaskIntent, TransitRequest
 from domain import WorkflowError
 from evaluation.metrics import outcome
@@ -99,6 +100,15 @@ class Map:
     def show_details(self, result, checkpoint):
         checkpoint()
         self.calls.append(("show", result["query_id"]))
+
+
+@pytest.fixture(autouse=True)
+def _rules_executor_configuration(monkeypatch):
+    # This module exercises the original rules adapter doubles, including the
+    # restart test which builds its own Engine rather than using ``engine``.
+    # A developer's local AutoGLM selection must not change what is under test.
+    # Scope is this module only; AutoGLM tests select their own mode explicitly.
+    monkeypatch.setenv("SILVERGUIDE_TRANSIT_EXECUTOR", "rules")
 
 
 @pytest.fixture
@@ -651,3 +661,331 @@ def test_cancelled_position_selection_never_becomes_an_explicit_start(engine):
     task = engine.store.get(task["id"])
     assert task["state"] == "cancelled" and not task["transit_choices"]
     assert task["transit_request"]["origin"] == "" and task["transit_request"]["use_current_location"]
+
+@pytest.mark.parametrize('instruction,expected', [
+    ('从广州塔到体育西路，查询公交', False),
+    ('查询公交后发送到我的钉钉文件助手', True),
+    ('查路线并分享给我自己的钉钉文件助手', True),
+])
+def test_dingtalk_requires_explicit_self_target(instruction, expected):
+    from agent.runtime import dingtalk_self_requested
+    assert dingtalk_self_requested(instruction) is expected
+
+@pytest.mark.parametrize('instruction', [
+    '路线发到钉钉', '把路线发送给老师的钉钉', '我想把路线发给钉钉同学', '把路线发给老师的钉钉文件助手',
+    '查完不要发送到我的钉钉文件助手', '不要把路线分享到我的钉钉文件助手', '我不需要发送到我的钉钉文件助手',
+    '假如查询成功再发送到我的钉钉文件助手', '如果我同意才发送到我的钉钉文件助手',
+    '是否可以发送到我的钉钉文件助手？', '怎么发送到我的钉钉文件助手', '可以发送到我的钉钉文件助手', '等我确认后发送到我的钉钉文件助手',
+    '把路线发给老师，再发送到我的钉钉文件助手', '发送到我的钉钉文件助手和同学',
+    '发送到我的钉钉文件助手，然后给老师发一份', '路线结果和钉钉文件助手',
+    '发到我的钉钉文件助手。再给小明一份', '把路线给小明和发送到我的钉钉文件助手',
+])
+def test_dingtalk_ambiguous_recipient_is_rejected(instruction):
+    from agent.runtime import dingtalk_self_requested
+    with pytest.raises(WorkflowError, match='文件助手'):
+        dingtalk_self_requested(instruction)
+
+@pytest.mark.parametrize('outcome,expected_state,expected_status,expected_attempts', [
+    ('sent', 'completed', 'sent', 1),
+    ('unknown', 'outcome_unknown', 'unknown', 1),
+    ('before_failure', 'failed', 'failed', 0),
+    ('before_cancel', 'cancelled', 'cancelled', 0),
+    ('after_failure', 'outcome_unknown', 'unknown', 1),
+    ('after_cancel', 'outcome_unknown', 'unknown', 1),
+])
+def test_self_dingtalk_share_runs_once_only_after_verified_route(engine, monkeypatch, outcome, expected_state, expected_status, expected_attempts):
+    import sys, types
+    calls = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            checkpoint()
+            assert route['classification'] == 'COMPLETE' and route['route_verified']
+            assert route['task_id'] == task_id and route['query_id'] == query_id
+            calls.append(query_id)
+            if outcome == 'before_failure': raise WorkflowError('无法核对目标')
+            if outcome == 'before_cancel':
+                from domain import Cancelled
+                raise Cancelled('任务被取消')
+            before_send('a' * 64)
+            if outcome == 'after_failure': raise WorkflowError('发送返回异常')
+            if outcome == 'after_cancel':
+                from domain import Cancelled
+                raise Cancelled('任务被取消')
+            return {'status': outcome}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，坐地铁，尽量少换乘。查询后把路线发送到我的钉钉文件助手。')
+    assert task['state'] == expected_state
+    assert task['dingtalk_status'] == expected_status
+    assert task['dingtalk_send_attempts'] == expected_attempts
+    assert task['route_verified'] and len(calls) == 1
+    with pytest.raises(WorkflowError):
+        engine._share_transit_to_self(task['id'], task['query_id'])
+    assert len(calls) == 1
+
+
+def test_incomplete_route_never_enters_dingtalk(engine, monkeypatch):
+    import sys, types
+    class ForbiddenDingTalk:
+        def __init__(self, base): raise AssertionError('incomplete route attempted share')
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=ForbiddenDingTalk, route_text=canonical_dingtalk_route_text))
+    engine.transit_device.kind = 'PARTIAL'
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    assert task['state'] == 'partial' and not task['route_verified']
+    assert task['dingtalk_send_attempts'] == 0
+
+
+def test_requery_does_not_implicitly_send_a_second_dingtalk_message(engine, monkeypatch):
+    import sys, types
+    calls = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            calls.append(query_id); before_send('a' * 64); return {'status': 'sent'}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    first = task['query_id']
+    task = settle(engine, engine.requery_transit(task['id'], {'query_id': first, 'preference': 'less_walking'}))
+    assert task['query_id'] != first and task['state'] == 'completed'
+    assert task['dingtalk_requested'] is False and calls == [first]
+
+
+def test_restart_after_dingtalk_dispatch_is_unknown_and_not_replayed(tmp_path):
+    store = Store(tmp_path)
+    store.save({'id': 'restart-task', 'request_key': 'restart-key', 'state': 'sharing_transit',
+                'send_attempts': 0, 'dingtalk_send_attempts': 1, 'dingtalk_status': 'sending',
+                'task_type': 'plan_transit', 'query_id': 'restart-query', 'route_verified': True,
+                'transit_result': {'classification': 'COMPLETE'}}, '单次发送已登记')
+    device = Device()
+    engine = Engine(store, device, Models())
+    try:
+        task = store.get('restart-task')
+        assert task['state'] == 'outcome_unknown' and task['dingtalk_status'] == 'unknown'
+        assert task['dingtalk_send_attempts'] == 1 and device.calls == []
+    finally:
+        engine.close()
+
+
+def test_cancel_during_dingtalk_dispatch_is_persisted_unknown_before_worker_or_restart(engine, monkeypatch):
+    import sys, types
+    entered, release = threading.Event(), threading.Event()
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            before_send('a' * 64)
+            entered.set()
+            release.wait(4)
+            checkpoint()
+            return {'status': 'sent'}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = engine.create_goal('在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手', 'cancel-dingtalk-1')
+    assert entered.wait(3)
+    cancelled = engine.control(task['id'], 'cancel')
+    assert cancelled['state'] == 'outcome_unknown' and cancelled['dingtalk_status'] == 'unknown'
+    assert cancelled['dingtalk_send_attempts'] == 1
+    # Simulate process restart reading the durable row before the old worker
+    # can wake and record its exception.
+    restarted = Engine(Store(engine.store.directory), Device(), Models())
+    try:
+        saved = restarted.store.get(task['id'])
+        assert saved['state'] == 'outcome_unknown' and saved['dingtalk_status'] == 'unknown'
+        assert saved['dingtalk_send_attempts'] == 1
+    finally:
+        restarted.close()
+        release.set()
+    engine.worker.join(4)
+    final = engine.store.get(task['id'])
+    assert final['state'] == 'outcome_unknown' and final['dingtalk_send_attempts'] == 1
+
+
+@pytest.mark.parametrize('verification,expected_state,expected_status', [
+    ('sent', 'completed', 'sent'), ('unknown', 'outcome_unknown', 'unknown'),
+    ('failure', 'outcome_unknown', 'unknown'),
+])
+def test_dingtalk_readonly_reverification_never_sends(engine, monkeypatch, verification, expected_state, expected_status):
+    import sys, types
+    calls = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            calls.append('send-once'); before_send('a' * 64); return {'status': 'unknown'}
+        def verify_self(self, task_id, query_id, route, checkpoint, digest, text_version=1):
+            calls.append('read-only'); checkpoint()
+            assert digest == 'a' * 64
+            if calls.count('read-only') == 1: return {'status': 'unknown'}
+            if verification == 'failure': raise WorkflowError('未读取本人会话')
+            return {'status': verification}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    assert task['state'] == 'outcome_unknown' and task['dingtalk_send_attempts'] == 1
+    task = settle(engine, engine.verify_dingtalk(task['id'], task['query_id']))
+    assert task['state'] == expected_state and task['dingtalk_status'] == expected_status
+    assert task['dingtalk_send_attempts'] == 1 and calls == ['send-once', 'read-only', 'read-only']
+
+
+@pytest.mark.parametrize('fault', ['wrong_query', 'no_recipient_digest', 'no_message_digest', 'changed_message', 'no_attempt', 'wrong_route', 'not_verified'])
+def test_dingtalk_reverification_rejects_unbound_context(engine, monkeypatch, fault):
+    import sys, types
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            before_send('a' * 64); return {'status': 'unknown'}
+        def verify_self(self, *args, **kwargs): raise AssertionError('unbound verification must not run')
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    target_query = task['query_id']
+    if fault == 'wrong_query': target_query = 'old-query-12345678'
+    if fault == 'no_recipient_digest': task.pop('dingtalk_recipient_digest')
+    if fault == 'no_message_digest': task.pop('dingtalk_message_digest')
+    if fault == 'changed_message': task['transit_result']['segments'][0]['line'] = '4号线'
+    if fault == 'no_attempt': task['dingtalk_send_attempts'] = 0
+    if fault == 'wrong_route': task['transit_result']['query_id'] = 'old-query-12345678'
+    if fault == 'not_verified': task['route_verified'] = False
+    if fault != 'wrong_query': engine.store.save(task, 'test')
+    with pytest.raises(WorkflowError): engine.verify_dingtalk(task['id'], target_query)
+
+
+def test_dingtalk_reverification_cannot_mark_sent_without_saved_account_binding(engine, monkeypatch):
+    import sys, types
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            before_send('a' * 64); return {'status': 'unknown'}
+        def verify_self(self, *args, **kwargs): raise AssertionError('legacy unbound attempt must not be trusted')
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    task.pop('dingtalk_recipient_digest')
+    engine.store.save(task, 'legacy attempt')
+    with pytest.raises(WorkflowError, match='无法绑定原发送的本人会话名称'):
+        engine.verify_dingtalk(task['id'], task['query_id'])
+    assert engine.store.get(task['id'])['state'] == 'outcome_unknown'
+
+
+def test_dingtalk_changed_route_after_dispatch_cannot_be_reported_sent(engine, monkeypatch):
+    import sys, types
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            before_send('a' * 64)
+            altered = engine.store.get(task_id)
+            altered['transit_result']['segments'][0]['line'] = '4号线'
+            engine.store.save(altered, 'test route mutation')
+            return {'status': 'sent'}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    assert task['state'] == 'outcome_unknown' and task['dingtalk_status'] == 'unknown'
+    assert task['dingtalk_send_attempts'] == 1
+
+
+def test_dingtalk_reverification_uses_legacy_v1_if_version_was_not_recorded(engine, monkeypatch):
+    import hashlib, sys, types
+    versions = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            assert text_version == 2
+            before_send('a' * 64); return {'status': 'unknown'}
+        def verify_self(self, task_id, query_id, route, checkpoint, digest, text_version=1):
+            versions.append(text_version)
+            return {'status': 'unknown' if len(versions) == 1 else 'sent'}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    assert task['dingtalk_text_version'] == 2
+    # Model a historical v1 record: its digest is for the v1 message, and
+    # earlier releases did not store an explicit version field.
+    task.pop('dingtalk_text_version')
+    text = canonical_dingtalk_route_text(task['id'], task['query_id'], task['transit_result'], version=1)
+    task['dingtalk_message_digest'] = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    engine.store.save(task, 'historical v1 fixture')
+    verified = settle(engine, engine.verify_dingtalk(task['id'], task['query_id']))
+    assert verified['state'] == 'completed' and versions == [2, 1]
+    assert verified['dingtalk_send_attempts'] == 1
+
+
+@pytest.mark.parametrize('invalid_version', [0, 3, '2', None, True])
+def test_dingtalk_reverification_rejects_invalid_format_version(engine, monkeypatch, invalid_version):
+    import sys, types
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            before_send('a' * 64); return {'status': 'unknown'}
+        def verify_self(self, *args, **kwargs): raise AssertionError('invalid version must not be used')
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    task['dingtalk_text_version'] = invalid_version
+    engine.store.save(task, 'test unsupported version')
+    with pytest.raises(WorkflowError, match='格式版本无效'):
+        engine.verify_dingtalk(task['id'], task['query_id'])
+    assert engine.store.get(task['id'])['state'] == 'outcome_unknown'
+
+
+def test_dingtalk_reverification_rejects_version_changed_during_read(engine, monkeypatch):
+    import sys, types
+    reads = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            before_send('a' * 64); return {'status': 'unknown'}
+        def verify_self(self, task_id, query_id, route, checkpoint, digest, text_version=1):
+            reads.append(text_version)
+            if len(reads) == 1: return {'status': 'unknown'}
+            task = engine.store.get(task_id)
+            task['dingtalk_text_version'] = 1
+            engine.store.save(task, 'test version change')
+            return {'status': 'sent'}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    result = settle(engine, engine.verify_dingtalk(task['id'], task['query_id']))
+    assert result['state'] == 'outcome_unknown' and result['dingtalk_send_attempts'] == 1
+
+
+@pytest.mark.parametrize('verification,expected_state', [('sent', 'completed'), ('unknown', 'outcome_unknown'), ('device_error', 'outcome_unknown')])
+def test_dingtalk_unknown_gets_at_most_one_automatic_readonly_recheck(engine, monkeypatch, verification, expected_state):
+    import sys, types
+    calls = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            calls.append('send'); before_send('a' * 64); return {'status': 'unknown'}
+        def verify_self(self, task_id, query_id, route, checkpoint, digest, text_version=1):
+            calls.append('verify'); checkpoint()
+            assert digest == 'a' * 64 and text_version == 2
+            if verification == 'device_error': raise OSError('device failed')
+            return {'status': verification}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    assert task['state'] == expected_state and task['dingtalk_send_attempts'] == 1
+    assert calls == ['send', 'verify']
+
+
+def test_dingtalk_unknown_then_cancel_before_recheck_never_verifies_or_resends(engine, monkeypatch):
+    import sys, types
+    calls = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            calls.append('send'); before_send('a' * 64)
+            engine.control(task_id, 'cancel')
+            return {'status': 'unknown'}
+        def verify_self(self, *args, **kwargs): calls.append('verify'); return {'status':'sent'}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    assert task['state'] == 'outcome_unknown' and task['dingtalk_send_attempts'] == 1
+    assert calls == ['send']
+
+
+def test_dingtalk_unknown_with_changed_context_never_rechecks(engine, monkeypatch):
+    import sys, types
+    calls = []
+    class MockDingTalk:
+        def __init__(self, base): pass
+        def share_self(self, task_id, query_id, route, checkpoint, before_send, text_version=2):
+            calls.append('send'); before_send('a' * 64)
+            task = engine.store.get(task_id); task['dingtalk_message_digest'] = 'b' * 64
+            engine.store.save(task, 'test altered context')
+            return {'status': 'unknown'}
+        def verify_self(self, *args, **kwargs): calls.append('verify'); return {'status':'sent'}
+    monkeypatch.setitem(sys.modules, 'device.dingtalk', types.SimpleNamespace(DingTalkDevice=MockDingTalk, route_text=canonical_dingtalk_route_text))
+    task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
+    assert task['state'] == 'outcome_unknown' and task['dingtalk_send_attempts'] == 1
+    assert calls == ['send']

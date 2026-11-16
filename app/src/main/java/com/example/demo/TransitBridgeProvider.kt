@@ -58,7 +58,10 @@ class TransitBridgeProvider : ContentProvider() {
                     }
                 } catch (_: TransitBridgeExpired) { reply(0, "bridge_timeout", nonce) }
                 catch (_: Exception) { reply(0, "bridge_error", nonce) }
-                finally { busy.set(false) }
+                finally {
+                    if (method == "dump_transit_ui") lease.logReadTiming()
+                    busy.set(false)
+                }
             })
             submitted = true
             return try {
@@ -66,6 +69,7 @@ class TransitBridgeProvider : ContentProvider() {
                 if (lease.active()) result else reply(0, "bridge_timeout", nonce)
             } catch (_: TimeoutException) {
                 lease.cancel()
+                if (method == "dump_transit_ui") lease.logReadTiming()
                 // The native operation may still be blocked. Busy is released
                 // only in its own finally; a second caller cannot overlap it.
                 reply(0, "bridge_timeout", nonce)

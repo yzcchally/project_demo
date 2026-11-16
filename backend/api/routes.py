@@ -102,7 +102,7 @@ def register(app):
 
     @app.post("/api/tasks/{task_id}/qr")
     def qr_result(task_id: str, body: QRReply):
-        return reply(lambda: get_engine().submit_qr(task_id, body.url, body.scan_nonce))
+        return reply(lambda: get_engine().submit_qr(task_id, body.url, body.scan_nonce, body.scan_source))
 
     @app.patch("/api/tasks/{task_id}/draft")
     def edit_draft(task_id: str, body: HumanReply):
@@ -183,6 +183,15 @@ def register(app):
             if recognize.running() or gmail_demo.running():
                 raise HTTPException(409, "请先停止基础 AI 操作，再查看高德")
             return reply(lambda: get_engine().show_transit(task_id, body.query_id))
+
+    @app.post("/api/tasks/{task_id}/transit/verify-dingtalk")
+    def verify_dingtalk(task_id: str, body: TransitQueryRef):
+        import recognize
+        import gmail_demo
+        with START_LOCK:
+            if recognize.running() or gmail_demo.running():
+                raise HTTPException(409, "请先停止基础 AI 操作，再核查钉钉")
+            return reply(lambda: get_engine().verify_dingtalk(task_id, body.query_id))
 
     @app.get("/api/evaluation")
     def evaluation():

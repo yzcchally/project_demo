@@ -34,7 +34,11 @@ class TaskConnectionService : Service() {
     private var lastSpoken = ""
     private var ttsReady = false
     private var reconnectScheduled = false
+    private var reconnectRetry: Runnable? = null
     private var destroyed = false
+    private val controls = TaskControlQueue()
+    private var controlReady = false
+    private var controlRetry: Runnable? = null
     private lateinit var tts: TextToSpeech
     private val terminal = setOf("completed", "partial", "no_route", "failed", "cancelled", "outcome_unknown", "interrupted")
 
@@ -63,6 +67,7 @@ class TaskConnectionService : Service() {
         if (intent?.action == ACTION_DISMISS) {
             if (watched.isBlank() || watched == id) {
                 active = false; watched = ""; latest = null
+                controlReady = false; controls.clear(); cancelControlRetry()
                 handler.removeCallbacksAndMessages(null)
                 socket?.cancel(); socket = null
                 client.dispatcher.cancelAll()
@@ -84,7 +89,11 @@ class TaskConnectionService : Service() {
             return START_STICKY
         }
         if (watched != id || socket == null) {
-            if (watched != id) { latest = null; lastSpoken = "" }
+            if (watched != id) {
+                latest = null; lastSpoken = ""
+                cancelControlRetry()
+                controls.select(id, prefs.getString("pending_control:$id", null))
+            }
             watched = id; active = true
             startForeground(NOTICE, notification("正在连接任务进度", null))
             connect(id)
@@ -96,6 +105,9 @@ class TaskConnectionService : Service() {
     private fun current(id: String) = !destroyed && id.isNotBlank() && watched == id && !dismissed(id)
     private fun connect(id: String) {
         if (!current(id) || !active) return
+        controlReady = false
+        reconnectRetry?.let { handler.removeCallbacks(it) }; reconnectRetry = null
+        cancelControlRetry()
         reconnectScheduled = false
         val previous = socket; socket = null; previous?.cancel()
         val cursor = prefs.getLong("cursor:$id", 0)
@@ -104,14 +116,22 @@ class TaskConnectionService : Service() {
                 handler.post {
                     if (current(id) && socket === webSocket) {
                         prefs.edit().remove("connection_error").apply()
-                        prefs.getString("pending_control:$id", null)?.let { control(id, it) }
                     }
                 }
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
                 handler.post {
-                    if (current(id) && socket === webSocket)
-                        try { update(JSONObject(text)) } catch (_: Exception) { reconnect(id) }
+                    if (current(id) && socket === webSocket) {
+                        try {
+                            val response = JSONObject(text)
+                            // Replayed controls must wait for the current task snapshot.
+                            val snapshot = response.optString("event_type") == "snapshot" && response.optJSONObject("task")?.optString("id") == id
+                            if (snapshot) controlReady = true
+                            update(response)
+                            if (snapshot && active && controls.reconcileSnapshot(latest?.optString("state").orEmpty())) persistControl(id)
+                            dispatchControl(id)
+                        } catch (_: Exception) { reconnect(id) }
+                    }
                 }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -120,14 +140,20 @@ class TaskConnectionService : Service() {
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 handler.post { if (current(id) && socket === webSocket) reconnect(id) }
             }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(1000, null)
+                handler.post { if (current(id) && socket === webSocket) reconnect(id) }
+            }
         })
     }
     private fun reconnect(id: String) {
         if (!current(id) || !active || reconnectScheduled) return
+        controlReady = false
         reconnectScheduled = true
         prefs.edit().putString("connection_error", "连接暂时中断，正在恢复原任务。请检查电脑和 USB 连接。").apply()
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification("连接中断，正在恢复", latest))
-        handler.postDelayed({ if (current(id) && active) connect(id) }, 2500)
+        reconnectRetry = Runnable { reconnectRetry = null; if (current(id) && active) connect(id) }
+            .also { handler.postDelayed(it, 2500) }
     }
     private fun update(response: JSONObject) {
         val task = response.optJSONObject("task") ?: return
@@ -143,42 +169,72 @@ class TaskConnectionService : Service() {
         for (i in 0 until events.length()) unique[events.getJSONObject(i).optInt("seq")] = events.getJSONObject(i)
         val trimmed = JSONArray(); unique.values.toList().takeLast(20).forEach { trimmed.put(it) }
         prefs.edit().putString("live_task", task.toString()).putString("live_events", trimmed.toString()).putString("events_task", id)
-            .putLong("cursor:$id", response.optLong("cursor", prefs.getLong("cursor:$id", 0))).remove("connection_error").apply()
+            .putLong("cursor:$id", maxOf(prefs.getLong("cursor:$id", 0), response.optLong("cursor", 0))).remove("connection_error").apply()
         val message = task.optString("message")
         speak(id, message)
         active = task.optString("state") !in terminal
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification(message, task))
         if (!active) {
+            controlReady = false; controls.clear(); persistControl(id); cancelControlRetry()
             socket?.close(1000, "任务已结束"); socket = null
             stopForeground(STOP_FOREGROUND_DETACH)
             handler.postDelayed({ if (!active && current(id)) stopSelf() }, 10000)
         }
     }
     private fun control(id: String, action: String) {
-        if (!current(id) || latest?.optString("state") in terminal) return
-        prefs.edit().putString("pending_control:$id", action).apply()
-        val body = JSONObject().put("action", action).toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+        if (!current(id) || !controls.enqueue(action)) return
+        persistControl(id)
+        dispatchControl(id)
+    }
+    private fun persistControl(id: String) {
+        val editor = prefs.edit()
+        controls.pending?.let { editor.putString("pending_control:$id", it) }
+            ?: editor.remove("pending_control:$id")
+        editor.apply()
+    }
+    private fun cancelControlRetry() {
+        controlRetry?.let { handler.removeCallbacks(it) }
+        controlRetry = null
+    }
+    private fun dispatchControl(id: String) {
+        if (!current(id) || !active || !controlReady || latest == null) return
+        val attempt = controls.begin() ?: return
+        cancelControlRetry()
+        val body = JSONObject().put("action", attempt.action).toString().toRequestBody("application/json; charset=utf-8".toMediaType())
         http.newCall(Request.Builder().url("http://${apiHost()}:8000/api/tasks/$id/control").post(body).build()).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 handler.post {
-                    if (current(id)) prefs.edit().putString("connection_error", "控制请求尚未送达，恢复连接后继续提交。").apply()
+                    finishControl(id, attempt, null, true, "控制结果尚未确认，正在恢复连接并继续提交。")
                 }
             }
             override fun onResponse(call: Call, response: Response) {
                 response.use {
-                    try {
-                        val result = JSONObject(it.body?.string().orEmpty())
-                        val successful = it.isSuccessful
-                        handler.post {
-                            if (current(id)) {
-                                if (successful) { prefs.edit().remove("pending_control:$id").apply(); update(result) }
-                                else prefs.edit().putString("connection_error", result.optString("detail", "请打开助手查看任务状态")).apply()
-                            }
-                        }
-                    } catch (_: Exception) { }
+                    val result = try { JSONObject(it.body?.string().orEmpty()) } catch (_: Exception) { null }
+                    val acknowledged = it.isSuccessful && result?.optBoolean("ok", true) == true && result.optJSONObject("task")?.optString("id") == id
+                    val retryable = if (it.isSuccessful) !acknowledged else it.code == 408 || it.code == 429 || it.code >= 500
+                    val error = if (acknowledged) null else result?.optString("detail")?.takeIf { detail -> detail.isNotBlank() }
+                        ?: if (retryable) "控制结果尚未确认，正在恢复连接并继续提交。" else "这次控制未被接受，请打开助手查看任务状态。"
+                    handler.post { finishControl(id, attempt, result.takeIf { acknowledged }, retryable, error) }
                 }
             }
         })
+    }
+    private fun finishControl(id: String, attempt: TaskControlQueue.Attempt, result: JSONObject?, retryable: Boolean, error: String?) {
+        if (!current(id)) return
+        val stillRequested = controls.pending == attempt.action
+        if (!controls.complete(attempt, retryable)) return
+        persistControl(id)
+        result?.let { update(it) }
+        if (error != null && stillRequested && active) prefs.edit().putString("connection_error", error).apply()
+        if (controls.pending == null) return
+        if (retryable && stillRequested) {
+            // A timeout can follow a successful operation. Read a new snapshot
+            // before deciding whether this control still needs to be sent.
+            controlReady = false
+            cancelControlRetry()
+            controlRetry = Runnable { controlRetry = null; if (current(id) && active) connect(id) }
+                .also { handler.postDelayed(it, 2500) }
+        } else dispatchControl(id)
     }
     private fun speak(id: String, message: String) {
         if (current(id) && ttsReady && !prefs.getBoolean("route_speech_active", false) && prefs.getBoolean("speak_enabled", false) && message.isNotBlank() && message != lastSpoken) {
@@ -203,6 +259,7 @@ class TaskConnectionService : Service() {
     }
     override fun onDestroy() {
         destroyed = true; active = false; ttsReady = false
+        controlReady = false; controls.clear(); cancelControlRetry()
         prefs.unregisterOnSharedPreferenceChangeListener(speechListener)
         handler.removeCallbacksAndMessages(null); socket?.cancel(); client.dispatcher.cancelAll()
         tts.stop(); tts.shutdown(); super.onDestroy()
@@ -215,6 +272,12 @@ class TaskConnectionService : Service() {
         fun watch(context: Context, taskId: String) {
             if (taskId.isBlank() || context.getSharedPreferences("silverguide", 0).getString("dismissed_task", "") == taskId) return
             ContextCompat.startForegroundService(context, Intent(context, TaskConnectionService::class.java).putExtra("task_id", taskId))
+        }
+        fun submitControl(context: Context, taskId: String, action: String) {
+            if (taskId.isBlank() || action !in setOf("pause", "resume", "cancel") ||
+                context.getSharedPreferences("silverguide", 0).getString("dismissed_task", "") == taskId) return
+            ContextCompat.startForegroundService(context, Intent(context, TaskConnectionService::class.java)
+                .putExtra("task_id", taskId).putExtra("control", action))
         }
         fun dismiss(context: Context, taskId: String) {
             if (taskId.isBlank()) return

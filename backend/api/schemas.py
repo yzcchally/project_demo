@@ -213,6 +213,7 @@ class HumanReply(BaseModel):
 class QRReply(BaseModel):
     url: str = Field(max_length=2048)
     scan_nonce: str = Field(min_length=16, max_length=100)
+    scan_source: Literal["in_app_camera", "external_share"] = "in_app_camera"
 
 
 class Contact(BaseModel):

@@ -148,6 +148,10 @@ def _bound_leading_walk(row, rides, parents):
         children = list(owner)
         if len(children) >= 3 and children[1] is branch and all(_visible(c) for c in children[:3]):
             origin, _, after = children[:3]
+            walk_rows = [n for n in branch.iter("node") if _visible(n) and n.get("class") == "android.view.ViewGroup"
+                         and (_leading_walk_metrics(_label(n)) is not None or _tail_walk_label(_label(n)))]
+            if walk_rows != [row] or any(_line(n) for n in branch.iter("node") if _visible(n) and _label(n).endswith("方向")):
+                return None
             source = _station(origin)
             following = [ride for ride in rides if ride["container"] in after.iter()]
             if source is None or len(following) != 1:
@@ -178,6 +182,10 @@ def _bound_tail_walk(row, rides, parents):
         index = children.index(branch)
         if len(children) >= 3 and index == len(children)-2 and all(_visible(c) for c in children[-3:]):
             before, _, after = children[-3:]
+            walk_rows = [n for n in branch.iter("node") if _visible(n) and n.get("class") == "android.view.ViewGroup"
+                         and (_leading_walk_metrics(_label(n)) is not None or _tail_walk_label(_label(n)))]
+            if walk_rows != [row] or any(_line(n) for n in branch.iter("node") if _visible(n) and _label(n).endswith("方向")):
+                return None
             previous = [ride for ride in rides if ride["container"] in before.iter()]
             if len(previous) != 1 or any(ride["container"] in after.iter() for ride in rides):
                 return None
@@ -292,7 +300,11 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
         leading_rows = [n for n in ns if n.get("class") == "android.view.ViewGroup" and _leading_walk_metrics(_label(n)) is not None]
         if len(transfer_rows) > 1:
             return None  # Only one explicit same-station interchange is supported.
-        if len(tail_rows) > 1 or len(leading_rows) > 1:
+        if len(tail_rows) > 1 or len(leading_rows) > 2:
+            return None
+        # Sets below deduplicate repeated screenshots; they must not collapse
+        # two indistinguishable walking rows in the same frame.
+        if len({_label(n) for n in leading_rows}) != len(leading_rows):
             return None
         allowed_walk_nodes = {c for n in aggregate_groups + transfer_rows + tail_rows + leading_rows for c in n.iter()}
         walking_labels = [n for n in ns if ("步行" in _label(n) or "站内换乘" in _label(n)) and _label(n) not in {"步行少", "少步行"}]
@@ -362,7 +374,11 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
                 "walking_meters": meters, "duration_minutes": minutes,
                 "evidence_refs": {field: [e["evidence_id"]] for field in ["instructions","board","alight","walking_meters","duration_minutes"]},
             }
-        for row in tail_rows:
+        # Some itineraries show a separate measured walking leg at both
+        # ends, rather than the aggregate “站内外共步行” tail slot. Bind
+        # each row by its own adjacent itinerary branches, never by position
+        # in the flattened page text.
+        for row in tail_rows + leading_rows:
             bound = _bound_tail_walk(row, frame_records, parents)
             if bound is None:
                 continue
@@ -370,11 +386,13 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
             if not _request_endpoint_matches(request.get("destination", ""), terminal, request.get("city", "")):
                 continue
             identity = (ride["segment"]["segment_id"], board, terminal)
+            quote = _label(row)
+            metrics = _leading_walk_metrics(quote)
             tail_bindings[identity] = {
                 "segment_id": hashlib.sha256(repr(identity).encode()).hexdigest()[:20],
-                "mode": "walk", "instructions": "站内外共步行", "board": board, "alight": terminal,
-                "walking_meters": None, "duration_minutes": None,
-                "evidence_refs": {field: [e["evidence_id"]] for field in ["instructions", "board", "alight"]},
+                "mode": "walk", "instructions": quote if metrics else "站内外共步行", "board": board, "alight": terminal,
+                "walking_meters": metrics[0] if metrics else None, "duration_minutes": metrics[1] if metrics else None,
+                "evidence_refs": {field: [e["evidence_id"]] for field in (["instructions", "board", "alight", "walking_meters", "duration_minutes"] if metrics else ["instructions", "board", "alight"])},
             }
         # Duration/fare must come from the native aggregate summary, not a
         # boarding countdown or one segment's minutes.
@@ -422,7 +440,8 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
                 return None
         if observed_tail_rows and (tail is None or len(observed_tail_rows) != 1):
             return None
-        if observed_leading_rows and (leading is None or len(observed_leading_rows) != 1):
+        bound_normal = {v["instructions"] for v in (leading, tail) if v and _leading_walk_metrics(v["instructions"])}
+        if observed_leading_rows != bound_normal:
             return None
         if walk is None and tail is None and leading is None:
             return None

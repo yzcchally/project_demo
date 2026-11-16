@@ -28,6 +28,7 @@ def main():
         if connection.connect_ex(("127.0.0.1", 8000)) == 0:
             raise SystemExit("8000 端口已有后端，请先在原终端按 Ctrl+C 停止，再启动测试后端。")
     import main as application
+    from device.connection import ReverseMonitor
     from agent.runtime import get_engine
     import uvicorn
 
@@ -41,7 +42,8 @@ def main():
                       after_observed=lambda event: engine._demo_fault_observed(event["task_id"], event))
     print("测试模式：首次写信页将被主动切到桌面一次，随后由正式恢复逻辑继续。", flush=True)
     print("请使用 App 发起新任务；发送仍需用户在 App 核对并确认。", flush=True)
-    uvicorn.run(application.app, host="127.0.0.1", port=8000)
+    with ReverseMonitor():
+        uvicorn.run(application.app, host="127.0.0.1", port=8000)
 
 
 if __name__ == "__main__":

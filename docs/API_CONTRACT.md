@@ -8,7 +8,7 @@ Base: `http://127.0.0.1:8000`. OpenAPI: `/docs`. API version: 2.0. Compatibility
 | `GET /api/tasks/latest` | Latest durable task; `null` before the first task. |
 | `GET /api/tasks/{id}` | Current typed task, proof flags, interaction nonces and user-facing state. Route tasks expose `transit_request`/`transit_result`, not a mail draft. |
 | `POST /api/tasks/{id}/clarify` | Explicit recipient/alias, optional subject/body/URL and `save_contact`. |
-| `POST /api/tasks/{id}/qr` | `{url, scan_nonce}` from the camera result. |
+| `POST /api/tasks/{id}/qr` | `{url, scan_nonce, scan_source?}` from the current scan round. `scan_source` defaults to `in_app_camera`; a user-confirmed Android text share uses `external_share`. |
 | `PATCH /api/tasks/{id}/draft` | Explicit draft edits; invalidates approval and re-prepares. |
 | `POST /api/tasks/{id}/confirm` | `{draft_digest, approval_nonce, confirmed:true}`. |
 | `POST /api/tasks/{id}/pause`, `/resume`, `/cancel` | Controls; `/control` also accepts `{action}`. |
@@ -40,6 +40,8 @@ in its actual browser/draft phase, and progress is streamed over the same socket
 Recovery never grants approval or retries a send. See [recovery test cases](RECOVERY_TEST_CASES.md).
 
 Resuming a paused QR wait rotates `scan_nonce`. Clients reopen the scanner only after the prior scan activity has returned, bind its callback to the launch task/nonce, and discard old results.
+
+External scan shares are treated as user-supplied links, not evidence that a QR code was actually scanned. Before leaving the app to scan, the user selects “准备使用手机扫码”, capturing the current task and nonce. The app accepts a single HTTPS text URL, shows it for user confirmation, and continues only when that captured task and nonce still match the current snapshot. The server independently validates the URL and source; an expired nonce or invalid source cannot advance the task. Existing browser verification and mail approval still apply.
 
 ## Pilot/comparison metadata
 
@@ -171,6 +173,8 @@ existing event interface. Additional route fields are:
 | `transit_choices` | Already selected place facts; never an old screen row index. |
 | `transit_result` | Independently checked structured result, or `null` before acquisition. |
 | `route_verified` | True only for a complete, current, evidence-supported route. |
+| `transit_executor` | Frozen executor for this query: `rules` (default, including optional single-step assistance) or the explicitly selected legacy `autoglm` loop. This field alone does not assert that assistance was used. |
+| `transit_agent_step`, `transit_agent_last_action`, `transit_agent_events` | AutoGLM step number, sanitized latest action metadata and at most 20 recent summaries. No API key, raw thinking or Type text. |
 | `transit_explanation` | Deterministic narration from the same checked facts used in cards. |
 | `transit_history` | Earlier query results and their query/source references after requery. |
 | `cancel_requested_at`, `cancel_worker_finished_at`, `cancel_delay_seconds` | Measured cooperative cancellation timing when the route worker exits. |
@@ -186,6 +190,29 @@ unknown fields; `query_id` must be 8–80 characters and match the current task.
 The normal response is `{ok:true, task, message}` unless specified below.
 Invalid phases, stale generations or ownership conflicts return HTTP 409;
 invalid request structures return HTTP 422.
+
+The process default `SILVERGUIDE_TRANSIT_EXECUTOR` is copied to the task when a
+new route query starts. Clarification/place-choice/pause resumes retain that
+query's saved executor, even if the default later changes. Explicit `requery`
+starts a new query using the current process configuration and archives the
+prior result together with its executor. Historical tasks without the field
+remain `rules`. Changing `.env` requires restarting the backend; the App does
+not currently expose a model-selection toggle. See [AutoGLM configuration](AUTOGLM_TRANSIT.md).
+
+AutoGLM API/config/action failures are real task failures; the runtime does not
+start a rules query as fallback. Both modes run through the same task worker,
+ownership checks, current-query validation and result classifier. Source viewing
+uses the existing independently checked viewer and is not a new rules query.
+Route events include `transit_executor` and, for AutoGLM, the step/latest-action
+summary. A GUI-agent `Finish` requests independent collection/validation; it
+cannot itself set `route_verified:true` or COMPLETE.
+
+For `rules`, the optional `SILVERGUIDE_AUTOGLM_ASSIST_ENABLED` feature does not
+change the executor field. Its per-query `autoglm-assist.jsonl` local evidence
+records the trigger, request, checked candidate, execution and postcondition;
+an absent log means the assist path was not used. See
+[rule-led AutoGLM assistance](AUTOGLM_ASSIST.md). A controlled test trigger is
+identified in that log and must not be reported as a naturally occurring fault.
 
 | Suffix | Body | Behaviour |
 | --- | --- | --- |

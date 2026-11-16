@@ -41,7 +41,13 @@ class Store:
         event = {"time": task["updated_at"], "state": task["state"], "message": message,
                  "send_attempts": task["send_attempts"], "evidence": {key: bool(task.get(key)) for key in ("webpage_verified", "draft_verified", "sent_record_verified", "delivery_confirmed", "route_verified")}}
         if task.get("task_type") == "plan_transit":
-            event.update(task_type="plan_transit", query_id=task.get("query_id"), route_classification=(task.get("transit_result") or {}).get("classification"))
+            event.update(task_type="plan_transit", query_id=task.get("query_id"), route_classification=(task.get("transit_result") or {}).get("classification"),
+                         transit_executor=task.get("transit_executor", "rules"),
+                         dingtalk_status=task.get("dingtalk_status", "not_requested"),
+                         dingtalk_send_attempts=task.get("dingtalk_send_attempts", 0))
+            if task.get("transit_executor") == "autoglm":
+                event.update(transit_agent_step=task.get("transit_agent_step", 0),
+                             transit_agent_last_action=task.get("transit_agent_last_action"))
         with self.lock, self.connect() as c:
             c.execute("INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
                       (task["id"], task["request_key"], json.dumps(task, ensure_ascii=False)))

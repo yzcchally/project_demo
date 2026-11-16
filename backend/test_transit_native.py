@@ -49,6 +49,58 @@ def extract(obs, request=None):
     return extract_native(obs, request or {"origin": "体育西路地铁站", "destination": "广州塔地铁站", "city": "广州"}, task_id=TASK, query_id=QUERY, route_id=ROUTE)
 
 
+def two_edge_walk_fixture(tmp_path, *, extra_tail=False, hidden_tail=False):
+    ride = column("客村立交站", "体育中心站", ("夜", "61", "路"), "体育中心站方向", "3站9分钟")
+    list(ride)[0].append(n(text="关注", group=False))
+    lead = n(desc="步行 1.4公里 23分钟", children=[n(text="步行 1.4公里 · 23分钟", group=False), n(text="步行导航", group=False)])
+    tail = n(desc="步行 403米 8分钟", children=[n(text="步行 403米 · 8分钟", group=False), n(text="步行导航", group=False)], visible=not hidden_tail)
+    branches = [station("广州塔(地铁站)"), n(children=[lead]), n(children=[ride]), n(children=[tail]), station("体育西路(地铁站)")]
+    if extra_tail:
+        branches.insert(-1, station("其他地点"))
+    return observation(tmp_path, [n(children=branches)], summary="49分钟步行23分钟转夜61路步行8分钟最快3站¥4步行1.8公里")
+
+
+def test_two_measured_edge_walks_are_bound_independently_without_swapping_metrics(tmp_path):
+    e = two_edge_walk_fixture(tmp_path)
+    e["text"] += "\n广州"
+    req = {"origin": "广州塔地铁站", "destination": "体育西路地铁站", "city": "广州"}
+    result = extract([e], req)
+    assert result and [s["mode"] for s in result["segments"]] == ["walk", "bus", "walk"]
+    a, ride, b = result["segments"]
+    assert (a["walking_meters"], a["duration_minutes"], a["alight"]) == (1400, 23, "客村立交站")
+    assert (b["walking_meters"], b["duration_minutes"], b["board"]) == (403, 8, "体育中心站")
+    result["origin"] = {"name": "广州塔(地铁站)", "city": "广州", "evidence_refs": {"name": [e["evidence_id"]], "city": [e["evidence_id"]]}}
+    result["destination"] = {"name": "体育西路(地铁站)", "city": "广州", "evidence_refs": {"name": [e["evidence_id"]], "city": [e["evidence_id"]]}}
+    checked = validate_result(result, TASK, QUERY, req, evidence=[e], collection_complete=True)
+    assert checked["classification"] == "COMPLETE" and checked["route_verified"]
+    # Even if flattened page text still includes all names, a new branch
+    # inserted between the walk and endpoint invalidates the connection.
+    tree = ET.parse(e["xml_path"])
+    for owner in tree.getroot().iter("node"):
+        children = list(owner)
+        if len(children) == 5 and children[-1].get("content-desc") == "体育西路(地铁站)":
+            owner.insert(4, station("其他地点")); break
+    tree.write(e["xml_path"], encoding="unicode")
+    rejected = validate_result(result, TASK, QUERY, req, evidence=[e], collection_complete=True)
+    assert rejected["classification"] != "COMPLETE" and not rejected["route_verified"]
+
+
+@pytest.mark.parametrize("issue", ["intervening_branch", "hidden_tail"])
+def test_two_measured_walks_reject_missing_adjacency_or_visibility(tmp_path, issue):
+    e = two_edge_walk_fixture(tmp_path, extra_tail=issue == "intervening_branch", hidden_tail=issue == "hidden_tail")
+    assert extract([e], {"origin": "广州塔地铁站", "destination": "体育西路地铁站", "city": "广州"}) is None
+
+
+def test_identical_walking_rows_in_one_frame_are_not_collapsed(tmp_path):
+    e = two_edge_walk_fixture(tmp_path, extra_tail=True)
+    tree = ET.parse(e["xml_path"])
+    for item in tree.getroot().iter("node"):
+        for field in ("text", "content-desc"):
+            item.set(field, item.get(field, "").replace("403米", "1.4公里").replace("8分钟", "23分钟"))
+    tree.write(e["xml_path"], encoding="unicode")
+    assert extract([e], {"origin": "广州塔地铁站", "destination": "体育西路地铁站", "city": "广州"}) is None
+
+
 def test_actual_public_station_topology_yields_only_observed_facts(tmp_path):
     e = observation(tmp_path);r = extract([e])
     assert r and not r["route_verified"]

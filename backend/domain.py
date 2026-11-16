@@ -16,6 +16,8 @@ TERMINAL = {"completed", "failed", "cancelled", "outcome_unknown", "partial", "n
 MESSAGES = {
     "planning_transit": "正在高德查询公交地铁路线", "reading_transit": "正在展开并核对路线各段",
     "validating_transit": "正在校验本次高德路线及分段证据",
+    "sharing_transit": "正在分享到您自己的钉钉文件助手",
+    "verifying_dingtalk": "正在只读核查钉钉本人会话，不会重新发送",
     "awaiting_place_choice": "请选择本次明确的地点", "viewing_transit": "正在回到高德查看路线",
     "partial": "路线只读取了一部分，请核对缺失信息", "no_route": "高德当前没有可用公共交通方案",
     "understanding": "正在理解您的需求", "needs_clarification": "请补充收件信息",

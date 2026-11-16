@@ -156,11 +156,16 @@ class HuaweiDevice:
     def observe(self, checkpoint=lambda: None, evidence=False):
         import gmail_demo
         checkpoint()
-        for attempt in range(3):
+        protected = self.transport is not None and getattr(self.transport, "prefer_transit_bridge", False) is True
+        # The protected transport already owns the complete two-call budget.
+        # Preserve the legacy mail/browser retry contract without multiplying
+        # map reads or delaying cancellation behind another three attempts.
+        attempts = 1 if protected else 3
+        for attempt in range(attempts):
             try:
                 checkpoint()
                 epoch = self.context_epoch
-                xml = self.transport.xml() if self.transport else gmail_demo._dump_screen_xml()
+                xml = (self.transport.xml(checkpoint=checkpoint) if protected else self.transport.xml()) if self.transport else gmail_demo._dump_screen_xml()
                 ns = nodes(xml)
                 if any(n.get("resource-id") == ID + "send_email_btn" for n in ns):
                     activity = self.shell("dumpsys", "activity", "activities")
@@ -169,6 +174,8 @@ class HuaweiDevice:
                         self.compose_activity = found.group(1)
                 checkpoint()
                 if epoch != self.context_epoch:
+                    if protected:
+                        raise ScreenContextChanged("暂停恢复已废弃本次高德界面，请重新观察")
                     if attempt == 2:
                         raise WorkflowError("页面连续变化，请停止切换应用后重新准备")
                     continue
@@ -180,7 +187,9 @@ class HuaweiDevice:
                         saved.write(xml)
                 return xml
             except (OSError, RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ET.ParseError):
-                if attempt == 2:
+                if protected:
+                    raise WorkflowError("本次高德受保护界面读取失败，请检查手机连接、无障碍服务和页面加载状态") from None
+                if attempt == attempts - 1:
                     raise WorkflowError("连续三次无法读取手机界面，请检查 USB 连接并解锁手机") from None
                 checkpoint()
         raise AssertionError("unreachable")

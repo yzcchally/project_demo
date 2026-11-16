@@ -9,5 +9,7 @@ app.title = "SilverGuide Agent API"
 app.version = "2.0.0"
 
 if __name__ == "__main__":
+    from device.connection import ReverseMonitor
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    with ReverseMonitor():
+        uvicorn.run(app, host="127.0.0.1", port=8000)

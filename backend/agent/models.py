@@ -64,6 +64,7 @@ class ModelGateway:
             "只提取用户明确说出的内容，不猜测邮箱或网址。联系人称呼可以保留，地址交给后台查找。"
             "扫码发邮件为scan_and_share，只有打开网页为open_url，分享当前网页为share_current_page，明确网址分享为share_url。"
             "公交或地铁查询为plan_transit，将明确的起点/终点/城市放在transit.origin/destination/city。"
+            "查询公交或地铁后分享路线到钉钉文件助手，仍是plan_transit；分享授权和接收目标由程序从用户原话独立判定。"
             "只提取明确地点，不能猜分馆院区或从家里推断地址；家里仍保留家里供澄清。"
             "只有目的地时origin为空并use_current_location=true；从A到B时保留明确起点且use_current_location=false。"
             "路线偏好少换乘=fewer_transfers，少步行=less_walking，未指定时recommended；不从记忆生成线路或坐标。"

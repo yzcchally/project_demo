@@ -247,6 +247,7 @@ def test_a_city_substring_in_a_road_name_is_not_an_administrative_city_proof(ada
 @pytest.mark.parametrize("reason, expected", [
     ("root_package", "前台"), ("service_unavailable", "无障碍"),
     ("bridge_busy", "繁忙"), ("bridge_timeout", "超时"), ("bridge_unavailable", "更新"),
+    ("tree_changed", "页面正在变化"),
 ])
 def test_map_observation_reports_known_bridge_failure_without_claiming_usb_is_disconnected(adapter, reason, expected):
     import json
@@ -648,7 +649,8 @@ def test_current_bridge_service_loss_retries_boundedly_without_starting_uiautoma
     run = Mock(side_effect=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, f'Result: Bundle[{{code=0, result=0, data={reason}, reason={reason}, nonce={command[-1]}}}]', ""))
     sleep = Mock();monkeypatch.setattr(subprocess, "run", run);monkeypatch.setattr("time.sleep", sleep)
     with pytest.raises(RuntimeError, match="无障碍窗口暂不可用"): transport.xml()
-    assert run.call_count == 6 and sleep.call_count == 5
+    assert run.call_count == (4 if reason == "tree_changed" else 2)
+    assert sleep.call_count == (3 if reason == "tree_changed" else 1)
     assert transport.last_bridge_reason == reason
     transport._device.ui.assert_not_called();transport._fresh_file_xml.assert_not_called()
     assert all("dump_transit_ui" in call.args[0] and "content" in call.args[0] and "broadcast" not in call.args[0] and "uiautomator" not in call.args[0] for call in run.call_args_list)
@@ -664,16 +666,71 @@ def test_current_bridge_recovers_after_transient_tree_change_without_legacy_read
     calls = []
     def run(command, **kwargs):
         calls.append(command)
-        if len(calls) < 3:
+        if len(calls) < 2:
             return subprocess.CompletedProcess(command, 0, f'Result: Bundle[{{code=0, result=0, data=tree_changed, reason=tree_changed, nonce={command[-1]}}}]', "")
         root = ET.Element("hierarchy", nonce=command[-1]);root.append(node("已恢复的高德窗口"))
         encoded = base64.urlsafe_b64encode(ET.tostring(root, encoding="utf-8")).decode()
         return subprocess.CompletedProcess(command, 0, f'Result: Bundle[{{code=1, result=1, data={encoded}, reason=ok, nonce={command[-1]}}}]', "")
     sleep = Mock();monkeypatch.setattr(subprocess, "run", run);monkeypatch.setattr("time.sleep", sleep)
     assert "已恢复的高德窗口" in transport.xml()
-    assert len(calls) == 3 and len({c[-1] for c in calls}) == 3 and sleep.call_count == 2
+    assert len(calls) == 2 and len({c[-1] for c in calls}) == 2 and sleep.call_count == 1
     assert transport.last_bridge_reason is None and transport.last_ui_source == "protected-a11y-fallback"
     transport._device.ui.assert_not_called();transport._fresh_file_xml.assert_not_called()
+
+
+def test_changing_map_tree_recovers_after_multiple_fresh_reads(monkeypatch):
+    import base64
+    import gmail_demo
+    from device.mobilerun import MobilerunTransport
+    transport = MobilerunTransport(); transport._device = Mock(); transport.prefer_transit_bridge = True
+    monkeypatch.setattr(gmail_demo, "_adb", lambda: "adb-offline")
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        if len(calls) <= 2:
+            return subprocess.CompletedProcess(command, 0, f'Result: Bundle[{{code=0, result=0, data=tree_changed, reason=tree_changed, nonce={command[-1]}}}]', "")
+        root = ET.Element("hierarchy", nonce=command[-1]); root.append(node("稳定页面"))
+        encoded = base64.urlsafe_b64encode(ET.tostring(root, encoding="utf-8")).decode()
+        return subprocess.CompletedProcess(command, 0, f'Result: Bundle[{{code=1, result=1, data={encoded}, reason=ok, nonce={command[-1]}}}]', "")
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    assert "稳定页面" in transport.xml()
+    assert len(calls) == 3 and len({call[-1] for call in calls}) == 3
+    transport._device.ui.assert_not_called()
+
+
+def test_changing_map_tree_stops_on_cancel_before_retry(monkeypatch):
+    from device.mobilerun import MobilerunTransport
+    transport = MobilerunTransport(); transport.prefer_transit_bridge = True
+    def changing_tree():
+        transport.last_bridge_reason = "tree_changed"
+        return None
+    transport._protected_transit_xml = Mock(side_effect=changing_tree)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    calls = 0
+    def checkpoint():
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise Cancelled("cancelled")
+    with pytest.raises(Cancelled): transport.xml(checkpoint)
+    transport._protected_transit_xml.assert_called_once()
+
+
+def test_transit_bridge_exception_does_not_reuse_previous_tree_change_reason(monkeypatch):
+    from device.mobilerun import MobilerunTransport
+    transport = MobilerunTransport(); transport.prefer_transit_bridge = True
+    def changing_then_broken():
+        if transport._protected_transit_xml.call_count == 1:
+            transport.last_bridge_reason = "tree_changed"
+            return None
+        raise RuntimeError("malformed bridge response")
+    transport._protected_transit_xml = Mock(side_effect=changing_then_broken)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    with pytest.raises(RuntimeError, match="malformed bridge response"):
+        transport.xml()
+    assert transport._protected_transit_xml.call_count == 2
+    assert transport.last_bridge_reason is None
 
 
 def test_missing_transit_provider_fails_closed_instead_of_using_uiautomation(monkeypatch):
@@ -688,7 +745,7 @@ def test_missing_transit_provider_fails_closed_instead_of_using_uiautomation(mon
     run = Mock(side_effect=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "No content provider found", ""))
     sleep = Mock();monkeypatch.setattr(subprocess, "run", run);monkeypatch.setattr("time.sleep", sleep)
     with pytest.raises(RuntimeError): transport.xml()
-    assert run.call_count == 6 and sleep.call_count == 5
+    assert run.call_count == 2 and sleep.call_count == 1
     transport._fresh_file_xml.assert_not_called();transport._device.ui.assert_not_called()
 
 
@@ -861,7 +918,7 @@ def test_a_successfully_seen_new_bridge_can_never_downgrade_silent_failures_to_l
     monkeypatch.setattr(subprocess, "run", run);monkeypatch.setattr("time.sleep", Mock())
     assert "高德当前窗口" in transport.xml() and transport.protocol_seen
     with pytest.raises(RuntimeError): transport.xml()
-    assert count == 7 and transport.last_bridge_reason == "bridge_no_response"
+    assert count == 3 and transport.last_bridge_reason == "bridge_no_response"
     transport._device.ui.assert_not_called();transport._fresh_file_xml.assert_not_called()
 
 
@@ -881,7 +938,7 @@ def test_explicit_new_protocol_reason_prevents_later_silent_legacy_downgrade(mon
     monkeypatch.setattr(subprocess, "run", run);monkeypatch.setattr("time.sleep", Mock())
     assert transport._protected_transit_xml() is None and transport.protocol_seen
     with pytest.raises(RuntimeError): transport.xml()
-    assert count == 7 and transport.last_bridge_reason == "bridge_no_response"
+    assert count == 3 and transport.last_bridge_reason == "bridge_no_response"
     transport._device.ui.assert_not_called();transport._fresh_file_xml.assert_not_called()
 
 

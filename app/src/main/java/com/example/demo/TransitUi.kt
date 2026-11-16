@@ -18,13 +18,19 @@ import java.util.Locale
 
 internal val transitTerminalStates = setOf("completed", "partial", "no_route", "failed", "cancelled", "interrupted", "outcome_unknown")
 
+internal fun transitCompletionReady(state: String, routeVerified: Boolean, classification: String,
+                                    routeMatchesQuery: Boolean, dingtalkRequested: Boolean,
+                                    dingtalkStatus: String): Boolean =
+    state == "completed" && routeVerified && classification == "COMPLETE" && routeMatchesQuery &&
+        (!dingtalkRequested || dingtalkStatus == "sent")
+
 @RequiresApi(26)
 internal fun transitQueryTime(value: String, zone: ZoneId): String = try {
     DateTimeFormatter.ofPattern("yyyy年M月d日 HH:mm", Locale.SIMPLIFIED_CHINESE)
         .withZone(zone).format(OffsetDateTime.parse(value).toInstant())
 } catch (_: Exception) { "待核对" }
 
-private fun deviceQueryTime(value: String): String =
+internal fun deviceQueryTime(value: String): String =
     if (Build.VERSION.SDK_INT >= 26) transitQueryTime(value, ZoneId.systemDefault()) else "待核对"
 
 internal fun transitClarificationReady(origin: String, destination: String, city: String, missing: Set<String>): Boolean {
@@ -152,6 +158,15 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("公交 / 地铁出行", style = MaterialTheme.typography.titleLarge)
             Text(task.optString("message"), fontSize = 21.sp)
+            task.present("transit_recovery_notice")?.let { notice ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                ) {
+                    Text(notice, fontSize = 19.sp, modifier = Modifier.padding(14.dp))
+                }
+            }
             Text("由电脑经 USB 操作高德地图；本次只查询出发前路线。", fontSize = 16.sp)
             if (route == null) {
                 Surface(
@@ -235,6 +250,21 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
                 }
                 Button(onClick = { onSpeak(speech, queryId) }, enabled = !loading && steps.isNotEmpty(), modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) { Text("朗读这条路线", fontSize = 21.sp) }
                 OutlinedButton(onClick = onStop, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) { Text("停止朗读", fontSize = 20.sp) }
+                transitRouteShareText(task)?.let { text ->
+                    TransitRouteShareButton(text, enabled = !loading, onOpen = onStop)
+                }
+                if (task.optString("state") == "outcome_unknown" && task.optString("dingtalk_status") == "unknown"
+                    && task.optInt("dingtalk_send_attempts") == 1) {
+                    if (task.optString("dingtalk_recipient_digest").isNotBlank() && task.optString("dingtalk_message_digest").isNotBlank()) {
+                        Text("点击下方按钮，小银会打开您的钉钉文件助手，只核查本次消息，不会再次发送。", fontSize = 18.sp)
+                        OutlinedButton(onClick = { act("verify-dingtalk") }, enabled = !loading && !active,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+                            Text("仅核查钉钉发送结果", fontSize = 20.sp)
+                        }
+                    } else {
+                        Text("本次未记录可核对的会话或消息摘要，请在钉钉本人文件助手手动检查，不要重复发送。", fontSize = 18.sp)
+                    }
+                }
                 OutlinedButton(onClick = { act("show") }, enabled = !loading && !active, modifier = Modifier.fillMaxWidth()) { Text("查看高德详情", fontSize = 20.sp) }
                 if (verified) {
                     Text("您还想知道", fontSize = 19.sp)

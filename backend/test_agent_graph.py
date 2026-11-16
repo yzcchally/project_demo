@@ -131,6 +131,22 @@ def test_resuming_qr_requires_new_scan_nonce_and_rejects_old_callback(engine):
     assert task["state"] == "awaiting_confirmation" and task["send_attempts"] == 0
 
 
+def test_external_share_is_bound_to_current_scan_and_still_requires_approval(engine):
+    engine.contacts.put("女儿", "receiver@example.org")
+    task = create_goal(engine)
+    with pytest.raises(WorkflowError):
+        engine.submit_qr(task["id"], "https://example.org/", "stale-nonce", "external_share")
+    with pytest.raises(WorkflowError):
+        engine.submit_qr(task["id"], "http://example.org/", task["scan_nonce"], "external_share")
+    with pytest.raises(WorkflowError):
+        engine.submit_qr(task["id"], "https://example.org/", task["scan_nonce"], "untrusted_source")
+    assert not engine.device.calls
+    task = settle(engine, engine.submit_qr(task["id"], "https://example.org/", task["scan_nonce"], "external_share"))
+    assert task["state"] == "awaiting_confirmation"
+    assert task["source"] == "manual" and task["scan_source"] == "external_share"
+    assert task["webpage_verified"] and task["send_attempts"] == 0
+
+
 def test_invalid_clarification_keeps_current_question(engine):
     task = create_goal(engine)
     with pytest.raises(WorkflowError):

@@ -98,7 +98,9 @@ def _xml_station(node):
             or any(not _xml_visible(child) for child in leaves)
             or re.search(r"\d+(?:站|分钟|小时|米|公里)|[¥￥]|导航|步行|换乘|方向$", title)):
         return None
-    names = [_xml_label(child) for child in leaves]
+    # Bus boarding rows may include the unrelated native “关注” action next
+    # to the one literal station-name leaf. It cannot be a station or portal.
+    names = [_xml_label(child) for child in leaves if _xml_label(child) != "关注"]
     if len(names) == 1 and normalized(title) == normalized(names[0]):
         return {"name": title, "portal": None, "title": title}
     if (len(names) == 2 and normalized("".join(names)) == normalized(title)
@@ -174,11 +176,16 @@ def _edge_walk_binding(record, ride, walk, *, leading=False, current_origin_name
                 endpoint_matches = True
             if not endpoint_matches:
                 continue
-            row_pattern = (r"步行\s*(\d+(?:\.\d+)?)(米|公里)\s*(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟" if leading else
+            measured_walk = bool(not leading and re.fullmatch(r"步行\s*\d+(?:\.\d+)?(?:米|公里)\s*(?:[·•]\s*)?\d+(?:\.\d+)?分钟", walk.get("instructions") or ""))
+            row_pattern = (r"步行\s*(\d+(?:\.\d+)?)(米|公里)\s*(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟" if leading or measured_walk else
                            r"站内外共步行\s*(\d+(?:\.\d+)?)(米|公里)\s*(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟")
             rows = [node for node in walk_branch.iter("node") if node.get("class") == "android.view.ViewGroup"
                     and re.fullmatch(row_pattern, _xml_label(node))]
             if len(rows) != 1 or not path_visible(rows[0], marker):
+                continue
+            all_walk_rows = [node for node in walk_branch.iter("node") if node.get("class") == "android.view.ViewGroup"
+                             and re.fullmatch(r"(?:站内外共)?步行\s*\d+(?:\.\d+)?(?:米|公里)\s*(?:[·•]\s*)?\d+(?:\.\d+)?分钟", _xml_label(node))]
+            if all_walk_rows != rows or any(_xml_direction(node) for node in walk_branch.iter("node")):
                 continue
             total_leaves = [node for node in rows[0].iter("node") if not list(node) and re.fullmatch(row_pattern, _xml_label(node))]
             if len(total_leaves) != 1 or not path_visible(total_leaves[0], marker):
@@ -186,7 +193,7 @@ def _edge_walk_binding(record, ride, walk, *, leading=False, current_origin_name
             row_label = _xml_label(rows[0])
             if normalized(re.sub(r"[·•]", "", _xml_label(total_leaves[0]))) != normalized(re.sub(r"[·•]", "", row_label)):
                 continue
-            allowed_quotes = {normalized(row_label)} if leading else {"站内外共步行", normalized(row_label)}
+            allowed_quotes = {normalized(row_label)} if leading or measured_walk else {"站内外共步行", normalized(row_label)}
             if normalized(walk.get("instructions")) not in allowed_quotes:
                 continue
             directions = [node for node in ride_branch.iter("node")
@@ -516,9 +523,13 @@ def validate_result(result, task_id, query_id, request=None, *, evidence=None, c
         aggregate_walk = bool(walk_instruction and normalized(walk_instruction).startswith("站内外共步行"))
         leading_walk = bool(index == 0 and walk_instruction and re.fullmatch(
             r"步行\d+(?:\.\d+)?(?:米|公里)(?:[·•])?\d+(?:\.\d+)?分钟", normalized(walk_instruction)))
+        trailing_walk = bool(index == len(data["segments"]) - 1 and index > 0 and walk_instruction and re.fullmatch(
+            r"步行\d+(?:\.\d+)?(?:米|公里)(?:[·•])?\d+(?:\.\d+)?分钟", normalized(walk_instruction)))
         binding = None
         leading_binding = None
         leading_eid = None
+        trailing_binding = None
+        trailing_eid = None
         if leading_walk and trusted and len(data["segments"]) > 1 and data["segments"][1]["mode"] in {"bus", "subway"}:
             refs = [set(seg["evidence_refs"].get(field, [])) for field in ["instructions", "board", "alight"]]
             for eid in sorted(set.intersection(*refs)):
@@ -545,6 +556,20 @@ def validate_result(result, task_id, query_id, request=None, *, evidence=None, c
                 data["derived"][f"{prefix}.walk_connection"] = (f"同一高德详情的相邻行程分支连接{start_description}与{seg['alight']}；"
                                                                 "独立步行行保留原文，具体街道走法未显示")
                 break
+        if trailing_walk and trusted and valid_segments and valid_segments[-1]["mode"] in {"bus", "subway"}:
+            refs = [set(seg["evidence_refs"].get(field, [])) for field in ["instructions", "board", "alight"]]
+            for eid in sorted(set.intersection(*refs)):
+                record = records.get(eid)
+                if not record or record["page_kind"] != "route_detail" or record["route_id"] != route_id:
+                    continue
+                candidate = _edge_walk_binding(record, valid_segments[-1], seg)
+                if not candidate or normalized(candidate["end"]) != normalized(data["destination"]["name"]):
+                    continue
+                trailing_binding, trailing_eid = candidate, eid
+                walk_bindings[seg["segment_id"]] = (candidate["start"], candidate["end"])
+                excerpts.setdefault(eid, []).extend([candidate["start"], candidate["instructions"], candidate["end"]])
+                data["derived"][f"{prefix}.walk_connection"] = "同一高德详情的相邻行程分支连接下车站与终点；具体街道走法未显示"
+                break
         if aggregate_walk and trusted and index == len(data["segments"]) - 1 and valid_segments and valid_segments[-1]["mode"] in {"bus", "subway"}:
             refs = [set(seg["evidence_refs"].get(field, [])) for field in ["instructions", "board", "alight"]]
             for eid in sorted(set.intersection(*refs)):
@@ -564,6 +589,17 @@ def validate_result(result, task_id, query_id, request=None, *, evidence=None, c
         for field in ["line", "direction", "board", "alight", "stops", "instructions", "entrance", "exit", "duration_minutes", "walking_meters"]:
             value = seg[field]
             walk_field = seg["mode"] == "walk" and field in {"instructions", "duration_minutes", "walking_meters"}
+            if trailing_walk and field in {"board", "alight", "instructions", "duration_minutes", "walking_meters"} and trailing_binding:
+                if field in {"board", "alight", "instructions"}:
+                    continue
+                if value is not None and (trailing_eid not in seg["evidence_refs"].get(field, []) or abs(value - trailing_binding[field]) > .001):
+                    seg[field] = None
+                    missing.append(f"{prefix}.{field}.ungrounded")
+                continue
+            if trailing_walk and not trailing_binding and field in {"board", "alight"} and value:
+                seg[field] = None
+                missing.append(f"{prefix}.{field}.ungrounded")
+                continue
             if leading_walk and field in {"board", "alight", "instructions", "duration_minutes", "walking_meters"}:
                 if leading_binding:
                     if field in {"board", "alight", "instructions"}:

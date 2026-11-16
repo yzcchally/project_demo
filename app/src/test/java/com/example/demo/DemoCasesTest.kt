@@ -76,13 +76,14 @@ class DemoCasesTest {
     }
 
     @Test fun qrCasesExplainTheActualManualAction() {
-        assertEquals(setOf("T02", "T06", "T09", "T10", "T11"),
+        assertEquals(setOf("T02", "T06", "T09", "T10", "T11", "T12"),
             DemoCases.all.filter { it.requiresQr }.map { it.id }.toSet())
         val invalid = DemoCases.find("T06")!!
         assertTrue(invalid.steps.any { "仍等待" in it })
         assertTrue(invalid.steps.any { "再次打开扫码" in it })
         assertTrue(DemoCases.find("T09")!!.steps.any { "通知" in it && "取消" in it })
         assertTrue(DemoCases.find("T11")!!.steps.any { "45 秒" in it })
+        assertTrue(DemoCases.find("T12")!!.steps.any { "扫描" in it && "桌面" in it })
     }
 
     @Test fun recommendedCasesCoverNormalClarificationAndRecovery() {

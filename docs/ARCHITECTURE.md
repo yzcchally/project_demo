@@ -31,6 +31,30 @@ flowchart LR
 | Device execution | `device/mobilerun.py`, `device/huawei.py` | Local Mobilerun SDK for UI, screenshots and taps; constrained ADB intents and the companion's Unicode input bridge. |
 | Safety/verification | `safety/actions.py`, `verification/mail.py`, `domain.py` | Field/action restrictions, draft digest and nonce, single attempt, exact readback and outcome evidence. |
 | Evidence/evaluation | `storage/`, `evaluation/`, `explanation/` | Contacts, ordered events, factual templates and honest pilot metrics. |
+| AutoGLM route assistance | `autoglm/assist.py`, `client.py`, `protocol.py`, `safety.py` | Optional bounded single-step help when the rules-owned public-transit entry is absent; candidate grounding, device dispatch, re-observation and a postcondition precede return to the existing rules flow. |
+| AutoGLM route execution (legacy experiment) | `autoglm/config.py`, `client.py`, `protocol.py`, `safety.py`, `executor.py` | Separately selected model-led loop, retained for the earlier experiment and using the same device worker and route verifier. |
+
+## Two route executors
+
+`SILVERGUIDE_TRANSIT_EXECUTOR=rules` selects the native-control Amap adapter.
+With `SILVERGUIDE_AUTOGLM_ASSIST_ENABLED=true`, a verified target-missing condition
+at the supported public-transit entry may invoke a single bounded model-assisted
+Tap and then continue this same adapter; other failures do not invoke assistance.
+See [AutoGLM assistance](AUTOGLM_ASSIST.md).
+`autoglm` starts a separate, explicit screenshot→remote decision→strict parse→
+independent grounding→device execution→new observation loop inside the same
+SilverGuide worker. The normal sequence is chosen by the model, not a rules
+fallback or another upstream PhoneAgent thread. Missing credentials, rejected
+actions and API failures do not change executors. Configuration is separate
+from the DeepSeek ModelGateway used for understanding and fact extraction.
+
+The executor is frozen on each query. Human-choice/clarification resumes
+re-observe within the same query; process restarts mark unfinished work
+interrupted and never automatically replay device side effects. Explicit new
+queries may adopt the new process default and retain earlier mode provenance.
+Actions and observations are locally audited without raw model thoughts.
+Finish only requests the existing evidence-based route extractor/verifier;
+the model's prose cannot certify completion. See [AutoGLM route mode](AUTOGLM_TRANSIT.md).
 
 ## Graph and external effects
 
@@ -46,12 +70,14 @@ The model may propose only typed, observed preparation actions. Send and approva
 
 ### In-App demonstration cases
 
-The companion exposes 11 cases, T02–T12, locally in `DemoCases.kt`. The normal
-category contains only T02: one complete QR-to-email demonstration, with no
-step-by-step card or separate normal subcases. T03 draft-change review belongs
-to the checks category; checks and recovery retain expandable instructions.
-The recommended filter contains T02, T04 and T12. T01 is no longer shown in the
-picker, while the backend still accepts all 12 historical case IDs.
+The companion exposes 19 cases, T02–T20, locally in `DemoCases.kt`, split into
+map (T13–T20) and mail (T02–T12) domains, each with recommended/normal/checks/
+recovery filters. Mail normal contains only T02: one complete QR-to-email task;
+map normal has T13 and T14. Normal cases have no step-by-step subcases. Checks
+and recovery retain expandable instructions. Recommended mail cases are T02,
+T04 and T12; recommended map cases are T13, T15 and T18. T01 is not shown in the
+picker, while the backend still accepts all 20 IDs. These examples do not
+select the route executor: the current explicit backend configuration does.
 A small header entry opens `DemoCasePickerSheet`; selection fills a prompt with
 a fresh subject suffix, without starting a task. The user starts the complete
 normal flow once, and still approves the verified draft before sending.
