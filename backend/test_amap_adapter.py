@@ -1541,6 +1541,41 @@ def test_native_navigation_scrolls_to_reveal_footer_without_replanning(adapter):
     adapter.base.tap.assert_called_once()
 
 
+@pytest.mark.parametrize("variant", ["native", "hidden_panel", "unrelated_title", "unbound_button"])
+def test_navigation_deviation_reports_a_verified_amap_prompt_without_tapping_it(adapter, monkeypatch, variant):
+    monkeypatch.setattr("device.amap.time.sleep", lambda _: None)
+    route = _verified_navigation_route(adapter)
+    start = _navigation_detail()
+    tree = ET.fromstring(start)
+    panel = node(rect="[153,1145][1047,1495]", cls="android.widget.LinearLayout",
+                 **{"resource-id": ID + "parentPanel", "visible-to-user": "true"})
+    top = node(rect="[153,1211][1047,1348]", cls="android.widget.LinearLayout",
+               **{"resource-id": ID + "topPanel"})
+    top.append(node("您已偏离路线，请重新规划" if variant != "unrelated_title" else "开启定位权限",
+                    rect="[282,1211][918,1282]", cls="android.widget.TextView",
+                    **{"resource-id": ID + "alertTitle", "clickable": "false"}))
+    bottom = node(rect="[153,1349][1047,1495]", cls="android.widget.LinearLayout",
+                  **{"resource-id": ID + "buttonPanel"})
+    bottom.append(node("否", rect="[153,1349][599,1495]", cls="android.widget.Button",
+                       **{"resource-id": ID + "button1"}))
+    yes = node("是", rect="[600,1349][1047,1495]", cls="android.widget.Button",
+               **{"resource-id": ID + "button2"})
+    (tree if variant == "unbound_button" else bottom).append(yes)
+    if variant == "hidden_panel":
+        panel.set("visible-to-user", "false")
+    panel.extend([top, bottom])
+    tree.append(panel)
+    after = ET.tostring(tree, encoding="unicode")
+    adapter.base.observe.side_effect = [start, start, *([after] * 4)]
+    before_tap = Mock()
+
+    with pytest.raises(WorkflowError, match="已偏离路线" if variant == "native" else "实时导航界面"):
+        adapter.start_navigation(route, lambda: None, before_tap)
+
+    before_tap.assert_called_once()
+    adapter.base.tap.assert_called_once()
+
+
 @pytest.mark.parametrize("postcondition", ["unchanged", "different_footer", "outside_amap", "hidden_end", "different_ride"])
 def test_navigation_never_retries_a_command_after_unconfirmed_result(adapter, monkeypatch, postcondition):
     monkeypatch.setattr("device.amap.time.sleep", lambda _: None)

@@ -1834,6 +1834,22 @@ class AmapDevice:
         return visible
 
     @classmethod
+    def _has_navigation_deviation_dialog(cls, shot):
+        if shot["evidence"]["page_kind"] != "route_detail":
+            return False
+        visible = set(cls._visible_navigation_nodes(shot))
+        expected = {
+            (ID + "alertTitle", "您已偏离路线，请重新规划"),
+            (ID + "button1", "否"),
+            (ID + "button2", "是"),
+        }
+        return any(
+            expected <= {(node.get("resource-id"), node.get("text"))
+                         for node in panel.iter("node") if node in visible}
+            for panel in visible if panel.get("resource-id") == ID + "parentPanel"
+        )
+
+    @classmethod
     def _navigation_control(cls, shot, *, active):
         if shot["evidence"]["page_kind"] != "route_detail":
             return None
@@ -1909,17 +1925,26 @@ class AmapDevice:
             current_identity = self._resumed_map_identity(self.base.shell("dumpsys", "activity", "activities"))
             checkpoint()
             if current_identity == identity:
+                deviation = False
+                end = start = None
                 try:
                     shot = self._observe(checkpoint, "route_detail")
-                    end = self._navigation_control(shot, active=True)
-                    start = self._navigation_control(shot, active=False)
+                    deviation = self._has_navigation_deviation_dialog(shot)
+                    if not deviation:
+                        end = self._navigation_control(shot, active=True)
+                        start = self._navigation_control(shot, active=False)
                 except (ScreenContextChanged, Cancelled):
                     raise
                 except WorkflowError:
                     end = start = None
+                if deviation:
+                    final_identity = self._resumed_map_identity(self.base.shell("dumpsys", "activity", "activities"))
+                    checkpoint()
+                    if final_identity == identity:
+                        raise WorkflowError("高德提示已偏离路线。请回到高德，从当前位置重新规划。")
                 # Amap keeps the same detail page and replaces this route's
                 # start control with the live end control in the same footer.
-                if end is not None and start is None and bounds(end) == submitted_bounds:
+                elif end is not None and start is None and bounds(end) == submitted_bounds:
                     visible, _ = self._visible_detail_nodes(shot["xml"])
                     names = {place_key(label(node)) for node in visible}
                     body = re.sub(r"\s+", "", screen_text(visible))
