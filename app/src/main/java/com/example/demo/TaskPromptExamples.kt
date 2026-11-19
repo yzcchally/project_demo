@@ -20,7 +20,7 @@ internal fun TaskPromptExamples(enabled: Boolean, onChoose: (String) -> Unit) {
         listOf(
             "帮我扫这个二维码，打开网页。",
             "帮我扫码，把网页发邮件给女儿。",
-            "在广州，从广州塔地铁站到客村地铁站怎么走？",
+            DemoCases.navigationExample,
         ).forEach { example ->
             OutlinedButton(
                 onClick = { onChoose(example) },

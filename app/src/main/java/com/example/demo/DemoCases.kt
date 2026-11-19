@@ -38,6 +38,7 @@ data class DemoCase(
 
 /** Local examples only. Choosing one prepares text; it never starts a task. */
 object DemoCases {
+    internal const val navigationExample = "在广州，从广州塔地铁站到客村地铁站怎么走？"
     val all: List<DemoCase> = listOf(
         DemoCase(
             id = "T02",
@@ -194,13 +195,13 @@ object DemoCases {
         ),
         DemoCase(
             id = "T13",
-            title = "高德路线并分享钉钉",
-            summary = "查询真实高德路线，核对后自动发送到自己的钉钉文件助手。",
+            title = "开始高德公交地铁导航",
+            summary = "查询广州塔到客村的地铁路线，核对后在高德里开始导航。",
             category = DemoCategory.SUCCESS,
             domain = DemoDomain.MAP,
-            promptTemplate = "在广州市，从广州塔地铁站去体育西路地铁站，坐地铁或公交，尽量少换乘。查询后把路线发送到我的钉钉文件助手。",
-            steps = emptyList(),
-            expected = "真实查询并核对路线，然后自动发送到自己的钉钉文件助手；无法核实则停止。",
+            promptTemplate = navigationExample,
+            steps = listOf("等待小银核对路线。", "点「开始高德导航」，确认后查看高德的导航界面。"),
+            expected = "高德显示「结束导航」，小银结束本次操作并保留高德前台。",
             recommended = true,
         ),
         DemoCase(

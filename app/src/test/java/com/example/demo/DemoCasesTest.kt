@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DemoCasesTest {
+    @Test
+    fun defaultMapDemoFinishesInNativeNavigation() {
+        val example = checkNotNull(DemoCases.find("T13"))
+        assertTrue(example.recommended)
+        assertTrue(example.steps.any { "开始高德导航" in it })
+        assertFalse("钉钉" in example.promptTemplate)
+    }
+
     @Test fun visibleCasesHaveUniqueStableIdsWithoutTheOldWebOnlyCase() {
         assertEquals((2..20).map { "T%02d".format(it) }, DemoCases.all.map { it.id })
         assertEquals(19, DemoCases.all.map { it.id }.toSet().size)
