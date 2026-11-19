@@ -112,6 +112,7 @@ def register(app):
     def qr_result(task_id: str, body: QRReply):
         return reply(lambda: get_engine().submit_qr(task_id, body.url, body.scan_nonce, body.scan_source))
 
+    @app.post("/api/tasks/{task_id}/draft", include_in_schema=False)
     @app.patch("/api/tasks/{task_id}/draft")
     def edit_draft(task_id: str, body: HumanReply):
         return reply(lambda: get_engine().edit(task_id, body.model_dump(exclude_none=True, exclude_unset=True)))

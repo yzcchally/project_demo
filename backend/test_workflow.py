@@ -267,6 +267,23 @@ class WorkflowTests(unittest.TestCase):
             response = client.post(f"/tasks/{task['id']}/approve", json={"draft_digest": task["draft_digest"]})
             self.assertEqual(response.status_code, 409)
 
+    def test_android_post_edit_replaces_draft_and_requires_new_approval(self):
+        task = self.settle(self.create())
+        with patch("workflow_api.get_engine", return_value=self.engine):
+            client = TestClient(gmail_demo.app)
+            response = client.post(f"/api/tasks/{task['id']}/draft", json={"subject": "Updated subject"})
+            self.assertEqual(response.status_code, 200)
+            updated = self.settle(response.json()["task"])
+            self.assertEqual(updated["state"], "awaiting_confirmation")
+            self.assertEqual(updated["draft"]["subject"], "Updated subject")
+            self.assertNotEqual(updated["draft_digest"], task["draft_digest"])
+            self.assertNotEqual(updated["approval_nonce"], task["approval_nonce"])
+            old = client.post(f"/tasks/{task['id']}/approve", json={
+                "draft_digest": task["draft_digest"], "approval_nonce": task["approval_nonce"], "confirmed": True,
+            })
+            self.assertEqual(old.status_code, 409)
+            self.assertEqual(self.store.get(task["id"])["send_attempts"], 0)
+
 
 class InputTests(unittest.TestCase):
     def test_browser_restores_hidden_toolbar_and_reads_full_native_address(self):
