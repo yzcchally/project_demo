@@ -177,6 +177,8 @@ internal fun WorkflowScreen(
     val state = task?.optString("state").orEmpty()
     val message = task?.optString("message").orEmpty()
     val active = task != null && state !in terminalStates
+    val navigationReady = state == "completed" && task?.optString("task_type") == "plan_transit" &&
+        task?.optBoolean("route_verified") == true && task?.optInt("transit_navigation_attempts") == 0
     fun changed() { requestKey = UUID.randomUUID().toString() }
     fun newTask() {
         stopRouteSpeech(); transitFormOpen = false
@@ -380,7 +382,7 @@ internal fun WorkflowScreen(
             }
         }
         if (result.isNotBlank() && result != message) Text(result, fontSize = 18.sp, color = MaterialTheme.colorScheme.primary)
-        if (task != null && state in terminalStates)
+        if (task != null && state in terminalStates && !navigationReady)
             Button(onClick = { newTask() }, enabled = !loading, modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) { Text("准备新的任务", fontSize = 21.sp) }
         task?.let { current ->
             if (current.optString("task_type") == "plan_transit") {
@@ -388,6 +390,12 @@ internal fun WorkflowScreen(
                     TransitTaskCard(current, loading,
                         onAction = { path, payload -> action(path, payload) },
                         onSpeak = { text, query -> speakRoute(text, query) }, onStop = { stopRouteSpeech() })
+                }
+                if (navigationReady) {
+                    OutlinedButton(onClick = { newTask() }, enabled = !loading,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+                        Text("准备新的任务", fontSize = 20.sp)
+                    }
                 }
             } else {
             val draft = current.getJSONObject("draft")
@@ -483,6 +491,10 @@ internal fun WorkflowScreen(
             }
             }
         }
+        OutlinedButton(
+            onClick = { showFamilyContact = true },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
+        ) { Text("联系家人", fontSize = 22.sp) }
         if (task == null) {
             LocalVoiceInput(enabled = !loading, onRecognized = { text ->
                 if (listOf("主题", "正文", "内容").any { it in text } && listOf("扫码", "扫描", "二维码", "打开", "发给", "发送", "分享", "公交", "地铁", "路线", "出发", "换乘").none { it in text }) {
@@ -490,10 +502,6 @@ internal fun WorkflowScreen(
                 } else { changed(); startGoal(text) }
             }, onMessage = { result = it })
         }
-        OutlinedButton(
-            onClick = { showFamilyContact = true },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
-        ) { Text("联系家人", fontSize = 22.sp) }
         if (task == null) {
             OutlinedButton(onClick = { transitFormOpen = !transitFormOpen }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
                 Text(if (transitFormOpen) "收起路线填写" else "按地点查公交地铁", fontSize = 20.sp)
