@@ -1253,6 +1253,49 @@ def test_preview_identity_keeps_gate_distinct_from_the_whole_campus(adapter):
     assert adapter._poi_title_names({'nodes':list(title.iter('node'))})=={'示例大学国际校区(西南门)'}
 
 
+def test_compact_station_detail_reads_the_address_from_its_own_header(adapter, monkeypatch):
+    monkeypatch.setattr("device.amap.time.sleep", lambda _: None)
+    name = "广州塔(地铁站)"
+    adapter.request["city"] = "广州市"
+    listing = museum_search_shot(query="广州市广州塔地铁站", name=name, address="广州市海珠区")
+    title = node(desc=name, rect="[53,806][1147,882]")
+    title.append(node(name, cls="android.view.View", rect="[53,806][620,882]"))
+    header = node(rect="[0,767][1200,1219]")
+    header.extend([title, node("广州市海珠区", cls="android.view.View", rect="[53,1150][270,1200]")])
+    screen = node(rect="[0,0][1200,2640]")
+    screen.extend([header, node("广州市海珠区其他路99号", rect="[53,1510][850,1580]"),
+                   node("搜周边", rect="[106,2484][205,2535]"), node("分享", rect="[362,2484][435,2534]"),
+                   node("导航", rect="[686,2440][787,2506]"), node("路线", rect="[942,2440][1043,2506]")])
+    detail = {"nodes": list(screen.iter("node")), "epoch": 0, "evidence": {"evidence_id": "huawei-detail"}}
+    adapter._observe = Mock(side_effect=[listing, listing, detail])
+    adapter._tap = Mock()
+
+    resolved = adapter._resolve_place("origin", "广州塔地铁站", {}, lambda: None)
+
+    assert resolved["kind"] == "place"
+    assert resolved["place"]["name"] == name
+    assert resolved["place"]["address"] == "广州市海珠区"
+    assert resolved["place"]["evidence_refs"]["address"] == ["huawei-detail"]
+
+
+def test_huawei_collapsed_station_is_a_scroll_target_only_with_a_matching_title(adapter):
+    name = "广州塔(地铁站)"
+    title = node(desc=name, rect="[53,2048][1147,2124]")
+    leaf = node(name, cls="android.view.View", rect="[53,2048][430,2124]")
+    title.append(leaf)
+    preview = node(cls="androidx.recyclerview.widget.RecyclerView", rect="[0,2007][1200,2640]",
+                   scrollable="true")
+    preview.append(title)
+    screen = node(rect="[0,0][1200,2640]")
+    screen.extend([preview, node("搜周边"), node("分享"), node("导航"), node("路线")])
+    shot = {"nodes": list(screen.iter("node"))}
+
+    assert adapter._collapsed_station_card(shot, name) == ([53, 2048, 1147, 2124], [0, 2007, 1200, 2640])
+    assert adapter._collapsed_station_card(shot, "客村(地铁站)") is None
+    leaf.set("visible-to-user", "false")
+    assert adapter._collapsed_station_card(shot, name) is None
+
+
 def test_wrong_gate_preview_is_reported_as_identity_mismatch_not_a_network_timeout(adapter,monkeypatch):
     monkeypatch.setattr('device.amap.time.sleep',lambda _:None)
     shot,card,title=campus_with_gate_card()
@@ -1356,3 +1399,110 @@ def test_unbound_same_name_location_sentence_is_not_a_poi_overview(adapter):
                      node('示例大学国际校区，位于广州市番禺区。',rect='[53,1269][1146,1390]')],
             'evidence':{'evidence_id':'unbound-text'}}
     assert adapter._read_place(detail,'示例大学(国际校区)')['city'] is None
+
+
+_NAVIGATION_FOOTER = "[769,2446][1124,2605]"
+
+
+def _navigation_detail(*, state="start", with_control=True, footer=_NAVIGATION_FOOTER,
+                       line="3号线海傍方向", destination="客村"):
+    # The native Huawei bridge exposed a clickable ViewGroup with the
+    # accessible action and a visible text descendant in the same bounds.
+    marker = node(desc="公交详情页面", rect="[0,0][1200,2640]")
+    marker.extend([
+        node("广州塔", rect="[178,1632][359,1707]"),
+        node(line, rect="[178,1745][1133,1815]"),
+        node(destination, rect="[178,2537][299,2612]"),
+    ])
+    if with_control:
+        title = "结束导航" if state == "active" else "开始导航"
+        description = "结束导航" if state == "active" else "开始导航，开启下车提醒"
+        control = node(desc=description, rect=footer)
+        control.append(node(title if state != "wrong_child" else "下车提醒", rect="[845,2490][1045,2558]",
+                            cls="android.view.View"))
+        marker.append(control)
+    return xml([marker])
+
+
+def _verified_navigation_route(adapter):
+    route = {"classification": "COMPLETE", "route_verified": True,
+             "origin": {"name": "广州塔"}, "destination": {"name": "客村"},
+             "segments": [{"mode": "subway", "line": "3号线", "board": "广州塔", "direction": "海傍", "alight": "客村"}]}
+    seed_view_context(adapter, route)
+    return route
+
+
+def test_native_navigation_uses_one_observed_footer_and_leaves_active_amap(adapter):
+    route = _verified_navigation_route(adapter)
+    start = _navigation_detail()
+    adapter.base.observe.side_effect = [start, start, _navigation_detail(state="active")]
+    before_tap = Mock()
+    adapter.base.tap.side_effect = lambda control, checkpoint: (checkpoint(), before_tap.assert_called_once())
+
+    proof = adapter.start_navigation(route, lambda: None, before_tap)
+
+    assert proof["observation_id"] and proof["android_task_id"] == 71
+    assert bounds(adapter.base.tap.call_args.args[0]) == [769, 2446, 1124, 2605]
+    adapter.base.tap.assert_called_once()
+    before_tap.assert_called_once()
+    assert all(call.args[:2] != ("am", "start") for call in adapter.base.shell.call_args_list)
+
+
+@pytest.mark.parametrize("bad_frame", ["wrong_route", "changed_footer", "wrong_child", "already_active"])
+def test_native_navigation_does_not_dispatch_from_unverified_or_changed_footer(adapter, bad_frame):
+    route = _verified_navigation_route(adapter)
+    before_tap = Mock()
+    adapter._scroll_detail = Mock()
+    start = _navigation_detail()
+    if bad_frame == "wrong_route":
+        first = second = _navigation_detail(destination="体育西路")
+    elif bad_frame == "changed_footer":
+        first, second = start, _navigation_detail(footer="[769,2441][1124,2605]")
+    elif bad_frame == "wrong_child":
+        first = second = _navigation_detail(state="wrong_child")
+    else:
+        first = second = _navigation_detail(state="active")
+    adapter.base.observe.side_effect = [first, second]
+
+    with pytest.raises(WorkflowError):
+        adapter.start_navigation(route, lambda: None, before_tap)
+
+    before_tap.assert_not_called()
+    adapter.base.tap.assert_not_called()
+
+
+def test_native_navigation_scrolls_to_reveal_footer_without_replanning(adapter):
+    route = _verified_navigation_route(adapter)
+    adapter._scroll_detail = Mock()
+    adapter.base.observe.side_effect = [_navigation_detail(with_control=False), _navigation_detail(),
+                                        _navigation_detail(), _navigation_detail(state="active")]
+
+    assert adapter.start_navigation(route, lambda: None, Mock())["observation_id"]
+
+    adapter._scroll_detail.assert_called_once()
+    adapter.base.tap.assert_called_once()
+
+
+@pytest.mark.parametrize("postcondition", ["unchanged", "different_footer", "outside_amap", "hidden_end", "different_ride"])
+def test_navigation_never_retries_a_command_after_unconfirmed_result(adapter, monkeypatch, postcondition):
+    monkeypatch.setattr("device.amap.time.sleep", lambda _: None)
+    route = _verified_navigation_route(adapter)
+    before_tap = Mock()
+    if postcondition == "unchanged":
+        after = _navigation_detail()
+    elif postcondition == "hidden_end":
+        after = _navigation_detail(state="active").replace('content-desc="结束导航"', 'content-desc="结束导航" visible-to-user="false"')
+    elif postcondition == "different_ride":
+        after = _navigation_detail(state="active", line="8号线万胜围方向")
+    else:
+        after = _navigation_detail(state="active", footer="[769,2440][1124,2605]")
+    start = _navigation_detail()
+    adapter.base.observe.side_effect = [start, start, *([after] * 4)]
+    if postcondition == "outside_amap":
+        adapter.base.tap.side_effect = lambda _, checkpoint: setattr(adapter.base.shell, "return_value", "")
+
+    with pytest.raises(WorkflowError, match="实时导航界面"):
+        adapter.start_navigation(route, lambda: None, before_tap)
+
+    adapter.base.tap.assert_called_once()
+    before_tap.assert_called_once()

@@ -989,3 +989,104 @@ def test_dingtalk_unknown_with_changed_context_never_rechecks(engine, monkeypatc
     task = create(engine, instruction='在广州从广州塔去体育西路，查询公交并发送到我的钉钉文件助手')
     assert task['state'] == 'outcome_unknown' and task['dingtalk_send_attempts'] == 1
     assert calls == ['send']
+
+
+
+def test_native_navigation_requires_confirmation_and_current_verified_query(engine):
+    task = create(engine)
+    with pytest.raises(WorkflowError, match="先确认"):
+        engine.start_transit_navigation(task["id"], task["query_id"], False)
+    with pytest.raises(WorkflowError, match="已经更新"):
+        engine.start_transit_navigation(task["id"], "expired-query", True)
+    assert not engine.store.get(task["id"]).get("transit_navigation_attempts")
+
+
+def test_native_navigation_is_idempotent_and_does_not_return_to_silverguide(engine):
+    task = create(engine)
+    show_calls = list(engine.device.calls)
+    calls = []
+
+    def navigate(route, checkpoint, before_tap):
+        checkpoint()
+        assert route == task["transit_result"]
+        before_tap()
+        assert engine.store.get(task["id"])["transit_navigation_attempts"] == 1
+        calls.append("tapped once")
+        return {"observation_id": "current-amap-navigation",
+                **{field: route[field] for field in ("task_id", "query_id", "route_id")}}
+
+    engine.transit_device.start_navigation = navigate
+    args = (task["id"], task["query_id"], True)
+    done = settle(engine, engine.start_transit_navigation(*args))
+
+    assert done["state"] == "completed"
+    assert done["transit_navigation_status"] == "started"
+    assert done["transit_navigation_proof"]["observation_id"] == "current-amap-navigation"
+    assert engine.start_transit_navigation(*args) == done
+    assert calls == ["tapped once"] and engine.device.calls == show_calls
+    assert done["dingtalk_send_attempts"] == 0
+
+
+def test_native_navigation_uncertain_is_not_replayed_after_cancel_or_restart(engine):
+    task = create(engine)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    show_calls = list(engine.device.calls)
+
+    def navigate(route, checkpoint, before_tap):
+        before_tap()
+        calls.append("dispatch")
+        entered.set()
+        assert release.wait(3)
+        checkpoint()
+
+    engine.transit_device.start_navigation = navigate
+    args = (task["id"], task["query_id"], True)
+    engine.start_transit_navigation(*args)
+    try:
+        assert entered.wait(3)
+        assert engine.start_transit_navigation(*args)["transit_navigation_status"] == "checking"
+        stopped = engine.control(task["id"], "cancel")
+        assert stopped["state"] == "outcome_unknown"
+        assert stopped["transit_navigation_status"] == "unknown"
+    finally:
+        release.set()
+    task = settle(engine, task)
+    assert engine.start_transit_navigation(*args) == task
+    assert calls == ["dispatch"] and engine.device.calls == show_calls
+
+    restarted_engine = Engine(engine.store, engine.device, Models())
+    try:
+        assert restarted_engine.start_transit_navigation(*args) == task
+    finally:
+        restarted_engine.close()
+
+
+def test_native_navigation_restart_during_dispatch_marks_unknown_without_replay(engine):
+    task = create(engine)
+    task.update(state="starting_navigation", transit_navigation_status="checking", transit_navigation_attempts=1)
+    engine.store.save(task, "pre-dispatch")
+
+    restarted_engine = Engine(engine.store, engine.device, Models())
+    try:
+        stored = restarted_engine.store.get(task["id"])
+        assert stored["state"] == "outcome_unknown"
+        assert stored["transit_navigation_status"] == "unknown"
+        assert restarted_engine.start_transit_navigation(task["id"], task["query_id"], True) == stored
+        assert restarted_engine.transit_device is None
+    finally:
+        restarted_engine.close()
+
+
+
+def test_native_navigation_api_requires_a_boolean_confirmation(engine):
+    task = create(engine)
+    url = f"/api/tasks/{task['id']}/transit/start-navigation"
+    body = {"query_id": task["query_id"]}
+    with patch("workflow_api.get_engine", return_value=engine):
+        client = TestClient(gmail_demo.app)
+        assert client.post(url, json=body).status_code == 409
+        assert client.post(url, json={**body, "confirmed": 1}).status_code == 422
+        assert client.post(url, json={**body, "confirmed": True, "x": 123}).status_code == 422
+    assert not engine.store.get(task["id"]).get("transit_navigation_attempts")

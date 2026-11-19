@@ -14,11 +14,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI
 
+from device.android_app import ANDROID_NAMESPACE, a11y_command, android_component, android_package
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 LOG_FILE = Path(__file__).resolve().parent / "gmail_demo_log.txt"
-RECEIVER = "com.example.demo/.A11yCommandReceiver"
-ACTION = "com.example.demo.A11Y_COMMAND"
 SCAN_INTERVAL_SECONDS = 3
 MAX_SCANS = 24
 RECIPIENT = os.environ.get("GMAIL_RECIPIENT", "your_send_email@example.com").strip()
@@ -362,8 +362,9 @@ def _tap(adb: str, point: tuple[int, int]) -> None:
 
 
 def _send(adb: str, extras: list[str]) -> None:
+    receiver, action = a11y_command()
     subprocess.run(
-        [adb, "shell", "am", "broadcast", "-n", RECEIVER, "-a", ACTION, *extras],
+        [adb, "shell", "am", "broadcast", "-n", receiver, "-a", action, *extras],
         capture_output=True,
         text=True,
         timeout=15,
@@ -379,7 +380,10 @@ def _accessibility_enabled(adb: str) -> bool:
         timeout=15,
         check=False,
     )
-    return "MailAccessibilityService" in result.stdout
+    enabled = set(result.stdout.strip().split(":"))
+    service = "MailAccessibilityService"
+    components = {android_component(service), f"{android_package()}/{ANDROID_NAMESPACE}.{service}"}
+    return result.returncode == 0 and not enabled.isdisjoint(components)
 
 
 def _log(line: str) -> None:

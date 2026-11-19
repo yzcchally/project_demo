@@ -1,4 +1,4 @@
-"""Bounded, query-only Amap GUI adapter for the observed Android application.
+"""Bounded Amap GUI adapter for route queries and confirmed navigation.
 
 No route service, private API, coordinates from a model, or recorded route is
 used. URI search is only an app entry; all places and route facts are read back.
@@ -489,6 +489,50 @@ class AmapDevice:
         return names
 
     @staticmethod
+    def _collapsed_station_card(shot, name):
+        """Find the visible bottom sheet for an exact station, before its address is shown."""
+        if not name.endswith(("(地铁站)", "（地铁站）")):
+            return None
+        visible = {n for n in AmapDevice._visible_place_nodes(shot["nodes"])
+                   if n.get("enabled") != "false" and bounds(n)}
+        labels = {label(n) for n in visible}
+        if not {"分享", "路线", "导航"} <= labels or not {"周边", "搜周边"} & labels:
+            return None
+        parents = {child: parent for parent in shot["nodes"] for child in parent}
+        targets = []
+        for title in visible:
+            if label(title) != name or title.get("class") != "android.view.ViewGroup":
+                continue
+            leaves = [label(n) for n in title.iter("node") if n is not title and n in visible and not list(n) and label(n)]
+            if leaves != list(name) and leaves != [name]:
+                continue
+            sheet = parents.get(title)
+            while sheet is not None:
+                if sheet in visible and sheet.get("class", "").endswith(".RecyclerView") and sheet.get("scrollable") == "true":
+                    left, top, right, bottom = bounds(sheet)
+                    if top >= bottom * .70 and right - left >= 1.5 * (bottom - top):
+                        targets.append((bounds(title), bounds(sheet)))
+                    break
+                sheet = parents.get(sheet)
+        return targets[0] if len(targets) == 1 else None
+
+    def _expand_station_card(self, shot, name, checkpoint):
+        original = self._collapsed_station_card(shot, name)
+        fresh = self._observe(checkpoint, "place_detail")
+        if original is None or self._collapsed_station_card(fresh, name) != original:
+            raise WorkflowError("高德地点预览已变化，请重新查询")
+        if fresh["epoch"] != self.base.context_epoch or shot["epoch"] != fresh["epoch"]:
+            raise ScreenContextChanged("重新进入高德后需重新核对地点预览")
+        left, top, right, bottom = original[1]
+        x = left + (right - left) // 2
+        start = top + (bottom - top) // 3
+        end = top // 2
+        self._action(checkpoint)
+        self.base.shell("input", "swipe", str(x), str(start), str(x), str(end), "450")
+        self._audit_action({"bounds": original[1], "role": "place_preview",
+                            "observation_id": fresh["evidence"]["observation_id"]}, "expand_station_card")
+
+    @staticmethod
     def _compact_poi_header(shot):
         """Recognize one actual compact main-POI header, never a result row.
 
@@ -500,7 +544,7 @@ class AmapDevice:
         ns = [n for n in AmapDevice._visible_place_nodes(shot.get("nodes", []))
               if n.get("package") == PACKAGE and n.get("enabled") != "false"]
         labels = {label(n) for n in ns}
-        if not {"周边", "分享", "导航", "路线"} <= labels:
+        if not {"分享", "导航", "路线"} <= labels or not {"周边", "搜周边"} & labels:
             return None
         if labels.intersection({"搜索历史", "历史记录", "历史搜索", "清空历史", "清除历史", "最近搜索", "搜索发现"}):
             return None
@@ -515,7 +559,7 @@ class AmapDevice:
         names = AmapDevice._poi_title_names({"nodes": ns})
         excluded = re.compile(r"^(?:相似服务推荐|相关推荐|热门推荐|用户评价|用户评论|用户点评|全部评价|全部评论|网友评论|热门评论|精选评论)")
         stop = min((bounds(n)[1] for n in ns if bounds(n) and excluded.match(label(n))), default=height)
-        footer_top = min((bounds(n)[1] for n in ns if bounds(n) and label(n) in {"周边", "分享", "导航", "路线"}), default=height)
+        footer_top = min((bounds(n)[1] for n in ns if bounds(n) and label(n) in {"周边", "搜周边", "分享", "导航", "路线"}), default=height)
         administrative = r"(?:[\u4e00-\u9fff]{2,}(?:省|市|区|县|自治区|自治州)){1,5}"
         def contained(inner, outer):
             return outer[0] <= inner[0] < inner[2] <= outer[2] and outer[1] <= inner[1] < inner[3] <= outer[3]
@@ -753,7 +797,13 @@ class AmapDevice:
             exact = [(c,n) for c,n in values if c["candidate_id"] == chosen.get("candidate_id") and c["name"] == chosen.get("name")]
             if len(exact) != 1:
                 raise WorkflowError("已选地点与当前高德候选不一致，请重新选择")
-        elif len(exact) != 1:
+        elif query.endswith(("地铁站", "（地铁站）", "(地铁站)")):
+            # The station category in the exact user request disambiguates a
+            # same-named street, without collapsing two different station rows.
+            station_rows = [(c, n) for c, n in exact if c["name"].endswith(("(地铁站)", "（地铁站）"))]
+            if station_rows:
+                exact = station_rows
+        if not chosen and len(exact) != 1:
             if len({c["candidate_id"] for c,n in values})!=len(values):
                 return {"kind":"clarification","fields":[role],"message":"高德出现无法区分地址的同名地点，请补充具体分馆、院区或街道地址。"}
             return {"kind":"choice","role":role,"candidates":[c for c,n in values]}
@@ -763,24 +813,34 @@ class AmapDevice:
         self._tap(shot,title,checkpoint,place_binding={"query":query,
                   "candidate_id":candidate["candidate_id"],"row_signature":signature})
         name=candidate["name"]
-        def detail_ready(s):
+        def detail_ready(s, *, allow_expand=True):
             if already_detail(s) and any(n.get("class")=="android.view.ViewGroup" and bounds(n)
                     and bounds(n)[1]<800 and place_key(label(n))==place_key(name) for n in s["nodes"]):
                 return True
             if self._text_target(s,"路线") is not None and self._text_target(s,"导航") is not None:
+                compact = self._compact_poi_header(s)
+                if compact and place_key(compact["name"]) == place_key(name):
+                    return compact
+                if allow_expand and self._collapsed_station_card(s, name):
+                    return "expand"
                 names = self._poi_title_names(s)
                 if len(names) == 1 and place_key(next(iter(names))) != place_key(name):
                     raise WorkflowError("高德打开的地点与本次选择不一致（"+next(iter(names))+"），已停止，请重新选择地点")
             return None
         try:
-            detail,_ = self._wait(detail_ready,checkpoint,"place_detail")
+            detail, match = self._wait(detail_ready,checkpoint,"place_detail")
+            if match == "expand":
+                self._expand_station_card(detail, name, checkpoint)
+                detail, match = self._wait(lambda s: detail_ready(s, allow_expand=False), checkpoint, "place_detail")
         except (Cancelled, ScreenContextChanged):
             raise
         except WorkflowError as error:
             if str(error).startswith("高德页面未出现预期控件"):
                 raise WorkflowError("已选择高德地点，但完整地点详情尚未展开；请返回高德核对主地点后重新查询") from None
             raise
-        return {"kind":"place","place":self._read_place(detail,name,selected=chosen,candidate=candidate)}
+        header = {} if match is True else {"header_bounds": match["bounds"]}
+        return {"kind":"place","place":self._read_place(detail,name,selected=chosen,candidate=candidate,
+                                                           **header)}
 
     def _read_place(self,detail,name,*,selected=None,candidate=None,header_bounds=None):
         city=self.request.get("city", "")
@@ -1404,34 +1464,44 @@ class AmapDevice:
         return context
 
     def show_details(self, result, checkpoint):
+        return self._detail_operation(result, checkpoint)
+
+    def start_navigation(self, result, checkpoint, before_tap):
+        if result.get("classification") != "COMPLETE" or not result.get("route_verified"):
+            raise WorkflowError("只有本次已核对的完整公交地铁路线可以启动导航")
+        proof = self._detail_operation(result, checkpoint, before_tap=before_tap)
+        return {**proof, **{field: result[field] for field in ("task_id", "query_id", "route_id")}}
+
+    def _detail_operation(self, result, checkpoint, *, before_tap=None):
         transport = getattr(self.base, "transport", None)
         previous = getattr(transport, "prefer_transit_bridge", False) if transport else False
         if transport:
             transport.prefer_transit_bridge = True
         try:
-            return self._show_details(result, checkpoint)
+            return self._show_details(result, checkpoint, before_tap=before_tap)
         finally:
             if transport:
                 transport.prefer_transit_bridge = previous
 
-    def _show_details(self, result, checkpoint):
-        # Viewing has its own bounded lifetime and evidence directory; a query
+    def _show_details(self, result, checkpoint, *, before_tap=None):
+        # The operation has its own bounded lifetime and evidence directory; a query
         # may have completed minutes ago or in a previous backend process.
         fields = ("started", "actions", "query_id", "route_id", "folder", "observations")
         previous = {field: getattr(self, field, None) for field in fields}
         key = self._context_key(result)
         self.started = time.monotonic(); self.actions = 0
         self.query_id, self.route_id = key[1], key[2]
-        self.folder = self._context_path(key).parent / ("show-" + uuid.uuid4().hex)
+        operation = "navigation-" if before_tap is not None else "show-"
+        self.folder = self._context_path(key).parent / (operation + uuid.uuid4().hex)
         self.folder.mkdir(parents=True, exist_ok=True); self.observations = []
         try:
-            return self._verify_shown_details(result, checkpoint)
+            return self._verify_shown_details(result, checkpoint, before_tap=before_tap)
         finally:
             for field, value in previous.items():
                 if value is None and hasattr(self, field): delattr(self, field)
                 else: setattr(self, field, value)
 
-    def _verify_shown_details(self, result, checkpoint):
+    def _verify_shown_details(self, result, checkpoint, *, before_tap=None):
         self._check(checkpoint)
         context = self._detail_context(result)
         snapshot = self.base.shell("dumpsys", "activity", "activities")
@@ -1490,10 +1560,24 @@ class AmapDevice:
                 return any(place_key(label(node)) == place_key(value) for node in body)
             return matched, endpoint("origin", rides[0].get("board")), endpoint("destination", rides[-1].get("alight"))
 
+        def finish(shot):
+            if before_tap is None:
+                return None
+
+            def observe_same_route():
+                current, body, text = observe()
+                if not expected_strip:
+                    seen, start_seen, end_seen = matches(body, text)
+                    if len(seen) != len(rides) or not start_seen or not end_seen:
+                        raise WorkflowError("当前详情已无法完整核对本次路线")
+                return current
+
+            return self._start_shown_navigation(shot, observe_same_route, identity, rides, before_tap, checkpoint)
+
         shot, body, text = observe()
         seen, start_seen, end_seen = matches(body, text)
         if len(seen) == len(rides) and start_seen and end_seen:
-            return
+            return finish(shot)
         if not expected_strip:
             raise WorkflowError("本次长路线的可信方案身份不足，请重新查询；小银仍保留原路线")
         if not context.get("detail_strip_fingerprint") and trusted_strip:
@@ -1511,10 +1595,132 @@ class AmapDevice:
             current, start, end = matches(body, text)
             seen.update(current); start_seen |= start; end_seen |= end
             if len(seen) == len(rides) and start_seen and end_seen:
-                return
+                return finish(shot)
             if index == self.scroll_limit: break
             previous_text = text
             self._scroll_detail(shot, checkpoint)
             shot, body, text = observe()
             if text == previous_text: break
         raise WorkflowError("已受限核对多屏详情，仍未读全本次起终点及各乘车段，请重新查询")
+
+
+    @staticmethod
+    def _visible_navigation_nodes(shot):
+        all_nodes = list(ET.fromstring(shot["xml"]).iter("node"))
+        parents = {child: parent for parent in all_nodes for child in parent}
+
+        def shown(node):
+            while node is not None:
+                if node.get("visible-to-user") == "false" or node.get("enabled") == "false":
+                    return False
+                node = parents.get(node)
+            return True
+
+        visible = [node for node in all_nodes if bounds(node) and shown(node)]
+        if any(node.get("package") != PACKAGE or re.search(r"Dialog|PopupWindow", node.get("class", ""))
+               for node in visible):
+            raise WorkflowError("高德页面可能有其他窗口遮挡，请核对手机界面")
+        return visible
+
+    @classmethod
+    def _navigation_control(cls, shot, *, active):
+        if shot["evidence"]["page_kind"] != "route_detail":
+            return None
+        visible = cls._visible_navigation_nodes(shot)
+        markers = [node for node in visible if label(node) == "公交详情页面"]
+        if len(markers) != 1:
+            return None
+        left, top, right, bottom = bounds(markers[0])
+        owner_label = "结束导航" if active else "开始导航，开启下车提醒"
+        child_label = "结束导航" if active else "开始导航"
+        candidates = []
+        for node in visible:
+            name = label(node) if active else clean(node.get("content-desc"))
+            if (node.get("class") != "android.view.ViewGroup" or node.get("clickable") != "true"
+                    or name != owner_label):
+                continue
+            x1, y1, x2, y2 = bounds(node)
+            if not (left <= x1 < x2 <= right and top + (bottom - top) * .75 <= y1 < y2 <= bottom):
+                continue
+            if any(child is not node and child in visible and clean(child.get("text")) == child_label
+                   and x1 <= bounds(child)[0] < bounds(child)[2] <= x2
+                   and y1 <= bounds(child)[1] < bounds(child)[3] <= y2
+                   for child in node.iter("node")):
+                candidates.append(node)
+        if len(candidates) > 1:
+            raise WorkflowError("高德导航按钮无法唯一核对")
+        return candidates[0] if candidates else None
+
+    def _start_shown_navigation(self, shot, observe_same_route, identity, rides, before_tap, checkpoint):
+        if self._navigation_control(shot, active=True) is not None:
+            raise WorkflowError("高德当前已显示进行中的导航，请查看手机界面")
+        target = self._navigation_control(shot, active=False)
+        for _ in range(self.scroll_limit):
+            if target is not None:
+                break
+            self._scroll_detail(shot, checkpoint)
+            previous_text = shot["evidence"]["text"]
+            shot = observe_same_route()
+            target = self._navigation_control(shot, active=False)
+            if shot["evidence"]["text"] == previous_text:
+                break
+        if target is None:
+            raise WorkflowError("本次高德详情未找到开始导航按钮")
+
+        fresh = observe_same_route()
+        current = self._navigation_control(fresh, active=False)
+        if (current is None or bounds(current) != bounds(target)
+                or current.get("resource-id") != target.get("resource-id")
+                or self._navigation_control(fresh, active=True) is not None):
+            raise WorkflowError("高德开始导航按钮已经变化")
+        self._action(checkpoint)
+        epoch = fresh["epoch"]
+
+        def check_epoch():
+            self._check(checkpoint)
+            if self.base.context_epoch != epoch:
+                raise ScreenContextChanged("已废弃暂停之前的导航按钮")
+
+        current_identity = self._resumed_map_identity(self.base.shell("dumpsys", "activity", "activities"))
+        check_epoch()
+        if current_identity != identity:
+            raise ScreenContextChanged("高德已离开本次路线页面")
+        before_tap()
+        self.base.tap(current, check_epoch)
+        self._audit_action({"role": "start_navigation", "bounds": bounds(current),
+                            "resource_id": current.get("resource-id"),
+                            "observation_id": fresh["evidence"]["observation_id"]}, "start_navigation")
+        return self._verify_native_navigation(identity, bounds(current), rides, check_epoch)
+
+    def _verify_native_navigation(self, identity, submitted_bounds, rides, checkpoint):
+        for attempt in range(4):
+            checkpoint()
+            current_identity = self._resumed_map_identity(self.base.shell("dumpsys", "activity", "activities"))
+            checkpoint()
+            if current_identity == identity:
+                try:
+                    shot = self._observe(checkpoint, "route_detail")
+                    end = self._navigation_control(shot, active=True)
+                    start = self._navigation_control(shot, active=False)
+                except (ScreenContextChanged, Cancelled):
+                    raise
+                except WorkflowError:
+                    end = start = None
+                # Amap keeps the same detail page and replaces this route's
+                # start control with the live end control in the same footer.
+                if end is not None and start is None and bounds(end) == submitted_bounds:
+                    visible, _ = self._visible_detail_nodes(shot["xml"])
+                    names = {place_key(label(node)) for node in visible}
+                    body = re.sub(r"\s+", "", screen_text(visible))
+                    same_ride = any(re.sub(r"\s+", "", ride["line"]) in body
+                                    and re.sub(r"\s+", "", ride["direction"]) in body
+                                    and any(place_key(ride[stop]) in names for stop in ("board", "alight"))
+                                    for ride in rides)
+                    final_identity = self._resumed_map_identity(self.base.shell("dumpsys", "activity", "activities"))
+                    checkpoint()
+                    if same_ride and final_identity == identity:
+                        return {"observation_id": shot["evidence"]["observation_id"],
+                                "observed_at": now(), "android_task_id": identity[0], "activity": identity[1]}
+            if attempt < 3:
+                time.sleep(.5)
+        raise WorkflowError("高德尚未显示可核对的实时导航界面")

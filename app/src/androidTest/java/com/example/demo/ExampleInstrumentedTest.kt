@@ -1,5 +1,6 @@
 package com.example.demo
 
+import android.content.ComponentName
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 
@@ -16,9 +17,9 @@ import org.junit.Assert.*
 @RunWith(AndroidJUnit4::class)
 class ExampleInstrumentedTest {
     @Test
-    fun useAppContext() {
-        // Context of the app under test.
+    fun launchIntentTargetsMainActivity() {
         val appContext = InstrumentationRegistry.getInstrumentation().targetContext
-        assertEquals("com.example.demo", appContext.packageName)
+        val launchIntent = appContext.packageManager.getLaunchIntentForPackage(appContext.packageName)
+        assertEquals(ComponentName(appContext, MainActivity::class.java), launchIntent?.component)
     }
 }

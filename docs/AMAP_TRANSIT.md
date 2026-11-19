@@ -2,7 +2,7 @@
 
 本功能在 SilverGuide 现有仓库和任务服务中扩展 `plan_transit`。用户在小银填写或说出地点，后端真实操作高德地图查询公共交通方案，读取方案详情，再回到小银显示大字步骤卡片和中文朗读。
 
-这是**出发前路线安排**。系统不会点击“开始导航”，不会购票或付款，也不会借用邮件批准、发送或收件确认来表示路线成功。
+小银在核对完整方案后显示**推荐路线**。用户确认“开始高德导航”后，小银返回本次路线详情并点击高德的原生“开始导航，开启下车提醒”按钮。看到本次路线的“结束导航”已接替原按钮后，小银记录导航已启动，并让高德保持在前台。钉钉路线分享需要用户另行明确请求。
 
 高德默认使用 `rules` 原有应用适配逻辑。可单独启用 [AutoGLM 单步辅助](AUTOGLM_ASSIST.md)：规则确实找不到已支持步骤的控件时，才会请求候选点击并独立核验。旧的 `autoglm` 全程模型决策实验模式仍需显式选择，与规则主导辅助分开；具体见 [历史说明](AUTOGLM_TRANSIT.md)。两种执行路径共用现有结果验证与任务控制。
 
@@ -41,6 +41,8 @@ flowchart TD
     Detail --> Validate["证据校验与分段去重"]
     Validate --> Result["回小银：完整 / 部分 / 无路线 / 失败"]
     Result --> Cards["大字分步卡片、朗读与当前路线追问"]
+    Cards -->|"完整路线，用户确认"| Start["核对同一方案并点击高德原生导航按钮"]
+    Start --> Active["核对正在导航的界面，高德留在前台"]
 ```
 
 明确起点优先于当前位置。自然语言中指定“从 A 去 B”后，不允许被高德默认的“我的位置”覆盖。用户说“家里”而没有具体地址时，先澄清。
@@ -133,7 +135,8 @@ WebSocket 只携带必要结构化结果、状态及证据引用，不把所有�
 | `POST /api/tasks/{id}/transit/place` | `query_id + choice_nonce + candidate_id` |
 | `POST /api/tasks/{id}/transit/requery` | 当前 `query_id`，可选新的 `preference` |
 | `POST /api/tasks/{id}/transit/ask` | `query_id + question`；回答返回相同任务和查询标识 |
-| `POST /api/tasks/{id}/transit/show` | 当前 `query_id`，返回高德供核对，不启动导航 |
+| `POST /api/tasks/{id}/transit/show` | 当前 `query_id`，返回高德供只读核对 |
+| `POST /api/tasks/{id}/transit/start-navigation` | 当前 `query_id` 和布尔值 `confirmed: true`，核对同一详情后启动原生导航 |
 
 完整请求、响应和状态约定见 [API_CONTRACT.md](API_CONTRACT.md)。路线不接受邮件批准、编辑草稿、收件确认、`verify_only` 或 `retry_prepare`。
 
@@ -153,7 +156,7 @@ LangGraph 将 GUI 查询与等待用户选择的中断节点分开。地点回�
 
 主动朗读携带当前 `query_id`。进度服务在主动朗读期间停止并抑制自身的进度语音，避免 `QUEUE_FLUSH` 打断路线。新查询、取消、离开页面及用户停止朗读时结束本轮主动播报。
 
-路线查询完成后不弹出邮件的完成清空窗口，结果留在页面供核对；只有用户点击“准备新的任务”才清理当前显示。联系人、原有邮件发送限制及后端历史仍保留。
+完整路线下方首先显示“开始高德导航”。确认窗口列出本次起点与终点。点击“确认开始导航”会停止小银朗读，再启动高德操作。取消确认可继续查看本次推荐路线、分段详情和路线追问。“准备新的任务”清理当前显示，历史记录仍可查看。
 
 ## 证据与隐私
 
@@ -164,3 +167,5 @@ LangGraph 将 GUI 查询与等待用户选择的中断节点分开。地点回�
 官方参考：[高德 Android 路线规划 URI](https://developer.amap.com/api/amap-mobile/guide/android/route)、[Android AccessibilityService](https://developer.android.com/guide/topics/ui/accessibility/service)。
 
 长路线的“查看高德详情”使用独立的有界查看预算和 `show-*` 证据目录。恢复原 Android task／Activity 后，先核对本查询真实选中方案条，再受限滚动核对起点、终点和所有乘车段；每屏重核任务、查询、epoch 与方案身份。旧 context 缺少指纹时，仅从本查询可信详情 XML 回填；不使用列表、隐藏节点或其他查询。查看过程不重新规划、不启动导航、不替换原路线结果。
+
+启动导航在同一任务的 `navigation-*` 目录保存新观察。开始前重新核对原 Android task、Activity、已核对方案及可见的原生按钮。点击提交前先持久化本次尝试，随后只读取界面核对结果。如果调用中断或页面无法核对，小银显示“高德导航结果待核对”，用户可以查看当前高德界面。同一个查询的重复请求返回已有导航状态。

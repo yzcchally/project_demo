@@ -8,6 +8,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import com.example.demo.ui.theme.DemoTheme
@@ -15,10 +16,14 @@ import com.example.demo.ui.theme.DemoTheme
 class MainActivity : ComponentActivity() {
     private val sharedScan = mutableStateOf<SharedScan?>(null)
     private var shareId = 0
+    private val historyOpenRequest = mutableIntStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (savedInstanceState == null) receiveShare(intent) else {
+        if (savedInstanceState == null) {
+            receiveShare(intent)
+            receiveHistoryRequest(intent)
+        } else {
             shareId = savedInstanceState.getInt("share_sequence")
             if (savedInstanceState.getBoolean("share_pending")) {
                 sharedScan.value = SharedScan(savedInstanceState.getInt("share_id"), savedInstanceState.getString("share_url"))
@@ -28,7 +33,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             DemoTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    WorkflowScreen(Modifier.padding(padding), sharedScan.value) { sharedScan.value = null }
+                    WorkflowScreen(Modifier.padding(padding), sharedScan.value, historyOpenRequest.intValue) {
+                        sharedScan.value = null
+                    }
                 }
             }
         }
@@ -37,6 +44,13 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         receiveShare(intent)
+        receiveHistoryRequest(intent)
+    }
+
+    private fun receiveHistoryRequest(intent: Intent) {
+        if (intent.getBooleanExtra(TaskHistoryEntry.EXTRA_OPEN_HISTORY, false)) {
+            historyOpenRequest.intValue++
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

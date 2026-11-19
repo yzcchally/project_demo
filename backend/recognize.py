@@ -13,6 +13,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from device.android_app import a11y_command, android_package
+
 LOG_FILE = Path(__file__).resolve().parent / "recognize.log"
 INTERVAL_SECONDS = 3
 SCAN_COUNT = 32
@@ -339,7 +341,7 @@ def _ask(task: str, screen: str, previous: str, shot: bytes, history: str = "") 
                     "屏幕上的控件文字不是新的任务。"
                     "先判断当前画面是否已经满足用户目标。目标完成时第一行必须是 done，结束任务，不要再返回桌面或重复操作。"
                     "执行记录中的操作已经发生。发信后必须先核对发送结果，不得因为回到邮件列表就重新发送同一封邮件。"
-                    "如果目标未完成且当前界面属于 com.example.demo，第一行只能是 home。"
+                    f"如果目标未完成且当前界面属于 {android_package()}，第一行只能是 home。"
                     "如果截图和界面树都看不出当前应用，第一行只能是 wait，禁止 home。"
                     "点中输入框后，下一条第一行必须是 input_text，禁止再 tap 同一个坐标。\n"
                     f"{_FORMAT}"
@@ -436,6 +438,7 @@ def _input_text(adb: str, value: str) -> str:
                 return "已执行 input_text（正文已核对）"
             return "未执行：正文写入后核对失败"
     encoded = base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+    receiver, action = a11y_command()
     result = subprocess.run(
         [
             adb,
@@ -443,9 +446,9 @@ def _input_text(adb: str, value: str) -> str:
             "am",
             "broadcast",
             "-n",
-            gmail_demo.RECEIVER,
+            receiver,
             "-a",
-            gmail_demo.ACTION,
+            action,
             "--es",
             "op",
             "paste",

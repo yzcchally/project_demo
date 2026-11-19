@@ -6,6 +6,7 @@ import subprocess
 import uuid
 import xml.etree.ElementTree as ET
 
+from device.android_app import android_package
 from domain import WorkflowError
 
 PACKAGE = 'com.alibaba.android.rimet'
@@ -24,7 +25,7 @@ def observe(checkpoint=lambda: None):
     if os.environ.get('ANDROID_SERIAL'):
         command += ['-s', os.environ['ANDROID_SERIAL']]
     command += ['shell', 'content', 'call', '--uri',
-                'content://com.example.demo.dingtalk', '--method', 'dump_dingtalk_ui', '--arg', nonce]
+                f'content://{android_package()}.dingtalk', '--method', 'dump_dingtalk_ui', '--arg', nonce]
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
                                 errors='replace', timeout=9)

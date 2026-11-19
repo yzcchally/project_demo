@@ -1,0 +1,25 @@
+# 屏幕模型入口 load_model() 默认加载 active 指向的模型。
+active: human
+
+# 输入是当前这一轮。这一轮里有：
+# image 当前截图，text 当前文字，info 宽高等，
+# previous 前面每一轮的 image、text、info。
+# 输出是一条指令，外加给悬浮窗的 progress。
+#
+# 现在只实现了 human，代码在 backend/models/human/。
+# 新增一种模型要做三件事：
+# 1. 新建 backend/models/<kind>/，类继承 AgentModel，实现 complete(self, turn)。
+# 2. 在类上写 @registry.register("<kind>")，并在 backend/models/__init__.py 里 import 这个包。
+# 3. 在下面 models 里加一块，把 active 改成它的名字。
+#
+# deepseek:
+#   kind: deepseek
+#   base_url: ${SILVERGUIDE_MODEL_BASE_URL}
+#   api_key: ${DEEPSEEK_API_KEY}
+#   model: ${SILVERGUIDE_VISION_MODEL}
+#
+# ${名字} 从环境变量或项目根目录的 .env 读取。
+
+models:
+  human:
+    kind: human

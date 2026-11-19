@@ -220,7 +220,21 @@ identified in that log and must not be reported as a naturally occurring fault.
 | `place` | `{query_id, choice_nonce, candidate_id}` | Resumes `awaiting_place_choice` using one currently offered candidate. |
 | `requery` | `{query_id, preference?}` | Starts a fresh generation after a finished/partial/no-route/failed/interrupted query; keeps previous result sources. |
 | `ask` | `{query_id, question}` | Answers from the current verified result; returns `{ok:true, task_id, query_id, answer}` without device actions. |
-| `show` | `{query_id}` | Acquires the device worker to return to Amap for inspection; does not start in-trip navigation. |
+| `show` | `{query_id}` | Acquires the device worker to return to Amap for read-only inspection. |
+| `start-navigation` | `{query_id, confirmed:true}` | Rechecks the current complete route and starts its native Amap navigation after user confirmation. |
+
+Navigation is available after the current query has a verified `COMPLETE`
+result. The task enters `starting_navigation` while the device worker checks
+the saved Amap route. It records `transit_navigation_attempts: 1` before
+dispatching the start tap. The task reports `transit_navigation_status: "started"`
+only after a fresh Amap observation verifies that the end-navigation button
+has replaced the start button for the same route. The proof binds the task,
+query, route and observation. Amap stays in the foreground.
+
+A failure before dispatch preserves the route and reports `"failed"`. An
+interruption after dispatch may report `"unknown"` with task state
+`outcome_unknown`. Repeating the request for that query returns its saved
+navigation state without a second tap, including after a backend restart.
 
 A `place_choice` snapshot has this structure:
 

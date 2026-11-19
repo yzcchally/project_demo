@@ -6,7 +6,7 @@ import anyio
 from typing import Literal
 
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from workflow import WorkflowError, get_engine, validate_url
 from api.schemas import (GoalRequest, HumanReply, QRReply, Contact, DEMO_CASE_IDS,
@@ -31,8 +31,16 @@ class Approval(BaseModel):
     approval_nonce: str = Field(default="", max_length=100)
 
 
+class TransitNavigationConfirmation(TransitQueryRef):
+    confirmed: StrictBool = False
+
+
 class Control(BaseModel):
     action: Literal["pause", "resume", "cancel", "retry_prepare", "verify_only"]
+
+
+class TaskReturnRequest(BaseModel):
+    expected_revision: int = Field(gt=0, strict=True)
 
 
 def reply(function):
@@ -184,6 +192,15 @@ def register(app):
                 raise HTTPException(409, "请先停止基础 AI 操作，再查看高德")
             return reply(lambda: get_engine().show_transit(task_id, body.query_id))
 
+    @app.post("/api/tasks/{task_id}/transit/start-navigation")
+    def start_transit_navigation(task_id: str, body: TransitNavigationConfirmation):
+        import recognize
+        import gmail_demo
+        with START_LOCK:
+            if recognize.running() or gmail_demo.running():
+                raise HTTPException(409, "请先停止基础 AI 操作，再启动高德导航")
+            return reply(lambda: get_engine().start_transit_navigation(task_id, body.query_id, body.confirmed))
+
     @app.post("/api/tasks/{task_id}/transit/verify-dingtalk")
     def verify_dingtalk(task_id: str, body: TransitQueryRef):
         import recognize
@@ -192,6 +209,26 @@ def register(app):
             if recognize.running() or gmail_demo.running():
                 raise HTTPException(409, "请先停止基础 AI 操作，再核查钉钉")
             return reply(lambda: get_engine().verify_dingtalk(task_id, body.query_id))
+
+    @app.get("/api/tasks/{task_id}/return-step/{step_seq}")
+    def task_return_options(task_id: str, step_seq: int):
+        from task_history import return_options
+
+        try:
+            return return_options(get_engine(), task_id, step_seq)
+        except WorkflowError as error:
+            raise HTTPException(404, str(error)) from None
+
+    @app.post("/api/tasks/{task_id}/return-step/{step_seq}")
+    def task_return_step(task_id: str, step_seq: int, body: TaskReturnRequest):
+        import gmail_demo
+        import recognize
+        from task_history import return_to_step
+
+        with START_LOCK:
+            if recognize.running() or gmail_demo.running():
+                raise HTTPException(409, "请先停止基础 AI 操作，再返回任务步骤")
+            return reply(lambda: return_to_step(get_engine(), task_id, step_seq, body.expected_revision))
 
     @app.get("/api/evaluation")
     def evaluation():

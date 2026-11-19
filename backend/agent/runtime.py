@@ -61,6 +61,14 @@ class Engine:
         self.graph = build_graph(self)
         # A restart must never replay a possible external send.
         for task in store.all():
+            if task.get("transit_navigation_status") in {"preparing", "checking"}:
+                attempted = bool(task.get("transit_navigation_attempts"))
+                task.update(state="outcome_unknown" if attempted else "completed",
+                            transit_navigation_status="unknown" if attempted else "failed")
+                task.pop("resume_state", None)
+                store.save(task, "高德导航结果待核对，请查看高德当前页面" if attempted
+                           else "导航准备已中断，已保留本次路线")
+                continue
             if task["state"] not in TERMINAL:
                 task["state"] = "outcome_unknown" if task.get("send_attempts", 0) or task.get("dingtalk_send_attempts", 0) else "interrupted"
                 if task.get("dingtalk_send_attempts", 0):
@@ -287,6 +295,15 @@ class Engine:
                 if task.get("task_type") == "plan_transit":
                     if locals().get("work_query_id") is not None and task.get("query_id") != work_query_id:
                         return
+                    if function == self._start_transit_navigation:
+                        if task.get("transit_navigation_status") in {"preparing", "checking"}:
+                            attempted = bool(task.get("transit_navigation_attempts"))
+                            task.update(state="outcome_unknown" if attempted else "completed",
+                                        transit_navigation_status="unknown" if attempted else "failed")
+                            task.pop("resume_state", None)
+                            message = "高德导航结果待核对，请查看高德当前页面" if attempted else "未启动高德导航，已保留本次路线"
+                            self.store.save(task, message + "：" + str(error)[:180])
+                        return
                     if (task.get("state") in {"sharing_transit", "verifying_dingtalk"} or task.get("dingtalk_status") in {"sending", "verifying"}
                             or task.get("dingtalk_status") == "unknown" and task.get("dingtalk_send_attempts")):
                         attempted = bool(task.get("dingtalk_send_attempts"))
@@ -428,6 +445,13 @@ class Engine:
                     self.cancelled = True
                     self.paused = False
                     self.condition.notify_all()
+                if task.get("transit_navigation_status") in {"preparing", "checking"}:
+                    attempted = bool(task.get("transit_navigation_attempts"))
+                    task.update(state="outcome_unknown" if attempted else "completed",
+                                transit_navigation_status="unknown" if attempted else "failed")
+                    task.pop("resume_state", None)
+                    return self.store.save(task, "已停止核对，请查看高德当前页面确认导航状态" if attempted
+                                           else "已取消启动导航，已保留本次路线")
                 dingtalk_attempted = bool(task.get("dingtalk_send_attempts", 0))
                 task.update(state="outcome_unknown" if task["send_attempts"] or dingtalk_attempted else "cancelled", approval_digest=None)
                 if dingtalk_attempted:
@@ -502,7 +526,12 @@ class Engine:
 
     def _understand(self, task_id):
         task = self._stage(task_id, "understanding")
-        intent = self.models.understand(task["instruction"], [c["alias"] for c in self.contacts.all()])
+        from agent.local_intake import understand_local_instruction
+
+        intent = understand_local_instruction(task["instruction"])
+        parser = "explicit_input" if intent else "llm"
+        if intent is None:
+            intent = self.models.understand(task["instruction"], [c["alias"] for c in self.contacts.all()])
         self.checkpoint()
         task = self.store.get(task_id)
         if intent.task_type == "unsupported":
@@ -528,7 +557,7 @@ class Engine:
                 request["preference"] = "less_walking"
             else:
                 request["preference"] = "recommended"
-            if not request["origin"] and not explicit_from:
+            if parser == "llm" and not request["origin"] and not explicit_from:
                 request["use_current_location"] = True
             for field in ("origin", "destination"):
                 if request[field] in {"家", "家里", "我家", "家中"}:
@@ -543,7 +572,7 @@ class Engine:
                         transit_executor=self._configured_transit_executor(), transit_executor_started=False,
                         transit_place_selections=[], query_id=uuid.uuid4().hex,
                         query_started_at=now(), transit_result=None, route_verified=False,
-                        transit_choices={}, place_choice=None, parser="llm", request_qr=False,
+                        transit_choices={}, place_choice=None, parser=parser, request_qr=False,
                         intake_complete=True, source="amap_gui",
                         plan=["理解出行需求", "核对起终点和城市", "高德查询公交地铁", "展开并核对各段", "返回小银分步讲解"])
             # Route tasks have an independent contract, not a fabricated mail draft.
@@ -564,7 +593,7 @@ class Engine:
             alias = ""
         urls = re.findall(r"https://[^\s，。；]+", instruction)
         url = validate_url(urls[0]) if len(urls) == 1 else ""
-        task.update(task_type=intent.task_type, recipient_alias=alias, recipient_ambiguous=ambiguous, parser="llm",
+        task.update(task_type=intent.task_type, recipient_alias=alias, recipient_ambiguous=ambiguous, parser=parser,
                     request_qr=intent.task_type == "scan_and_share" or any(w in instruction for w in ("扫码", "二维码", "扫描")),
                     plan=(["理解需求", "识别二维码或网址", "核对网页"] if intent.task_type == "open_url" else
                           ["理解需求", "澄清收件人", "识别二维码或网址", "核对网页", "准备草稿", "用户确认", "单次发送并核验"]),
@@ -1145,6 +1174,8 @@ class Engine:
             if answer.preference is not None: request["preference"] = answer.preference
             executor = self._configured_transit_executor()
             task.pop("dingtalk_text_version", None)
+            for field in ("transit_navigation_status", "transit_navigation_attempts", "transit_navigation_proof"):
+                task.pop(field, None)
             task.update(query_id=uuid.uuid4().hex, query_started_at=now(), transit_request=TransitRequest.model_validate(request).model_dump(),
                         dingtalk_requested=False, dingtalk_status="not_requested", dingtalk_send_attempts=0, dingtalk_query_id=None,
                         dingtalk_recipient_digest=None, dingtalk_message_digest=None,
@@ -1166,6 +1197,62 @@ class Engine:
                 raise WorkflowError("当前没有完整核验的路线，请先查询；缺失信息不能用于编造路线回答")
             answer = answer_question(task["transit_result"], question)
             return {"ok": True, "task_id": task_id, "query_id": query_id, "answer": answer}
+
+    def start_transit_navigation(self, task_id, query_id, confirmed):
+        if confirmed is not True:
+            raise WorkflowError("请先确认在高德启动本次路线的导航")
+        with self.condition:
+            task = self._transit_task(task_id, query_id)
+            result = task.get("transit_result") or {}
+            if (not task.get("route_verified") or not result.get("route_verified")
+                    or result.get("classification") != "COMPLETE" or result.get("task_id") != task_id
+                    or result.get("query_id") != query_id or not result.get("route_id")):
+                raise WorkflowError("请先核对本次完整路线，再启动高德导航")
+            if task.get("transit_navigation_attempts") or task.get("transit_navigation_status") == "preparing":
+                return task
+            if task["state"] != "completed":
+                raise WorkflowError("请等待本次路线查询完成，再启动高德导航")
+            if (self.worker and self.worker.is_alive()
+                    or any(t["id"] != task_id and t["state"] not in TERMINAL | {"interrupted"} for t in self.store.all())):
+                raise WorkflowError("手机正由其他任务使用，请稍后启动高德导航")
+            task.update(state="starting_navigation", transit_navigation_status="preparing",
+                        transit_navigation_attempts=0)
+            self.store.save(task, "正在回到高德核对本次路线和导航按钮")
+            self._launch(self._start_transit_navigation, task_id)
+            return task
+
+    def _start_transit_navigation(self, task_id):
+        task = self.store.get(task_id)
+        query_id = task["query_id"]
+        route = task["transit_result"]
+        check = self._transit_checkpoint(task_id, query_id)
+        check()
+        epoch = getattr(self.device, "context_epoch", 0)
+        adapter = self._transit_adapter()
+
+        def before_tap():
+            with self.condition:
+                current = self._transit_task(task_id, query_id)
+                if (self.cancelled or self.paused or current["state"] != "starting_navigation"
+                        or current.get("transit_navigation_status") != "preparing"
+                        or current.get("transit_navigation_attempts") or current.get("transit_result") != route
+                        or getattr(self.device, "context_epoch", 0) != epoch):
+                    raise WorkflowError("高德导航确认或当前页面已变化")
+                current.update(transit_navigation_status="checking", transit_navigation_attempts=1)
+                self.store.save(current, "正在启动高德导航并核对导航界面")
+
+        proof = adapter.start_navigation(route, check, before_tap)
+        check()
+        with self.condition:
+            task = self._transit_task(task_id, query_id)
+            if (task.get("transit_navigation_status") != "checking" or task.get("transit_navigation_attempts") != 1
+                    or task.get("transit_result") != route or getattr(self.device, "context_epoch", 0) != epoch
+                    or not isinstance(proof, dict) or not proof.get("observation_id")
+                    or (proof.get("task_id"), proof.get("query_id"), proof.get("route_id")) !=
+                    (task_id, query_id, route["route_id"])):
+                raise WorkflowError("本次高德导航界面仍待核对")
+            task.update(state="completed", transit_navigation_status="started", transit_navigation_proof=proof)
+            self.store.save(task, "高德导航已启动，请按高德的实时指引出行")
 
     def show_transit(self, task_id, query_id):
         with self.condition:

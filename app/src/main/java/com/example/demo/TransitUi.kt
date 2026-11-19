@@ -129,7 +129,7 @@ fun TransitRequestCard(enabled: Boolean, onStart: (String) -> Unit) {
 }
 
 @Composable
-fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
+fun TransitTaskCard(task: JSONObject, loading: Boolean,
                     onAction: (String, JSONObject) -> Unit, onSpeak: (String, String) -> Unit, onStop: () -> Unit) {
     val taskId = task.optString("id"); val queryId = task.optString("query_id")
     val state = task.optString("state"); val active = state !in transitTerminalStates
@@ -150,7 +150,7 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
     }
     var answer by remember(taskId, queryId) { mutableStateOf("") }
     var asking by remember(taskId, queryId) { mutableStateOf(false) }
-    var historyExpanded by rememberSaveable(taskId, queryId) { mutableStateOf(false) }
+    var confirmNavigation by remember(taskId, queryId, state) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     fun payload() = JSONObject().put("query_id", queryId)
     fun act(suffix: String, body: JSONObject = payload()) { onStop(); onAction("/api/tasks/$taskId/transit/$suffix", body) }
@@ -167,7 +167,6 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
                     Text(notice, fontSize = 19.sp, modifier = Modifier.padding(14.dp))
                 }
             }
-            Text("由电脑经 USB 操作高德地图；本次只查询出发前路线。", fontSize = 16.sp)
             if (route == null) {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -216,8 +215,11 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
             if (route != null) {
                 val classification = route.optString("classification")
                 val verified = task.optBoolean("route_verified") && route.optBoolean("route_verified") && classification == "COMPLETE"
-                Text(when { verified -> "已核对路线"; classification == "PARTIAL" -> "路线只读取了一部分"; classification == "NO_ROUTE" -> "没有查到公交地铁方案"; else -> "本次路线查询未完成" }, fontSize = 24.sp)
-                Text("${route.optJSONObject("origin")?.optString("name").orEmpty()} → ${route.optJSONObject("destination")?.optString("name").orEmpty()}", fontSize = 23.sp)
+                val routeOrigin = route.optJSONObject("origin")?.optString("name").orEmpty()
+                val routeDestination = route.optJSONObject("destination")?.optString("name").orEmpty()
+                val navigationAvailable = verified && state == "completed" && task.optInt("transit_navigation_attempts") == 0
+                Text(when { verified -> "推荐路线"; classification == "PARTIAL" -> "路线只读取了一部分"; classification == "NO_ROUTE" -> "没有查到公交地铁方案"; else -> "本次路线查询未完成" }, fontSize = 24.sp)
+                Text("$routeOrigin → $routeDestination", fontSize = 23.sp)
                 val overview = buildList {
                     route.present("duration_minutes")?.let { add("预计 $it 分钟") }
                     route.present("transfers")?.let { add("换乘 $it 次") }
@@ -226,6 +228,29 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
                 }
                 if (overview.isNotEmpty()) Text(overview.joinToString(" · "), fontSize = 20.sp)
                 route.present("selection_basis")?.let { Text(it, fontSize = 18.sp) }
+                if (navigationAvailable) {
+                    Button(
+                        onClick = { confirmNavigation = true },
+                        enabled = !loading,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
+                    ) { Text("开始高德导航", fontSize = 22.sp) }
+                    if (confirmNavigation) {
+                        AlertDialog(
+                            onDismissRequest = { confirmNavigation = false },
+                            title = { Text("开始高德导航？", fontSize = 24.sp) },
+                            text = { Text("从${routeOrigin}到${routeDestination}。确认后，高德将开启这条路线的实时导航和下车提醒。", fontSize = 19.sp) },
+                            confirmButton = {
+                                Button(onClick = {
+                                    confirmNavigation = false
+                                    act("start-navigation", payload().put("confirmed", true))
+                                }, enabled = !loading) { Text("确认开始导航", fontSize = 18.sp) }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { confirmNavigation = false }) { Text("稍后", fontSize = 18.sp) }
+                            },
+                        )
+                    }
+                }
                 val missing = route.optJSONArray("missing_fields")
                 if (classification == "PARTIAL" || !verified) {
                     Text("信息不完整，请先核对高德详情；未读取的信息不会补猜。", fontSize = 19.sp, color = MaterialTheme.colorScheme.error)
@@ -265,7 +290,10 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
                         Text("本次未记录可核对的会话或消息摘要，请在钉钉本人文件助手手动检查，不要重复发送。", fontSize = 18.sp)
                     }
                 }
-                OutlinedButton(onClick = { act("show") }, enabled = !loading && !active, modifier = Modifier.fillMaxWidth()) { Text("查看高德详情", fontSize = 20.sp) }
+                if (task.optInt("transit_navigation_attempts") == 0) {
+                    OutlinedButton(onClick = { act("show") }, enabled = !loading && !active,
+                        modifier = Modifier.fillMaxWidth()) { Text("查看高德详情", fontSize = 20.sp) }
+                }
                 if (verified) {
                     Text("您还想知道", fontSize = 19.sp)
                     listOf("第一步怎么走？", "我应该在哪一站下车？", "需要换乘几次？").forEach { question ->
@@ -294,15 +322,6 @@ fun TransitTaskCard(task: JSONObject, loading: Boolean, timeline: String,
                     enabled = !loading, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) { Text(if (state == "paused") "继续任务" else "暂停任务", fontSize = 20.sp) }
                 OutlinedButton(onClick = { onStop(); onAction("/api/tasks/$taskId/control", JSONObject().put("action", "cancel")) },
                     enabled = !loading, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) { Text("取消任务", fontSize = 20.sp) }
-            }
-            if (timeline.isNotBlank()) {
-                TextButton(onClick = { historyExpanded = !historyExpanded }) {
-                    Text(if (historyExpanded) "收起历史操作记录" else "查看历史操作记录", fontSize = 16.sp)
-                }
-                if (historyExpanded) {
-                    Text("记录可能包含此前查询；当前状态请看页面上方。", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(timeline, fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
             }
         }
     }

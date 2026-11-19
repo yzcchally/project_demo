@@ -39,6 +39,7 @@ class TaskConnectionService : Service() {
     private val controls = TaskControlQueue()
     private var controlReady = false
     private var controlRetry: Runnable? = null
+    private var overlaySteps = emptyList<String>()
     private lateinit var tts: TextToSpeech
     private val terminal = setOf("completed", "partial", "no_route", "failed", "cancelled", "outcome_unknown", "interrupted")
 
@@ -64,9 +65,10 @@ class TaskConnectionService : Service() {
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val id = intent?.getStringExtra("task_id") ?: prefs.getString("task_id", "").orEmpty()
-        if (intent?.action == ACTION_DISMISS) {
+        if (intent?.action == dismissAction(this)) {
             if (watched.isBlank() || watched == id) {
                 active = false; watched = ""; latest = null
+                TaskOverlayState.publish(this, null)
                 controlReady = false; controls.clear(); cancelControlRetry()
                 handler.removeCallbacksAndMessages(null)
                 socket?.cancel(); socket = null
@@ -81,6 +83,7 @@ class TaskConnectionService : Service() {
         }
         if (id.isBlank() || dismissed(id)) {
             if (watched.isBlank() || watched == id) {
+                TaskOverlayState.publish(this, null)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 getSystemService(NotificationManager::class.java).cancel(NOTICE)
                 stopSelfResult(startId)
@@ -106,6 +109,7 @@ class TaskConnectionService : Service() {
     private fun connect(id: String) {
         if (!current(id) || !active) return
         controlReady = false
+        TaskOverlayState.publish(this, null)
         reconnectRetry?.let { handler.removeCallbacks(it) }; reconnectRetry = null
         cancelControlRetry()
         reconnectScheduled = false
@@ -129,6 +133,7 @@ class TaskConnectionService : Service() {
                             if (snapshot) controlReady = true
                             update(response)
                             if (snapshot && active && controls.reconcileSnapshot(latest?.optString("state").orEmpty())) persistControl(id)
+                            publishTaskOverlay()
                             dispatchControl(id)
                         } catch (_: Exception) { reconnect(id) }
                     }
@@ -149,6 +154,7 @@ class TaskConnectionService : Service() {
     private fun reconnect(id: String) {
         if (!current(id) || !active || reconnectScheduled) return
         controlReady = false
+        TaskOverlayState.publish(this, null)
         reconnectScheduled = true
         prefs.edit().putString("connection_error", "连接暂时中断，正在恢复原任务。请检查电脑和 USB 连接。").apply()
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification("连接中断，正在恢复", latest))
@@ -168,11 +174,14 @@ class TaskConnectionService : Service() {
         val unique = LinkedHashMap<Int, JSONObject>()
         for (i in 0 until events.length()) unique[events.getJSONObject(i).optInt("seq")] = events.getJSONObject(i)
         val trimmed = JSONArray(); unique.values.toList().takeLast(20).forEach { trimmed.put(it) }
+        val state = task.optString("state")
+        val transitQuery = task.optString("query_id").takeIf { task.optString("task_type") == "plan_transit" }
+        overlaySteps = if (TaskOverlayPhase.fromTaskState(state) == null) emptyList() else taskOverlaySteps(trimmed, state, transitQuery)
         prefs.edit().putString("live_task", task.toString()).putString("live_events", trimmed.toString()).putString("events_task", id)
             .putLong("cursor:$id", maxOf(prefs.getLong("cursor:$id", 0), response.optLong("cursor", 0))).remove("connection_error").apply()
         val message = task.optString("message")
         speak(id, message)
-        active = task.optString("state") !in terminal
+        active = state !in terminal
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification(message, task))
         if (!active) {
             controlReady = false; controls.clear(); persistControl(id); cancelControlRetry()
@@ -183,8 +192,21 @@ class TaskConnectionService : Service() {
     }
     private fun control(id: String, action: String) {
         if (!current(id) || !controls.enqueue(action)) return
+        // Remove the touchable overlay before any queued control can resume work.
+        TaskOverlayState.publish(this, null)
         persistControl(id)
         dispatchControl(id)
+    }
+
+    private fun publishTaskOverlay() {
+        val task = latest
+        val phase = TaskOverlayPhase.fromTaskState(task?.optString("state").orEmpty())
+        val id = task?.optString("id").orEmpty()
+        if (!current(id) || !active || !controlReady || phase == null || controls.pending != null || controls.inFlight != null) {
+            TaskOverlayState.publish(this, null)
+            return
+        }
+        TaskOverlayState.publish(this, TaskOverlaySnapshot(id, phase, overlaySteps)) { action -> control(id, action) }
     }
     private fun persistControl(id: String) {
         val editor = prefs.edit()
@@ -225,6 +247,7 @@ class TaskConnectionService : Service() {
         if (!controls.complete(attempt, retryable)) return
         persistControl(id)
         result?.let { update(it) }
+        publishTaskOverlay()
         if (error != null && stillRequested && active) prefs.edit().putString("connection_error", error).apply()
         if (controls.pending == null) return
         if (retryable && stillRequested) {
@@ -259,6 +282,7 @@ class TaskConnectionService : Service() {
     }
     override fun onDestroy() {
         destroyed = true; active = false; ttsReady = false
+        TaskOverlayState.publish(this, null)
         controlReady = false; controls.clear(); cancelControlRetry()
         prefs.unregisterOnSharedPreferenceChangeListener(speechListener)
         handler.removeCallbacksAndMessages(null); socket?.cancel(); client.dispatcher.cancelAll()
@@ -268,7 +292,7 @@ class TaskConnectionService : Service() {
     companion object {
         const val CHANNEL = "silverguide_tasks"
         const val NOTICE = 7001
-        private const val ACTION_DISMISS = "com.example.demo.DISMISS_TASK"
+        private fun dismissAction(context: Context) = "${context.packageName}.DISMISS_TASK"
         fun watch(context: Context, taskId: String) {
             if (taskId.isBlank() || context.getSharedPreferences("silverguide", 0).getString("dismissed_task", "") == taskId) return
             ContextCompat.startForegroundService(context, Intent(context, TaskConnectionService::class.java).putExtra("task_id", taskId))
@@ -284,7 +308,7 @@ class TaskConnectionService : Service() {
             context.getSharedPreferences("silverguide", 0).edit()
                 .putString("dismissed_task", taskId).remove("pending_control:$taskId").apply()
             context.startService(Intent(context, TaskConnectionService::class.java)
-                .setAction(ACTION_DISMISS).putExtra("task_id", taskId))
+                .setAction(dismissAction(context)).putExtra("task_id", taskId))
         }
     }
 }

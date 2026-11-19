@@ -1,5 +1,7 @@
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from device.android_app import android_package
 
 
 DemoCaseId = Literal["T01", "T02", "T03", "T04", "T05", "T06", "T07", "T08", "T09", "T10", "T11", "T12", "T13", "T14", "T15", "T16", "T17", "T18", "T19", "T20"]
@@ -221,13 +223,26 @@ class Contact(BaseModel):
     address: str = Field(min_length=3, max_length=254)
 
 
+def _action_packages() -> tuple[str, ...]:
+    return ("", "com.huawei.email", "com.huawei.browser", "com.android.chrome", android_package())
+
+
 class ActionSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: Literal["open_app", "tap_element", "enter_text", "press_back", "swipe", "wait"]
     target_id: str = Field(default="", max_length=80)
     role: Literal["", "to", "subject", "body", "url"] = ""
     text: str = Field(default="", max_length=11000)
-    package: Literal["", "com.huawei.email", "com.huawei.browser", "com.android.chrome", "com.example.demo"] = ""
+    package: str = Field(
+        default="", strict=True, json_schema_extra=lambda schema: schema.update(enum=list(_action_packages())),
+    )
+
+    @field_validator("package")
+    @classmethod
+    def validate_package(cls, package: str) -> str:
+        if package not in _action_packages():
+            raise ValueError("不允许的应用包名")
+        return package
 
 
 class ScreenDecision(BaseModel):

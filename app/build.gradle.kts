@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val huaweiSideBySide = providers.gradleProperty("huaweiSideBySide").orNull == "true"
+
 android {
     namespace = "com.example.demo"
     compileSdk {
@@ -15,11 +17,18 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "1.0"
+        manifestPlaceholders["launcherLabel"] = "@string/app_name"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
+        debug {
+            if (huaweiSideBySide) {
+                applicationIdSuffix = ".huaweitest"
+                manifestPlaceholders["launcherLabel"] = "@string/huawei_test_app_name"
+            }
+        }
         release {
             optimization {
                 enable = true

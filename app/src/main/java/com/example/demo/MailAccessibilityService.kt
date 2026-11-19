@@ -3,11 +3,14 @@ package com.example.demo
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.app.KeyguardManager
 import android.graphics.Path
 import android.graphics.Rect
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.res.Configuration
+import android.os.Build
 import android.os.Bundle
 import android.util.Xml
 import android.view.accessibility.AccessibilityEvent
@@ -34,6 +37,7 @@ internal class TransitBridgeLease(private val deadline: Long) {
 }
 
 class MailAccessibilityService : AccessibilityService() {
+    private val taskOverlay by lazy { TaskOperationOverlay(this) }
     var lastTransitReadReason = "not_requested"
         private set
     var lastTransitInputReason = "not_requested"
@@ -84,6 +88,7 @@ class MailAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         configureTransitAccess()
         instance = this
+        refreshTaskOverlay()
     }
 
     private fun configureTransitAccess() {
@@ -100,6 +105,7 @@ class MailAccessibilityService : AccessibilityService() {
     private fun nodeBounds(rect: Rect) = "[${rect.left},${rect.top}][${rect.right},${rect.bottom}]"
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
+        taskOverlay.hide()
         if (instance === this) {
             instance = null
         }
@@ -107,13 +113,63 @@ class MailAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        taskOverlay.hide()
         if (instance === this) {
             instance = null
         }
         super.onDestroy()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (TaskOverlayState.snapshot == null || event == null) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> refreshTaskOverlay()
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                val changes = AccessibilityEvent.WINDOWS_CHANGE_ADDED or AccessibilityEvent.WINDOWS_CHANGE_REMOVED or
+                    AccessibilityEvent.WINDOWS_CHANGE_ACTIVE or AccessibilityEvent.WINDOWS_CHANGE_FOCUSED or
+                    AccessibilityEvent.WINDOWS_CHANGE_LAYER
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || (event.windowChanges and changes) != 0) {
+                    refreshTaskOverlay()
+                }
+            }
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        taskOverlay.configurationChanged()
+        refreshTaskOverlay()
+    }
+
+    internal fun refreshTaskOverlay() {
+        val snapshot = TaskOverlayState.snapshot
+        if (snapshot != null && canShowTaskOverlay()) taskOverlay.show(snapshot) else taskOverlay.hide()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun canShowTaskOverlay(): Boolean {
+        if (getSystemService(KeyguardManager::class.java).isKeyguardLocked) return false
+        val entries = runCatching { windows.orEmpty() }.getOrDefault(emptyList())
+        return try {
+            val front = entries.filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+                .maxByOrNull { it.layer } ?: return false
+            if (!front.isFocused && !front.isActive) return false
+            if (entries.any { it.layer > front.layer && it.type == AccessibilityWindowInfo.TYPE_SYSTEM &&
+                    (it.isFocused || it.isActive) }) return false
+            val root = front.root ?: return false
+            try {
+                val foreground = root.packageName?.toString().orEmpty()
+                // The DingTalk bridge independently rejects observations through an overlay.
+                foreground.isNotEmpty() && foreground != packageName && foreground != "com.alibaba.android.rimet"
+            } finally {
+                root.recycle()
+            }
+        } catch (_: RuntimeException) {
+            false
+        } finally {
+            entries.forEach { it.recycle() }
+        }
+    }
 
     override fun onInterrupt() = Unit
 

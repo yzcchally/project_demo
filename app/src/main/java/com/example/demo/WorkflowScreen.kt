@@ -75,6 +75,7 @@ internal suspend fun request(path: String, payload: JSONObject? = null, method: 
 internal fun WorkflowScreen(
     modifier: Modifier = Modifier,
     sharedScan: SharedScan? = null,
+    openHistoryRequest: Int = 0,
     onDismissSharedScan: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -111,7 +112,11 @@ internal fun WorkflowScreen(
     var editBody by rememberSaveable { mutableStateOf("") }
     var advanced by rememberSaveable { mutableStateOf(false) }
     var debugPrompt by rememberSaveable { mutableStateOf("打开手机的设置，打开后结束任务。") }
-    var timeline by remember { mutableStateOf("") }
+    var showHistory by rememberSaveable { mutableStateOf(false) }
+    var historyTaskId by rememberSaveable {
+        mutableStateOf(prefs.getString("history_task_id", taskId.ifBlank { dismissedTaskId }).orEmpty())
+    }
+    LaunchedEffect(openHistoryRequest) { if (openHistoryRequest > 0) showHistory = true }
     var speakEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("speak_enabled", false)) }
     var ttsReady by remember { mutableStateOf(false) }
     var ttsSupported by remember { mutableStateOf(true) }
@@ -119,6 +124,7 @@ internal fun WorkflowScreen(
     var viewedTransitCompletion by rememberSaveable { mutableStateOf("") }
     var speechStatus by remember { mutableStateOf("") }
     var showDemoPicker by rememberSaveable { mutableStateOf(false) }
+    var showFamilyContact by rememberSaveable { mutableStateOf(false) }
     var selectedDemoId by rememberSaveable { mutableStateOf("") }
     var selectedDemoPrompt by rememberSaveable { mutableStateOf("") }
     var demoMetadataSupported by rememberSaveable { mutableStateOf(false) }
@@ -182,7 +188,7 @@ internal fun WorkflowScreen(
         contactAlias = ""; contactAddress = ""
         receiptDialog = false; viewedTransitCompletion = ""; showDemoPicker = false; launchedScan = ""
         scanInFlight = false; scanOwner = ""; scanNonce = ""
-        task = null; taskId = ""; timeline = ""; result = ""; changed()
+        task = null; taskId = ""; result = ""; changed()
         instruction = ""; webpage = ""; body = ""; subject = "网页分享"; source = "text"
         recipient = prefs.getString("recipient", "").orEmpty()
         selectedDemoId = ""; selectedDemoPrompt = ""
@@ -212,7 +218,8 @@ internal fun WorkflowScreen(
                 val becameActive = task?.optString("state") in terminalStates && incoming.optString("state") !in terminalStates
                 if (queryChanged || incoming.optString("state") == "cancelled") stopRouteSpeech()
                 task = incoming; taskId = incoming.getString("id")
-                prefs.edit().putString("task_id", taskId).apply()
+                historyTaskId = taskId
+                prefs.edit().putString("task_id", taskId).putString("history_task_id", historyTaskId).apply()
                 if (prefs.getString("live_task", "") != incoming.toString()) prefs.edit().putString("live_task", incoming.toString()).apply()
                 if (watchedTask != taskId || queryChanged || becameActive) { watchedTask = taskId; TaskConnectionService.watch(context, taskId) }
             }
@@ -237,10 +244,6 @@ internal fun WorkflowScreen(
             scope.launch {
                 if (key == "live_task") prefs.getString("live_task", null)?.let {
                     accept(JSONObject().put("task", JSONObject(it)))
-                }
-                if (key == "live_events" && prefs.getString("events_task", "") == taskId) {
-                    val events = org.json.JSONArray(prefs.getString("live_events", "[]"))
-                    timeline = (maxOf(0, events.length() - 6) until events.length()).joinToString("\n") { "• " + events.getJSONObject(it).optString("message") }
                 }
                 if (key == "connection_error") prefs.getString("connection_error", null)?.let { result = it }
             }
@@ -276,8 +279,7 @@ internal fun WorkflowScreen(
         action("/api/tasks", payload)
     }
 
-    fun openDemoPicker() {
-        showDemoPicker = true
+    fun checkTaskDemoCapabilities() {
         demoRecoverySupported = false; demoMetadataSupported = false
         demoRecoveryStatus = "正在检查演示功能…"
         scope.launch {
@@ -337,8 +339,8 @@ internal fun WorkflowScreen(
             .setPrompt("将镜头对准网页二维码").setOrientationLocked(false).setBeepEnabled(false).setTimeout(45000))
     }
 
-    LaunchedEffect(state, taskId, task?.optString("scan_nonce"), lifecycleState, scanInFlight, sharedScan) {
-        if (!scanInFlight && sharedScan == null && state == "awaiting_qr" && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)) {
+    LaunchedEffect(state, taskId, task?.optString("scan_nonce"), lifecycleState, scanInFlight, sharedScan, showHistory) {
+        if (!scanInFlight && !showHistory && sharedScan == null && state == "awaiting_qr" && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)) {
             val marker = taskId + task!!.optString("scan_nonce")
             if (launchedScan != marker) {
                 launchedScan = marker
@@ -348,15 +350,19 @@ internal fun WorkflowScreen(
     }
 
 
-    Column(modifier.verticalScroll(pageScroll).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    TaskHistoryScaffold(modifier, pageScroll, onOpen = { showHistory = true }) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("小银助手", style = MaterialTheme.typography.headlineMedium)
                 Text("SilverGuide", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            TextButton(onClick = { openDemoPicker() }) { Text("演示案例", fontSize = 17.sp) }
+            TextButton(onClick = { showDemoPicker = true }) { Text("演示案例", fontSize = 17.sp) }
         }
         Text("扫码分享网页，也能查询公交地铁路线。", fontSize = 20.sp)
+        OutlinedButton(
+            onClick = { showFamilyContact = true },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
+        ) { Text("联系家人", fontSize = 22.sp) }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("语音播报任务进度", fontSize = 18.sp)
             Switch(speakEnabled, onCheckedChange = { speakEnabled = it; prefs.edit().putBoolean("speak_enabled", it).apply(); if (!it) tts.stop() })
@@ -375,14 +381,15 @@ internal fun WorkflowScreen(
         task?.let { current ->
             if (current.optString("task_type") == "plan_transit") {
                 key(taskId, current.optString("query_id")) {
-                    TransitTaskCard(current, loading, timeline,
+                    TransitTaskCard(current, loading,
                         onAction = { path, payload -> action(path, payload) },
                         onSpeak = { text, query -> speakRoute(text, query) }, onStop = { stopRouteSpeech() })
                 }
             } else {
             val draft = current.getJSONObject("draft")
             val fingerprint = current.getString("draft_digest")
-            var checked by remember(taskId, fingerprint, state) { mutableStateOf(false) }
+            val approvalNonce = current.optString("approval_nonce")
+            var checked by remember(taskId, fingerprint, state, approvalNonce) { mutableStateOf(false) }
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("当前任务", style = MaterialTheme.typography.titleLarge)
@@ -426,7 +433,7 @@ internal fun WorkflowScreen(
                             Checkbox(checked, onCheckedChange = { checked = it }, enabled = !loading)
                             Text("我已核对收件人、主题和完整正文", fontSize = 19.sp)
                         }
-                        Button(onClick = { action("/tasks/$taskId/approve", JSONObject().put("draft_digest", fingerprint).put("confirmed", true).put("approval_nonce", current.getString("approval_nonce"))) },
+                        Button(onClick = { action("/tasks/$taskId/approve", JSONObject().put("draft_digest", fingerprint).put("confirmed", true).put("approval_nonce", approvalNonce)) },
                             enabled = checked && !editMode && !loading, modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) { Text("确认发送这封邮件", fontSize = 21.sp) }
                         TextButton(onClick = {
                             editRecipient = draft.getString("recipient"); editSubject = draft.getString("subject")
@@ -464,7 +471,6 @@ internal fun WorkflowScreen(
                             action("/tasks/$taskId/control", JSONObject().put("action", "cancel"))
                         }, enabled = !loading) { Text("取消并修改内容", fontSize = 19.sp) }
                     }
-                    if (timeline.isNotEmpty()) Text(timeline, fontSize = 16.sp)
                     if (current.optString("assistance_mode") != "basic") TextButton(onClick = { scope.launch {
                         try { result = request("/api/tasks/$taskId/explain").getString("message") }
                         catch (e: Exception) { result = e.message.orEmpty() }
@@ -489,7 +495,11 @@ internal fun WorkflowScreen(
                 instruction = it
                 if (it != selectedDemoPrompt) { selectedDemoId = ""; selectedDemoPrompt = "" }
                 changed()
-            }, label = { Text("告诉小银想做什么") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+            }, label = { Text("告诉小银想做什么") },
+                placeholder = { Text("点下面的例子，或写自己的话") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+            if (instruction.isBlank()) TaskPromptExamples(enabled = !loading) {
+                selectedDemoId = ""; selectedDemoPrompt = ""; instruction = it; changed()
+            }
             Button(onClick = { startGoal(instruction) }, enabled = !loading && instruction.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) {
                 Text(DemoCases.find(selectedDemoId)?.startLabel ?: "让小银完成这个任务", fontSize = 21.sp)
             }
@@ -557,12 +567,31 @@ internal fun WorkflowScreen(
         }
         Spacer(Modifier.height(24.dp))
     }
-    if (showDemoPicker) DemoCasePickerSheet(
-        onDismiss = { showDemoPicker = false }, onSelect = { useDemo(it) },
+    if (showHistory) TaskHistoryPanel(
+        taskId = historyTaskId,
+        canReturn = task != null && historyTaskId == taskId,
+        onDismiss = { showHistory = false },
+        onReturned = { response ->
+            accept(response)
+            showHistory = false
+            scope.launch { pageScroll.scrollTo(0) }
+        },
+    )
+    if (showFamilyContact && !showHistory) FamilyContactDialog(onDismiss = { showFamilyContact = false })
+    if (showDemoPicker && !showHistory) DemoCasePickerSheet(
+        onDismiss = { showDemoPicker = false },
+        onSelect = { useDemo(it) },
+        onOpenTaskCases = ::checkTaskDemoCapabilities,
+        onOpenFamilyContact = {
+            if (!active && !loading) {
+                showDemoPicker = false
+                showFamilyContact = true
+            }
+        },
         canSelect = !active && !loading, recoverySupported = demoRecoverySupported,
         recoveryStatus = demoRecoveryStatus,
     )
-    sharedScan?.let { share ->
+    sharedScan?.takeUnless { showHistory }?.let { share ->
         // The share may cold-start the Activity before task restoration. Bind
         // once only after a successful fresh backend snapshot, and persist that
         // binding through rotation so a new QR round cannot inherit an old link.
@@ -634,7 +663,7 @@ internal fun WorkflowScreen(
             dismissButton = { TextButton(onClick = { dismissShare() }) { Text("返回", fontSize = 19.sp) } },
         )
     }
-    if (receiptDialog && task != null) AlertDialog(onDismissRequest = { receiptDialog = false }, title = { Text("确认已经收到？") },
+    if (receiptDialog && task != null && !showHistory) AlertDialog(onDismissRequest = { receiptDialog = false }, title = { Text("确认已经收到？") },
         text = { Text("请仅在收件箱中找到这封邮件，并核对主题和正文后确认。此结果会记录为您人工核对。") },
         confirmButton = { TextButton(onClick = {
             receiptDialog = false
@@ -644,7 +673,9 @@ internal fun WorkflowScreen(
         val route = current.optJSONObject("transit_result")
         val query = current.optString("query_id")
         val id = current.optString("id")
-        current.optString("task_type") == "plan_transit" && route != null && id.isNotBlank() && query.isNotBlank() &&
+        !showHistory && current.optString("task_type") == "plan_transit" &&
+            current.optBoolean("dingtalk_requested") && current.optString("dingtalk_status") == "sent" &&
+            route != null && id.isNotBlank() && query.isNotBlank() &&
             transitCompletionReady(current.optString("state"), current.optBoolean("route_verified") && route.optBoolean("route_verified"),
                 route.optString("classification"), route.optString("task_id") == id && route.optString("query_id") == query,
                 current.optBoolean("dingtalk_requested"), current.optString("dingtalk_status")) &&
@@ -660,8 +691,7 @@ internal fun WorkflowScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("任务已完成，请点击确认。", fontSize = 21.sp)
                     if (label.isNotBlank()) Text(label, fontSize = 19.sp)
-                    Text(if (completed.optBoolean("dingtalk_requested")) "路线已核对，并已发送到您的钉钉文件助手。"
-                        else "高德路线已查询并核对。", fontSize = 19.sp)
+                    Text("路线已核对，并已发送到您的钉钉文件助手。", fontSize = 19.sp)
                 }
             },
             confirmButton = {
@@ -670,13 +700,18 @@ internal fun WorkflowScreen(
                     Text("确认，返回首页", fontSize = 21.sp)
                 }
             },
-            dismissButton = { TextButton(onClick = { viewedTransitCompletion = "${completed.optString("id")}:${completed.optString("query_id")}" }) {
-                Text("查看路线", fontSize = 19.sp)
-            } },
+            dismissButton = {
+                val completionKey = listOf(completed.optString("id"), completed.optString("query_id")).joinToString(":")
+                TextButton(onClick = { viewedTransitCompletion = completionKey }) { Text("查看路线", fontSize = 19.sp) }
+                TextButton(onClick = {
+                    viewedTransitCompletion = completionKey
+                    showHistory = true
+                }) { Text("任务历史", fontSize = 19.sp) }
+            },
         )
     }
     task?.takeIf { current ->
-        current.optString("task_type") != "plan_transit" && state == "completed" && if (current.optString("task_type") == "open_url")
+        !showHistory && current.optString("task_type") != "plan_transit" && state == "completed" && if (current.optString("task_type") == "open_url")
             current.optBoolean("webpage_verified") else current.optBoolean("delivery_confirmed")
     }?.let { completed ->
         AlertDialog(
@@ -695,6 +730,7 @@ internal fun WorkflowScreen(
                     Text("确认，返回首页", fontSize = 21.sp)
                 }
             },
+            dismissButton = { TextButton(onClick = { showHistory = true }) { Text("任务历史", fontSize = 19.sp) } },
         )
     }
 }

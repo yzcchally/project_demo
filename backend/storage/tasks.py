@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from domain import WorkflowError, now
 from api.events import hub
@@ -15,12 +16,18 @@ class Store:
             c.executescript("""
                 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, data TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS events_task_seq ON events(task_id, seq);
             """)
 
+    @contextmanager
     def connect(self):
         c = sqlite3.connect(self.db, timeout=10)
-        c.execute("PRAGMA synchronous=FULL")
-        return c
+        try:
+            c.execute("PRAGMA synchronous=FULL")
+            with c:
+                yield c
+        finally:
+            c.close()
 
     def all(self) -> list[dict]:
         with self.lock, self.connect() as c:
@@ -44,7 +51,9 @@ class Store:
             event.update(task_type="plan_transit", query_id=task.get("query_id"), route_classification=(task.get("transit_result") or {}).get("classification"),
                          transit_executor=task.get("transit_executor", "rules"),
                          dingtalk_status=task.get("dingtalk_status", "not_requested"),
-                         dingtalk_send_attempts=task.get("dingtalk_send_attempts", 0))
+                         dingtalk_send_attempts=task.get("dingtalk_send_attempts", 0),
+                         transit_navigation_attempts=task.get("transit_navigation_attempts", 0),
+                         transit_navigation_status=task.get("transit_navigation_status"))
             if task.get("transit_executor") == "autoglm":
                 event.update(transit_agent_step=task.get("transit_agent_step", 0),
                              transit_agent_last_action=task.get("transit_agent_last_action"))
@@ -65,3 +74,13 @@ class Store:
         with self.lock, self.connect() as c:
             return [{"seq": r[0], **json.loads(r[1])} for r in c.execute(
                 "SELECT seq,data FROM events WHERE task_id=? AND seq>? ORDER BY seq LIMIT 100", (task_id, after))]
+
+    def history_step(self, task_id: str, seq: int) -> tuple[dict, int]:
+        with self.lock, self.connect() as c:
+            row = c.execute(
+                "SELECT data FROM events WHERE task_id=? AND seq=?", (task_id, seq)
+            ).fetchone()
+            if row is None:
+                raise WorkflowError("没有找到这一步的记录")
+            revision = c.execute("SELECT MAX(seq) FROM events WHERE task_id=?", (task_id,)).fetchone()[0]
+        return {"seq": seq, **json.loads(row[0])}, revision

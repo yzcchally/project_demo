@@ -74,6 +74,22 @@ def _unique_label(root, parents, label):
     return items[0]
 
 
+def _share_chooser_target(root, parents):
+    # DingTalk 9 displays the chat entry as a named, clickable share row.
+    rows = [n for n in root.iter('node') if n.get('resource-id') == PACKAGE + ':id/item_share_to_friend'
+            and n.get('clickable') == 'true' and _visible(n, parents) and _bounds(n)]
+    if not rows:
+        return _unique_label(root, parents, '钉钉好友')
+    if len(rows) != 1:
+        raise WorkflowError('钉钉好友分享入口不可唯一核对')
+    row = rows[0]
+    titles = [n for n in row.iter('node') if n.get('resource-id') == PACKAGE + ':id/text_title_main'
+              and _text(n) == '发送给好友' and _visible(n, parents) and _bounds(n)]
+    if len(titles) != 1:
+        raise WorkflowError('钉钉好友分享入口标题不可唯一核对')
+    return row
+
+
 def _self_target(root, parents):
     matches = []
     for n in root.iter('node'):
@@ -350,7 +366,7 @@ class DingTalkDevice:
         def find_page(root, parents):
             try: return ('self', _self_target(root, parents))
             except WorkflowError:
-                return ('chooser', _unique_label(root, parents, '钉钉好友'))
+                return ('chooser', _share_chooser_target(root, parents))
         _, _, (kind, target) = self._wait(find_page, check)
         if kind == 'chooser':
             _, _, (again, target) = self._wait(find_page, check)

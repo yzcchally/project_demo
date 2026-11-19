@@ -1,6 +1,11 @@
-"""Local-only Mobilerun SDK transport, with the existing ADB adapter as fallback."""
+"""Local-only Mobilerun SDK transport, with native ADB compatibility."""
+import base64
 import os
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
+
+from device.android_app import android_package
 
 
 TRANSIT_BRIDGE_REASONS = frozenset({
@@ -20,7 +25,6 @@ def call_transit_bridge(operation, extras=None):
     are allowed; a returned Bundle must echo this call's fresh nonce.
     """
     import re
-    import subprocess
     import uuid
     import gmail_demo
     if operation not in {"dump_transit_ui", "set_transit_field"}:
@@ -45,7 +49,7 @@ def call_transit_bridge(operation, extras=None):
     command = [gmail_demo._adb()]
     if os.environ.get("ANDROID_SERIAL"):
         command += ["-s", os.environ["ANDROID_SERIAL"]]
-    command += ["shell", "content", "call", "--uri", "content://com.example.demo.transit",
+    command += ["shell", "content", "call", "--uri", f"content://{android_package()}.transit",
                 "--method", operation, "--arg", nonce]
     for key, value in extras.items():
         command += ["--extra", f"{key}:s:{value}"]
@@ -83,6 +87,24 @@ def call_transit_bridge(operation, extras=None):
     return {"result": int(success), "data": data, "reason": reason, "nonce": nonce}
 
 
+class _NativeAdbDevice:
+    def __init__(self, serial):
+        import gmail_demo
+
+        self.command = [gmail_demo._adb(), "-s", serial]
+
+    def tap(self, x, y):
+        subprocess.run(self.command + ["shell", "input", "tap", str(x), str(y)],
+                       capture_output=True, check=True, timeout=10)
+
+    def screenshot(self):
+        png = subprocess.run(self.command + ["exec-out", "screencap", "-p"],
+                             capture_output=True, check=True, timeout=20).stdout
+        if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError("ADB 未取得可用的手机截图")
+        return base64.b64encode(png).decode("ascii")
+
+
 class MobilerunTransport:
     def __init__(self):
         self._device = None
@@ -95,14 +117,24 @@ class MobilerunTransport:
     @property
     def device(self):
         if self._device is None:
-            import subprocess
             import gmail_demo
-            from mobilerun_core import Mobilerun
+            try:
+                from mobilerun_core import Mobilerun
+            except ModuleNotFoundError as error:
+                if sys.platform != "win32" or error.name != "fcntl":
+                    raise
+                # The pinned SDK imports POSIX file locking during startup.
+                Mobilerun = None
             serial = os.environ.get("ANDROID_SERIAL")
             if not serial:
                 result = subprocess.run([gmail_demo._adb(), "get-serialno"], capture_output=True, text=True, timeout=10, check=True)
                 serial = result.stdout.strip()
-            self._device = Mobilerun().connect(serial, backend="local-android-adb")
+            if Mobilerun is None:
+                if not serial or serial == "unknown":
+                    raise RuntimeError("ADB 未取得手机序列号，请检查 USB 调试连接")
+                self._device = _NativeAdbDevice(serial)
+            else:
+                self._device = Mobilerun().connect(serial, backend="local-android-adb")
         return self._device
 
     def xml(self, checkpoint=lambda: None):
@@ -137,8 +169,11 @@ class MobilerunTransport:
             raise RuntimeError("高德无障碍窗口暂不可用，请检查页面状态后重试")
         if self.file_xml_mode:
             return self._compatible_xml()
+        device = self.device
+        if isinstance(device, _NativeAdbDevice):
+            return self._compatible_xml()
         try:
-            state = self.device.ui(filter=False)
+            state = device.ui(filter=False)
         except ValueError as error:
             if "uiautomator output did not contain" not in str(error):
                 raise
@@ -189,7 +224,6 @@ class MobilerunTransport:
         Each response is bound to this fresh nonce. Old/malformed successful
         responses fail closed instead of becoming route evidence.
         """
-        import base64
         response = call_transit_bridge("dump_transit_ui")
         self.last_bridge_reason = ("bridge_no_response" if response["reason"] == "bridge_unavailable" and self.protocol_seen
                                    else response["reason"])
@@ -217,13 +251,15 @@ class MobilerunTransport:
         return ET.tostring(root,encoding="unicode")
 
     def _fresh_file_xml(self):
-        import subprocess
         import uuid
         import gmail_demo
         path = "/sdcard/silverguide-" + uuid.uuid4().hex + ".xml"
-        command = [gmail_demo._adb()]
-        if os.environ.get("ANDROID_SERIAL"):
-            command += ["-s", os.environ["ANDROID_SERIAL"]]
+        if isinstance(self._device, _NativeAdbDevice):
+            command = self._device.command
+        else:
+            command = [gmail_demo._adb()]
+            if os.environ.get("ANDROID_SERIAL"):
+                command += ["-s", os.environ["ANDROID_SERIAL"]]
         try:
             subprocess.run(command + ["shell", "uiautomator", "dump", path],
                            check=True, capture_output=True, timeout=20)

@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
 
+from device.android_app import a11y_command, android_component
 from domain import WorkflowError, normalize_text, validate_url
 from safety.recovery import classify_dialog
 
@@ -305,8 +306,9 @@ class HuaweiDevice:
                 return
             if attempt:
                 self._spend_recovery("retry_input", "输入尚未通过核对，正在重新定位字段并重试一次", checkpoint)
-            self.shell("am", "broadcast", "-n", "com.example.demo/.A11yCommandReceiver",
-                       "-a", "com.example.demo.A11Y_COMMAND", "--es", "op", "set_field", "--es", "field", field,
+            receiver, action = a11y_command()
+            self.shell("am", "broadcast", "-n", receiver,
+                       "-a", action, "--es", "op", "set_field", "--es", "field", field,
                        "--es", "text", encoded, "--ez", "use_clipboard", clipboard)
             xml = self._observe_composer(checkpoint)
             actual = read_draft(xml)
@@ -473,7 +475,7 @@ class HuaweiDevice:
         return verified
 
     def show_app(self):
-        self.shell("am", "start", "-n", "com.example.demo/.MainActivity")
+        self.shell("am", "start", "-n", android_component("MainActivity"))
 
     def read_current_url(self, checkpoint):
         self.shell("am", "start", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.APP_BROWSER")

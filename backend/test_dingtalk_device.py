@@ -6,7 +6,8 @@ import subprocess
 
 import pytest
 from domain import WorkflowError
-from device.dingtalk import DingTalkDevice, _parse, _self_target, _home_self_target, _confirmation, _verified_self_message, recipient_digest, route_text
+from device.dingtalk import (DingTalkDevice, _parse, _self_target, _home_self_target, _confirmation,
+                            _share_chooser_target, _verified_self_message, recipient_digest, route_text)
 from device.dingtalk_bridge import TransientRead
 
 PKG = 'com.alibaba.android.rimet'
@@ -61,6 +62,18 @@ def tree(*nodes):
         ET.SubElement(root, 'node', {'text': text, 'package': PKG, 'bounds': bounds,
                                      'visible-to-user': 'true', 'enabled': 'true'})
     return ET.tostring(root, encoding='unicode')
+
+
+def test_share_chooser_supports_the_dingtalk_friend_row_on_huawei():
+    root = ET.fromstring(tree(('发送给好友', '[238,796][518,872]')))
+    row = ET.SubElement(root, 'node', {'package': PKG, 'resource-id': PKG + ':id/item_share_to_friend',
+                                      'clickable': 'true', 'bounds': '[53,555][1147,741]'})
+    title = ET.SubElement(row, 'node', {'package': PKG, 'resource-id': PKG + ':id/text_title_main',
+                                       'text': '发送给好友', 'bounds': '[238,610][518,686]'})
+    assert _share_chooser_target(root, {title: row}) is row
+    title.set('text', '发送给联系人')
+    with pytest.raises(WorkflowError, match='标题不可唯一核对'):
+        _share_chooser_target(root, {title: row})
 
 
 def listing():

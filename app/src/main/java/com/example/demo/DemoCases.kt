@@ -9,6 +9,7 @@ enum class DemoCategory(val label: String) {
 enum class DemoDomain(val title: String, val subtitle: String) {
     MAP("地图查询", "公交地铁路线"),
     MAIL("邮件案例", "扫码与发信"),
+    FAMILY("联系家人", "离线拨号"),
 }
 
 enum class DemoFilter(val label: String) {

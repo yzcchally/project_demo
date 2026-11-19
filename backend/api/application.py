@@ -11,7 +11,7 @@ def create_app():
     from workflow import get_engine
     from speech_api import register as register_speech
     app = FastAPI(title="SilverGuide Agent API", version="2.0.0")
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "10.0.2.2", "testserver"])
 
     @app.get("/health")
     def health():
