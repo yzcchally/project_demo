@@ -196,11 +196,11 @@ object DemoCases {
         DemoCase(
             id = "T13",
             title = "开始高德公交地铁导航",
-            summary = "查询广州塔到客村的地铁路线，核对后在高德里开始导航。",
+            summary = "查询广州塔到客村的地铁路线，核对后点「开始高德导航」并确认。",
             category = DemoCategory.SUCCESS,
             domain = DemoDomain.MAP,
             promptTemplate = navigationExample,
-            steps = listOf("等待小银核对路线。", "点「开始高德导航」，确认后查看高德的导航界面。"),
+            steps = emptyList(),
             expected = "高德显示「结束导航」，小银结束本次操作并保留高德前台。",
             recommended = true,
         ),

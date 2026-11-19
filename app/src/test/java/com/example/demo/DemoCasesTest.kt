@@ -8,7 +8,8 @@ class DemoCasesTest {
     fun defaultMapDemoFinishesInNativeNavigation() {
         val example = checkNotNull(DemoCases.find("T13"))
         assertTrue(example.recommended)
-        assertTrue(example.steps.any { "开始高德导航" in it })
+        assertTrue("开始高德导航" in example.summary)
+        assertTrue("结束导航" in example.expected)
         assertFalse("钉钉" in example.promptTemplate)
     }
 
