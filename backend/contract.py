@@ -100,16 +100,49 @@ class End(_Command):
     type: Literal["end"]
 
 
+class EndReturn(_Command):
+    type: Literal["end_return"]
+
+
 class UserAction(_Command):
     type: Literal["user_action"]
     instruction: str = Field(min_length=1, max_length=200)
+
+
+class Risk(_Command):
+    type: Literal["risk"]
+    message: str = Field(min_length=1, max_length=200)
+
+
+class Refuse(_Command):
+    type: Literal["refuse"]
+    message: str = Field(min_length=1, max_length=200)
+
+
+class Ask(_Command):
+    type: Literal["ask"]
+    question: str = Field(min_length=1, max_length=200)
+
+
+class Camera(_Command):
+    type: Literal["camera"]
+
+
+class Scan(_Command):
+    type: Literal["scan"]
+
+
+class HomePage(_Command):
+    type: Literal["home_page"]
+    direction: Literal["left", "right"]
 
 
 Command = Annotated[
     Union[
         Tap, LongPress, Swipe, Zoom, InputText, Back, Home, Recents, Notifications,
         QuickSettings, PowerDialog, LockScreen, ToggleSplitScreen, DismissShade,
-        Launch, Wait, MoveOverlay, End, UserAction,
+        Launch, Wait, MoveOverlay, End, EndReturn, UserAction, Risk, Refuse, Ask,
+        Camera, Scan, HomePage,
     ],
     Field(discriminator="type"),
 ]

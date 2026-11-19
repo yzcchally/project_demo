@@ -10,6 +10,9 @@ class PhoneLink:
         self.phase = "operating"
         self.retain_context = True
         self.user_action_pending = False
+        self.risk_pending = False
+        self.answer_pending = False
+        self.refused = False
         self.end_source: str | None = None
         self.on_phase = None
         self._pending: asyncio.Future | None = None

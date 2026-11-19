@@ -12,9 +12,14 @@ def normalize_decision(data) -> dict:
     progress = str(data.get("progress") or "").strip()
     command = data.get("command")
     if command in (None, "", {}):
-        return {"command": None, "progress": progress or None}
-    try:
-        parsed = parse_command(command)
-    except ValidationError as error:
-        raise ValueError(error.errors()[0]["msg"]) from None
-    return {"command": parsed.model_dump(), "progress": progress or None}
+        result = {"command": None, "progress": progress or None}
+    else:
+        try:
+            parsed = parse_command(command)
+        except ValidationError as error:
+            raise ValueError(error.errors()[0]["msg"]) from None
+        result = {"command": parsed.model_dump(), "progress": progress or None}
+    name = str(data.get("name") or "").strip()
+    if name:
+        result["name"] = name[:40]
+    return result

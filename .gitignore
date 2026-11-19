@@ -26,8 +26,10 @@ app/build/
 __pycache__/
 *.pdf
 backend/memory/
+backend/records/
 backend/last_screen.png
 backend/models/human/work/
+backend/models/deepseek/work/
 backend/*.xml
 backend/*.log
 backend/*.json

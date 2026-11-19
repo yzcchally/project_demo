@@ -18,17 +18,28 @@ class OperationOverlay(private val service: AccessibilityService) {
         get() = service.getSystemService(WindowManager::class.java)
     private var root: View? = null
     private var statusView: TextView? = null
-    private var taskView: TextView? = null
+    private var promptList: LinearLayout? = null
     private var countView: TextView? = null
     private var progressList: LinearLayout? = null
     private var progressScroll: ScrollView? = null
     private var detail: View? = null
     private var toggleView: TextView? = null
     private var doneView: TextView? = null
+    private var reviseView: TextView? = null
     private var userBlock: View? = null
     private var userInstructionView: TextView? = null
+    private var captureBlock: View? = null
+    private var questionBlock: View? = null
+    private var questionView: TextView? = null
+    private var warningBlock: View? = null
+    private var warningTitleView: TextView? = null
+    private var warningBodyView: TextView? = null
+    private var continueRiskView: TextView? = null
+    private var stopRiskView: TextView? = null
     private var params: WindowManager.LayoutParams? = null
     private var expanded = false
+    private var placeX: Int? = null
+    private var placeY: Int? = null
 
     fun show(): Boolean {
         if (root != null) {
@@ -46,8 +57,8 @@ class OperationOverlay(private val service: AccessibilityService) {
                 PixelFormat.TRANSLUCENT,
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
-                x = screenWidth() - dp(150)
-                y = screenHeight() / 3
+                x = placeX ?: (screenWidth() - dp(150))
+                y = placeY ?: (screenHeight() / 3)
             }
             val view = build()
             windowManager.addView(view, layoutParams)
@@ -62,6 +73,8 @@ class OperationOverlay(private val service: AccessibilityService) {
 
     fun hide() {
         val view = root ?: return
+        placeX = params?.x
+        placeY = params?.y
         expanded = false
         root = null
         params = null
@@ -82,21 +95,54 @@ class OperationOverlay(private val service: AccessibilityService) {
         refresh()
     }
 
+    fun presentWarning() {
+        refresh()
+    }
+
+    fun presentQuestion() {
+        refresh()
+    }
+
     fun refresh() {
-        val paused = RunSession.phase == RunSession.Phase.Paused
-        val waiting = RunSession.userInstruction.isNotEmpty()
+        val phase = RunSession.phase
+        val paused = phase == RunSession.Phase.Paused
+        val revising = phase == RunSession.Phase.Revising
+        val waiting = phase == RunSession.Phase.AwaitingUser && RunSession.userInstruction.isNotEmpty()
+        val risk = phase == RunSession.Phase.AwaitingRisk
+        val refused = phase == RunSession.Phase.Refused
+        val asking = phase == RunSession.Phase.AwaitingAnswer
+        val capturing = RunSession.capturing
         statusView?.text = when {
+            capturing -> "请拍照"
             paused -> "已暂停"
+            revising -> "修改中"
+            risk -> "有风险"
+            refused -> "无法完成"
+            asking -> "有问题"
             waiting -> "请操作"
             else -> "操作中"
         }
-        statusView?.maxWidth = if (expanded) dp(220) else dp(72)
-        taskView?.text = RunSession.task
+        statusView?.maxWidth = if (expanded || capturing) dp(220) else dp(72)
+        captureBlock?.visibility = if (capturing) View.VISIBLE else View.GONE
         toggleView?.text = if (paused) "继续" else "暂停"
+        toggleView?.visibility = if (risk || refused || revising || asking) View.GONE else View.VISIBLE
+        reviseView?.visibility = if (paused) View.VISIBLE else View.GONE
         doneView?.visibility = if (waiting) View.VISIBLE else View.GONE
         userInstructionView?.text = RunSession.userInstruction
         userBlock?.visibility = if (waiting) View.VISIBLE else View.GONE
+        questionView?.text = RunSession.question
+        questionBlock?.visibility = if (asking) View.VISIBLE else View.GONE
+        val warning = RunSession.warning.trim()
+        val title = if (refused) "很抱歉，这个任务我们无法完成" else "当前页面危险"
+        warningTitleView?.text = title
+        warningBodyView?.text = warning
+        warningBodyView?.visibility = if (warning.isNotEmpty() && warning != title) View.VISIBLE else View.GONE
+        continueRiskView?.visibility = if (risk) View.VISIBLE else View.GONE
+        stopRiskView?.text = if (risk) "终止结束" else "结束"
+        warningBlock?.visibility = if (risk || refused) View.VISIBLE else View.GONE
         detail?.visibility = if (expanded) View.VISIBLE else View.GONE
+        renderPrompts()
+        renderProgress()
     }
 
     private fun build(): View {
@@ -120,12 +166,37 @@ class OperationOverlay(private val service: AccessibilityService) {
         val toggle = button(filled = true).apply {
             setOnClickListener { (service as? ScreenAgentService)?.togglePause() }
         }
+        val revise = button(filled = false).apply {
+            text = "修改指令"
+            textSize = 14f
+            visibility = View.GONE
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setOnClickListener { (service as? ScreenAgentService)?.openRevise() }
+        }
         header.addView(status)
         header.addView(space(dp(8)))
         header.addView(done)
         header.addView(space(dp(8)))
         header.addView(toggle)
+        header.addView(revise)
+        (revise.layoutParams as LinearLayout.LayoutParams).marginStart = dp(8)
         panel.addView(header)
+
+        val shoot = button(filled = true).apply {
+            text = "拍照"
+            textSize = 14f
+            setOnClickListener { (service as? ScreenAgentService)?.takePhoto() }
+        }
+        val capture = vertical().apply {
+            visibility = View.GONE
+            setPadding(0, dp(8), 0, 0)
+            addView(text(size = 13f, bold = true, color = Color.parseColor("#175CD3")).apply {
+                this.text = "对准后拍照"
+            })
+            addView(space(dp(8)))
+            addView(shoot)
+        }
+        panel.addView(capture)
 
         val userInstruction = text(size = 14f, color = Color.parseColor("#7A2E0E")).apply {
             maxWidth = dp(206)
@@ -141,24 +212,93 @@ class OperationOverlay(private val service: AccessibilityService) {
         }
         panel.addView(userBlock)
 
-        val extra = vertical().apply { visibility = View.GONE }
-        val task = text(size = 14f, color = Color.parseColor("#667085")).apply {
-            maxWidth = dp(206)
+        val questionText = text(size = 14f, color = Color.parseColor("#1849A9")).apply {
+            maxWidth = dp(220)
         }
-        val taskBox = frame().apply { addView(task) }
+        val answer = button(filled = true).apply {
+            text = "回答"
+            textSize = 14f
+            setOnClickListener { (service as? ScreenAgentService)?.openAnswer() }
+        }
+        val question = vertical().apply {
+            visibility = View.GONE
+            setPadding(0, dp(8), 0, 0)
+            addView(text(size = 13f, bold = true, color = Color.parseColor("#175CD3")).apply {
+                this.text = "有问题"
+            })
+            addView(space(dp(4)))
+            addView(frame().apply { addView(questionText) })
+            addView(space(dp(8)))
+            addView(answer)
+        }
+        panel.addView(question)
+
+        val warningTitle = text(size = 14f, bold = true, color = Color.parseColor("#B42318")).apply {
+            maxWidth = dp(220)
+        }
+        val warningBody = text(size = 14f, color = Color.parseColor("#7A271A")).apply {
+            maxWidth = dp(220)
+        }
+        val continueRisk = button(filled = true).apply {
+            text = "继续操作"
+            textSize = 14f
+            setOnClickListener { (service as? ScreenAgentService)?.acceptRisk() }
+        }
+        val stopRisk = button(filled = false).apply {
+            text = "终止结束"
+            textSize = 14f
+            setOnClickListener { (service as? ScreenAgentService)?.endSession("button") }
+        }
+        val warningActions = LinearLayout(service).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, 0)
+            addView(continueRisk)
+            addView(stopRisk)
+            (stopRisk.layoutParams as LinearLayout.LayoutParams).marginStart = dp(8)
+        }
+        val warning = vertical().apply {
+            visibility = View.GONE
+            setPadding(0, dp(8), 0, 0)
+            addView(warningTitle)
+            addView(space(dp(4)))
+            addView(frame().apply { addView(warningBody) })
+            addView(warningActions)
+        }
+        panel.addView(warning)
+
+        val extra = vertical().apply { visibility = View.GONE }
+        val prompts = vertical().apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+        }
+        val promptScroller = ScrollView(service).apply {
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = false
+            scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(72))
+            addView(prompts)
+        }
+        val promptBox = frame().apply { addView(promptScroller) }
         extra.addView(space(dp(8)))
-        extra.addView(taskBox)
+        extra.addView(sectionLabel("提示"))
+        extra.addView(space(dp(6)))
+        extra.addView(promptBox)
         val count = text(size = 12f, color = Color.parseColor("#667085")).apply { text = "共 0 条" }
         val steps = vertical()
         val scroller = ScrollView(service).apply {
             isVerticalScrollBarEnabled = true
             isScrollbarFadingEnabled = false
-            scrollBarStyle = View.SCROLLBARS_OUTSIDE_INSET
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(148))
+            scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(88))
             addView(steps)
         }
         val progressBox = frame().apply { addView(scroller) }
-        extra.addView(space(dp(10)))
+        extra.addView(space(dp(12)))
+        extra.addView(sectionLabel("进度"))
+        extra.addView(space(dp(4)))
         extra.addView(count)
         extra.addView(space(dp(4)))
         extra.addView(progressBox)
@@ -173,9 +313,18 @@ class OperationOverlay(private val service: AccessibilityService) {
         statusView = status
         toggleView = toggle
         doneView = done
+        reviseView = revise
+        captureBlock = capture
         this.userBlock = userBlock
         userInstructionView = userInstruction
-        taskView = task
+        questionBlock = question
+        questionView = questionText
+        warningBlock = warning
+        warningTitleView = warningTitle
+        warningBodyView = warningBody
+        continueRiskView = continueRisk
+        stopRiskView = stopRisk
+        promptList = prompts
         countView = count
         progressList = steps
         progressScroll = scroller
@@ -199,19 +348,46 @@ class OperationOverlay(private val service: AccessibilityService) {
     }
 
     fun clearProgress() {
-        progressList?.removeAllViews()
-        countView?.text = "共 0 条"
+        renderProgress()
     }
 
-    fun addProgress(text: String) {
-        val label = text.trim()
-        if (label.isEmpty()) return
+    private fun renderPrompts() {
+        val list = promptList ?: return
+        list.removeAllViews()
+        val task = RunSession.task.trim()
+        if (task.isNotEmpty()) {
+            list.addView(tagRow("原始", Color.parseColor("#175CD3"), Color.parseColor("#EFF4FF"), task))
+        }
+        RunSession.additions.forEach { item ->
+            val body = item.text.trim()
+            if (body.isEmpty()) return@forEach
+            val asking = body.startsWith("问：")
+            list.addView(tagRow(
+                "第${item.progress}步",
+                if (asking) Color.parseColor("#027A48") else Color.parseColor("#B54708"),
+                if (asking) Color.parseColor("#E7F6EE") else Color.parseColor("#FFF6ED"),
+                body,
+            ))
+        }
+    }
+
+    private fun renderProgress() {
         val steps = progressList ?: return
+        steps.removeAllViews()
+        val items = RunSession.progress
         val gray = Color.parseColor("#98A2B3")
         val green = Color.parseColor("#12B76A")
-        for (index in 0 until steps.childCount) tintProgress(steps.getChildAt(index), gray)
-        steps.addView(progressRow(label, green))
-        countView?.text = "共 ${steps.childCount} 条"
+        items.forEachIndexed { index, item ->
+            val latest = index == items.lastIndex
+            steps.addView(tagRow(
+                "第${index + 1}步",
+                if (latest) green else gray,
+                if (latest) Color.parseColor("#E7F6EE") else Color.parseColor("#F2F4F7"),
+                item.text,
+                if (latest) Color.parseColor("#027A48") else Color.parseColor("#667085"),
+            ))
+        }
+        countView?.text = "共 ${items.size} 条"
         progressScroll?.post { progressScroll?.fullScroll(View.FOCUS_DOWN) }
     }
 
@@ -291,27 +467,30 @@ class OperationOverlay(private val service: AccessibilityService) {
         cornerRadius = radius
     }
 
-    private fun progressRow(label: String, color: Int) = LinearLayout(service).apply {
+    private fun tagRow(tag: String, tagColor: Int, tagFill: Int, body: String, bodyColor: Int = Color.parseColor("#1D2939")) = LinearLayout(service).apply {
         orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(0, dp(4), dp(4), dp(4))
-        addView(View(service).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(8) }
+        gravity = Gravity.TOP
+        setPadding(0, dp(3), dp(2), dp(3))
+        addView(text(size = 11f, bold = true, color = tagColor).apply {
+            text = tag
+            setPadding(dp(6), dp(2), dp(6), dp(2))
             background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(color)
+                cornerRadius = dp(8).toFloat()
+                setColor(tagFill)
             }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { marginEnd = dp(8) }
         })
-        addView(text(size = 13f, color = color).apply {
-            text = label
+        addView(text(size = 13f, color = bodyColor).apply {
+            text = body
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
     }
 
-    private fun tintProgress(row: View, color: Int) {
-        val line = row as? LinearLayout ?: return
-        (line.getChildAt(0).background as? GradientDrawable)?.setColor(color)
-        (line.getChildAt(1) as? TextView)?.setTextColor(color)
+    private fun sectionLabel(value: String) = text(size = 12f, bold = true, color = Color.parseColor("#98A2B3")).apply {
+        text = value
     }
 
     private fun frame() = vertical().apply {
@@ -321,7 +500,7 @@ class OperationOverlay(private val service: AccessibilityService) {
             setStroke(dp(1), Color.parseColor("#E4E7EC"))
         }
         setPadding(dp(8), dp(6), dp(8), dp(6))
-        layoutParams = LinearLayout.LayoutParams(dp(230), LinearLayout.LayoutParams.WRAP_CONTENT)
+        layoutParams = LinearLayout.LayoutParams(dp(248), LinearLayout.LayoutParams.WRAP_CONTENT)
     }
 
     private fun space(size: Int) = View(service).apply {

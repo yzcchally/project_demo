@@ -2,7 +2,7 @@
 import base64
 from pathlib import Path
 
-from memory_store import begin_round, earlier_turns, memory_notes
+from memory_store import additions_before, begin_round, earlier_commands, earlier_extras, earlier_turns, memory_notes
 from models.turn import Turn
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -36,5 +36,8 @@ def build_turn(task: str, screen: dict) -> Turn:
         },
         previous=previous,
         task=task,
+        additions=additions_before(saved["index"]),
+        commands=earlier_commands(saved["index"]),
+        extra=earlier_extras(saved["index"]),
         memory=memory_notes(),
     )

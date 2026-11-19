@@ -4,6 +4,8 @@ command 为 null 时手机不执行动作。progress 为空时不增加进度。
 
 一、不操作
 {"command": null, "progress": ""}
+新记录的第一次输出加上 name，用来给这段记录起名：
+{"command": null, "progress": "准备开始", "name": "点外卖"}
 
 二、屏幕手势
 手指在屏幕上的动作。按钮、列表都用这一类，不按文字查找控件。
@@ -38,12 +40,32 @@ zoom 以 (x, y) 为中心，两指同时张开或合拢。in 是放大，out 是
 六、流程
 控制这一轮要不要继续，不直接点屏幕。
 {"command": {"type": "wait", "duration_ms": 1000}, "progress": "等待一秒"}
+{"command": {"type": "ask", "question": "要换成哪一家店？"}, "progress": "询问用户"}
 {"command": {"type": "user_action", "instruction": "请输入支付密码"}, "progress": "等待用户输入密码"}
-{"command": {"type": "end"}, "progress": "结束并返回应用"}
+{"command": {"type": "risk", "message": "这是支付页面"}, "progress": "发现风险页面"}
+{"command": {"type": "refuse", "message": "这个任务无法完成"}, "progress": "停止这个任务"}
+{"command": {"type": "end"}, "progress": "结束并留在当前页面"}
+{"command": {"type": "end_return"}, "progress": "结束并返回应用"}
+ask 向用户提一个问题。悬浮窗显示问题，点「回答」后回到本应用填写。问题和回答会写进后续输入的提示词，step 用这一轮的后端步数。
 user_action 让用户自己完成敏感操作。悬浮窗显示操作指示，点「完成」后才继续下一轮。
-end 会回到本应用，界面结果和点击「结束」相同。暂停保留本次任务，结束才会标记为可以清除上下文。
+risk 表示当前页面有风险。悬浮窗提示危险，用户可以继续操作，也可以终止结束。
+refuse 表示任务完不成，或涉及严重违规、违法。悬浮窗说明无法完成，只能结束。
+end 结束任务，但留在当前软件，不打开本应用。导航到了目的地就用这个。
+end_return 结束任务，并回到本应用。邮件发送完这类可以回来看记录。
+模型自己判断用哪一个。悬浮窗上的「结束」按钮仍会回到本应用。
+暂停保留本次任务，这两种结束都会保存记录并清空工作记忆。
 
-七、悬浮窗
+七、相机、扫码、桌面翻页
+{"command": {"type": "camera"}, "progress": "拍一张照片"}
+{"command": {"type": "scan"}, "progress": "扫描二维码"}
+{"command": {"type": "home_page", "direction": "left"}, "progress": "桌面向左翻页"}
+{"command": {"type": "home_page", "direction": "right"}, "progress": "桌面向右翻页"}
+camera 打开后置相机，由用户自己拍照。悬浮窗上会出现「拍照」，对准后点它才拍。照片存到这一步的 memory 文件夹，下一步输入的 extra 里给出路径。
+scan 打开扫码框。二维码进入框内才会识别；是网址就自动打开这个页面，并把网址放进下一步的 extra。扫到的其他文字也放进 extra。
+extra 和提示词、截图分开，以后别的结果也可以放进这个字段。
+home_page 在当前页面横向滑动。left 是手指向左，right 是手指向右。要翻桌面时先回到桌面再用。
+
+八、悬浮窗
 {"command": {"type": "move_overlay", "x": 800, "y": 1800}, "progress": "把操作条移到这个位置"}
 move_overlay 的 x y 是操作条左上角，会立刻出现在那里。
 
@@ -51,7 +73,9 @@ move_overlay 的 x y 是操作条左上角，会立刻出现在那里。
 
 {"command": {"type": "tap", "x": 320, "y": 1467}, "progress": "点击"}
 
-{"command": {"type": "tap", "x": 338, "y": 578}, "progress": "点击"}
+{"command": {"type": "tap", "x": 382, "y": 347}, "progress": "点击"}
 
+{"command": {"type": "input_text", "x": 341, "y": 342, "text": "广州塔"}, "progress": "在输入框写入广州塔"}
+{"command": {"type": "tap", "x": 341, "y": 342}, "progress": "点击"}
 
 {"command": {"type": "swipe", "x1": 320, "y1": 1467, "x2": 338, "y2": 578, "duration_ms": 300}, "progress": "从第一点滑到第二点"}

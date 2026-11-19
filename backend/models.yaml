@@ -1,25 +1,24 @@
 # 后端启动时只加载 active 指向的那一个模型。改完后重新运行 python backend/main.py。
-active: human
+active: deepseek
 
 # 输入是当前这一轮。这一轮里有：
 # image 当前截图，text 当前文字，info 宽高等，
 # previous 前面每一轮的 image、text、info。
-# 输出是一条指令，外加给悬浮窗的 progress。
+# commands 前面每一步的 command 和 progress，空指令也在里面。
+# extra 是额外内容，和提示词、截图分开。照片给文件路径，扫码给网址或文字。
+# 输出是一条指令，外加给悬浮窗的 progress。新记录的第一次还可以带 name。
 #
-# 现在只实现了 human，代码在 backend/models/human/。
+# human 在 backend/models/human/，deepseek 在 backend/models/deepseek/。
 # 新增一种模型要做三件事：
 # 1. 新建 backend/models/<kind>/，类继承 AgentModel，实现 complete(self, turn)。
 # 2. 在类上写 @registry.register("<kind>")，并在 backend/models/__init__.py 里 import 这个包。
 # 3. 在下面 models 里加一块，把 active 改成它的名字。
 #
-# deepseek:
-#   kind: deepseek
-#   base_url: ${SILVERGUIDE_MODEL_BASE_URL}
-#   api_key: ${DEEPSEEK_API_KEY}
-#   model: ${SILVERGUIDE_VISION_MODEL}
-#
-# ${名字} 从环境变量或项目根目录的 .env 读取。
-
 models:
   human:
     kind: human
+  deepseek:
+    kind: deepseek
+    base_url: https://api.deepseek.com
+    api_key: your_key
+    model: deepseek-v4-flash-vision-exp

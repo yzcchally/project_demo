@@ -33,6 +33,8 @@ class AgentModel(ABC):
         if self._cancel.is_set():
             raise ModelCancelled()
         decision = self.complete(prepared)
+        if self._cancel.is_set():
+            raise ModelCancelled()
         remember_output(prepared.index, decision)
         return decision
 

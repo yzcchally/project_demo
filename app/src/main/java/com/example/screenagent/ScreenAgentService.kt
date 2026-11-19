@@ -18,6 +18,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
@@ -30,15 +31,50 @@ class ScreenAgentService : AccessibilityService() {
     private val operation = OperationOverlay(this)
     private var socket: WebSocket? = null
     private var pendingTask: String? = null
+    private var pendingRecord: String? = null
+    private var pendingMode: String? = null
 
     fun showOverlay(): Boolean = operation.show()
 
-    fun begin(task: String, server: String) {
+    fun begin(task: String, server: String, recordId: String) {
+        RunSession.recordId = recordId
+        RunSession.dialogues = emptyList()
+        RunSession.lastStep = 0
         RunSession.userInstruction = ""
+        RunSession.warning = ""
+        RunSession.question = ""
+        RunSession.answering = false
+        RunSession.capturing = false
+        RunSession.progress = emptyList()
+        RunSession.additions = emptyList()
+        RunSession.latestStep = 0
         operation.clearProgress()
+        pendingMode = "start"
         pendingTask = task
+        pendingRecord = recordId
         if (socket != null) {
-            main.postDelayed({ sendStart() }, 800)
+            main.postDelayed({ sendPending() }, 800)
+        } else {
+            connect(server)
+        }
+    }
+
+    fun resume(task: String, server: String, recordId: String, lastStep: Int) {
+        RunSession.recordId = recordId
+        RunSession.userInstruction = ""
+        RunSession.warning = ""
+        RunSession.question = ""
+        RunSession.answering = false
+        RunSession.capturing = false
+        RunSession.progress = emptyList()
+        RunSession.additions = emptyList()
+        RunSession.latestStep = lastStep
+        operation.clearProgress()
+        pendingMode = "resume"
+        pendingTask = task
+        pendingRecord = recordId
+        if (socket != null) {
+            main.post { sendPending() }
         } else {
             connect(server)
         }
@@ -50,15 +86,42 @@ class ScreenAgentService : AccessibilityService() {
 
     fun moveOverlay(x: Int, y: Int) = operation.moveTo(x, y)
 
-    fun endSession(source: String) {
+    fun takePhoto() {
+        CaptureBridge.shoot?.invoke()
+    }
+
+    fun endSession(source: String, returnToApp: Boolean = true) {
+        val pendingCapture = captureCallback
+        captureCallback = null
+        CaptureBridge.listener = null
+        CaptureBridge.shoot = null
+        RunSession.capturing = false
+        val cancelCapture = CaptureBridge.cancel
+        CaptureBridge.cancel = null
+        val saved = sendArchive()
+        val next = RunSession.dialogues.size + 1
+        RunSession.dialogues = RunSession.dialogues + RunSession.Dialogue(
+            next,
+            RunSession.dialoguePrompt,
+            RunSession.additions,
+            RunSession.progress,
+        )
+        RunSession.lastStep = maxOf(RunSession.lastStep, RunSession.latestStep)
         RunSession.userInstruction = ""
-        RunSession.phase = RunSession.Phase.Input
-        RunSession.notice = ""
-        reportPhase(source)
+        RunSession.warning = ""
+        RunSession.question = ""
+        RunSession.answering = false
+        RunSession.phase = RunSession.Phase.Review
+        RunSession.notice = if (saved) "" else "没连上电脑，这次没有保存"
+        reportPhase(source, "stopped")
+        if (pendingCapture != null) sendStepDone()
+        cancelCapture?.invoke()
         operation.hide()
-        startActivity(Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-        })
+        if (returnToApp) {
+            startActivity(Intent(this, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            })
+        }
     }
 
     override fun onServiceConnected() {
@@ -91,7 +154,7 @@ class ScreenAgentService : AccessibilityService() {
         socket = OkHttpClient().newWebSocket(Request.Builder().url(ws).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 status = "已连接"
-                main.postDelayed({ sendStart() }, 800)
+                main.postDelayed({ sendPending() }, 800)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -100,7 +163,7 @@ class ScreenAgentService : AccessibilityService() {
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 status = t.message ?: "连接失败"
-                main.post { operation.addProgress(status) }
+                main.post { pushProgress(status, null) }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -115,15 +178,45 @@ class ScreenAgentService : AccessibilityService() {
         status = "已断开"
     }
 
-    private fun sendStart() {
+    private fun sendPending() {
+        val mode = pendingMode ?: return
         val task = pendingTask ?: return
         val webSocket = socket ?: return
+        pendingMode = null
         pendingTask = null
-        webSocket.send(JSONObject().put("op", "start").put("task", task).toString())
+        val message = JSONObject().put("op", mode).put("task", task).put("record", pendingRecord.orEmpty())
+        pendingRecord = null
+        webSocket.send(message.toString())
+    }
+
+    private fun sendArchive(): Boolean {
+        val webSocket = socket ?: return false
+        val additions = JSONArray()
+        RunSession.additions.forEach { item ->
+            additions.put(JSONObject().put("progress", item.progress).put("text", item.text))
+        }
+        val progress = JSONArray()
+        RunSession.progress.forEach { item ->
+            val row = JSONObject().put("text", item.text)
+            if (item.step != null) row.put("step", item.step)
+            progress.put(row)
+        }
+        val message = JSONObject()
+            .put("op", "archive")
+            .put("task", RunSession.dialoguePrompt)
+            .put("record", RunSession.recordId)
+            .put("additions", additions)
+            .put("progress", progress)
+        return webSocket.send(message.toString())
     }
 
     private fun reply(webSocket: WebSocket, text: String) {
         val request = JSONObject(text)
+        if (request.optString("op") == "record_name") {
+            val name = request.optString("name").trim()
+            if (name.isNotEmpty()) RunSession.recordName = name
+            return
+        }
         if (request.optString("op") == "result") {
             handleResult(request)
             return
@@ -136,22 +229,39 @@ class ScreenAgentService : AccessibilityService() {
         webSocket.send(result.toString())
     }
 
-    fun reportPhase(source: String? = null) {
-        val message = JSONObject().put("op", "phase").put("phase", phaseName())
+    fun reportPhase(source: String? = null, wire: String? = null) {
+        val message = JSONObject().put("op", "phase").put("phase", wire ?: phaseName())
         if (!source.isNullOrEmpty()) message.put("source", source)
         socket?.send(message.toString())
     }
 
     private fun handleResult(message: JSONObject) {
         val command = if (message.isNull("command")) null else message.optJSONObject("command")
-        val waitForUser = command?.optString("type") == "user_action"
-        if (command != null && command.optString("type").isNotEmpty()) execute(command)
-        val progress = progressText(message)
-        if (progress.isNotEmpty()) operation.addProgress(progress)
-        if (waitForUser) sendStepDone() else main.postDelayed({ sendStepDone() }, 2000)
+        val type = command?.optString("type").orEmpty()
+        val step = if (message.has("step") && !message.isNull("step")) message.optInt("step") else null
+        if (step != null) RunSession.latestStep = step
+        val hold = type == "user_action" || type == "risk" || type == "refuse" || type == "ask"
+        if (command != null && type.isNotEmpty() && type != "camera" && type != "scan") execute(command)
+        pushProgress(progressText(message), step)
+        when (type) {
+            "camera" -> beginCapture(CaptureActivity::class.java, keepOverlay = true) { bytes, _ ->
+                val extra = JSONObject().put("kind", "photo")
+                if (bytes != null && bytes.isNotEmpty()) {
+                    extra.put("image_jpeg_base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                } else {
+                    extra.put("error", "没拍到照片")
+                }
+                sendStepDone(extra)
+            }
+            "scan" -> beginCapture(QrCaptureActivity::class.java, keepOverlay = false) { _, text ->
+                sendStepDone(scanExtra(text))
+            }
+            else -> if (hold) sendStepDone() else main.postDelayed({ sendStepDone() }, 2000)
+        }
     }
 
     fun togglePause() {
+        if (RunSession.phase == RunSession.Phase.AwaitingRisk || RunSession.phase == RunSession.Phase.AwaitingAnswer || RunSession.phase == RunSession.Phase.Refused || RunSession.phase == RunSession.Phase.Revising) return
         val waiting = RunSession.userInstruction.isNotEmpty()
         RunSession.phase = when (RunSession.phase) {
             RunSession.Phase.Paused -> if (waiting) RunSession.Phase.AwaitingUser else RunSession.Phase.Operating
@@ -169,8 +279,137 @@ class ScreenAgentService : AccessibilityService() {
         reportPhase("done")
     }
 
-    private fun sendStepDone() {
-        socket?.send(JSONObject().put("op", "step_done").put("phase", phaseName()).toString())
+    fun openRevise() {
+        if (RunSession.phase != RunSession.Phase.Paused) return
+        RunSession.phase = RunSession.Phase.Revising
+        operation.hide()
+        reportPhase()
+        startActivity(Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        })
+    }
+
+    fun applyRevision(selectedIndex: Int, addition: String) {
+        val items = RunSession.progress
+        val cutting = items.isNotEmpty() && selectedIndex in 0 until items.lastIndex
+        val keepStep = if (cutting) items.take(selectedIndex + 1).mapNotNull { it.step }.maxOrNull() ?: 0 else null
+        val progressNo = if (cutting) selectedIndex + 1 else items.size
+        if (cutting) {
+            RunSession.progress = items.take(progressNo)
+            RunSession.latestStep = keepStep ?: 0
+            RunSession.additions = RunSession.additions.filter { it.progress <= progressNo }
+        }
+        val text = addition.trim()
+        if (text.isNotEmpty()) {
+            RunSession.additions = RunSession.additions + RunSession.AddedPrompt(progressNo, text)
+        }
+        val message = JSONObject().put("op", "revise").put("addition", text).put("progress", progressNo)
+        if (keepStep != null) message.put("keep_step", keepStep)
+        socket?.send(message.toString())
+        RunSession.userInstruction = ""
+        RunSession.warning = ""
+        RunSession.phase = RunSession.Phase.Operating
+        operation.show()
+        reportPhase("revise")
+    }
+
+    fun openAnswer() {
+        if (RunSession.phase != RunSession.Phase.AwaitingAnswer) return
+        RunSession.answering = true
+        operation.hide()
+        startActivity(Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        })
+    }
+
+    fun submitAnswer(answer: String) {
+        val question = RunSession.question.trim()
+        val reply = answer.trim()
+        if (question.isEmpty() || reply.isEmpty()) return
+        val text = "问：$question\n答：$reply"
+        val progressNo = RunSession.progress.size
+        RunSession.additions = RunSession.additions + RunSession.AddedPrompt(progressNo, text)
+        socket?.send(JSONObject()
+            .put("op", "answer")
+            .put("text", text)
+            .put("progress", progressNo)
+            .put("step", RunSession.latestStep)
+            .toString())
+        RunSession.question = ""
+        RunSession.answering = false
+        RunSession.phase = RunSession.Phase.Operating
+        operation.show()
+        reportPhase("answer")
+    }
+
+    fun acceptRisk() {
+        val message = RunSession.warning.trim()
+        RunSession.warning = ""
+        RunSession.phase = RunSession.Phase.Operating
+        operation.refresh()
+        if (message.isNotEmpty()) {
+            socket?.send(JSONObject().put("op", "note").put("text", "用户已知晓风险并选择继续：$message").toString())
+        }
+        reportPhase("continue")
+    }
+
+    private fun sendStepDone(extra: JSONObject? = null) {
+        val message = JSONObject().put("op", "step_done").put("phase", phaseName())
+        if (extra != null) message.put("extra", extra)
+        socket?.send(message.toString())
+    }
+
+    private var captureCallback: ((ByteArray?, String?) -> Unit)? = null
+
+    private fun beginCapture(activity: Class<*>, keepOverlay: Boolean, done: (ByteArray?, String?) -> Unit) {
+        fun complete(bytes: ByteArray?, text: String?) {
+            val callback = captureCallback ?: return
+            captureCallback = null
+            CaptureBridge.listener = null
+            CaptureBridge.shoot = null
+            CaptureBridge.cancel = null
+            RunSession.capturing = false
+            main.post {
+                operation.show()
+                operation.refresh()
+                callback(bytes, text)
+            }
+        }
+        captureCallback = done
+        CaptureBridge.listener = { bytes, text -> complete(bytes, text) }
+        if (keepOverlay) {
+            RunSession.capturing = true
+            operation.show()
+            operation.refresh()
+        } else {
+            RunSession.capturing = false
+            operation.hide()
+        }
+        try {
+            startActivity(Intent(this, activity).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+        } catch (_: RuntimeException) {
+            complete(null, null)
+            return
+        }
+        main.postDelayed({ complete(null, null) }, 115_000)
+    }
+
+    private fun scanExtra(text: String?): JSONObject {
+        val value = text?.trim().orEmpty()
+        if (value.isEmpty()) return JSONObject().put("kind", "url").put("error", "没有扫到码")
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            return JSONObject().put("kind", "url").put("text", value).put("opened", openUrl(value))
+        }
+        return JSONObject().put("kind", "text").put("text", value)
+    }
+
+    private fun openUrl(value: String): Boolean {
+        return try {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(value)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun progressText(message: JSONObject): String {
@@ -179,10 +418,23 @@ class ScreenAgentService : AccessibilityService() {
         return if (value == "null") "" else value
     }
 
+    private fun pushProgress(text: String, step: Int?) {
+        val label = text.trim()
+        if (label.isEmpty() || label == "null") return
+        RunSession.progress = RunSession.progress + RunSession.ProgressItem(label, step)
+        if (step != null) RunSession.latestStep = step
+        operation.refresh()
+    }
+
     private fun phaseName(): String {
         return when (RunSession.phase) {
             RunSession.Phase.Paused -> "paused"
+            RunSession.Phase.Revising -> "revising"
             RunSession.Phase.AwaitingUser -> "awaiting_user"
+            RunSession.Phase.AwaitingRisk -> "awaiting_risk"
+            RunSession.Phase.AwaitingAnswer -> "awaiting_answer"
+            RunSession.Phase.Refused -> "refused"
+            RunSession.Phase.Review -> "review"
             RunSession.Phase.Input -> "stopped"
             RunSession.Phase.Operating -> "operating"
         }
@@ -240,20 +492,53 @@ class ScreenAgentService : AccessibilityService() {
         else if (type == "toggle_split_screen") performGlobalAction(GLOBAL_ACTION_TOGGLE_SPLIT_SCREEN)
         else if (type == "dismiss_shade") dismissShade()
         else if (type == "launch") launch(command.getString("package"))
+        else if (type == "home_page") homePage(command.getString("direction"))
         else if (type == "move_overlay") moveOverlay(command.getInt("x"), command.getInt("y"))
         else if (type == "end") {
-            endSession("command")
+            endSession("command", false)
+            true
+        } else if (type == "end_return") {
+            endSession("command", true)
             true
         } else if (type == "user_action") {
             RunSession.userInstruction = command.getString("instruction")
+            RunSession.warning = ""
             RunSession.phase = RunSession.Phase.AwaitingUser
             operation.presentUserAction()
+            true
+        } else if (type == "risk") {
+            RunSession.userInstruction = ""
+            RunSession.warning = command.getString("message")
+            RunSession.phase = RunSession.Phase.AwaitingRisk
+            operation.presentWarning()
+            true
+        } else if (type == "refuse") {
+            RunSession.userInstruction = ""
+            RunSession.warning = command.getString("message")
+            RunSession.phase = RunSession.Phase.Refused
+            operation.presentWarning()
+            true
+        } else if (type == "ask") {
+            RunSession.userInstruction = ""
+            RunSession.warning = ""
+            RunSession.question = command.getString("question")
+            RunSession.answering = false
+            RunSession.phase = RunSession.Phase.AwaitingAnswer
+            operation.presentQuestion()
             true
         }
         else if (type == "wait") {
             Thread.sleep(command.getLong("duration_ms")); true
         } else return JSONObject().put("ok", false).put("error", "未知指令")
         return JSONObject().put("ok", ok).put("error", if (ok) null else "指令未执行")
+    }
+
+    private fun homePage(direction: String): Boolean {
+        val width = resources.displayMetrics.widthPixels.toFloat()
+        val y = resources.displayMetrics.heightPixels * 0.55f
+        val startX = if (direction == "left") width * 0.84f else width * 0.16f
+        val endX = if (direction == "left") width * 0.16f else width * 0.84f
+        return gesture(startX, y, endX, y, 320L)
     }
 
     private fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long): Boolean {

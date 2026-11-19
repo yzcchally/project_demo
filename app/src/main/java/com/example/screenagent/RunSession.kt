@@ -10,12 +10,28 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
 object RunSession {
-    enum class Phase { Input, Operating, Paused, AwaitingUser }
+    enum class Phase { Input, Operating, Paused, AwaitingUser, Revising, AwaitingRisk, AwaitingAnswer, Refused, Review }
+
+    class ProgressItem(val text: String, val step: Int?)
+    class AddedPrompt(val progress: Int, val text: String)
+    class Dialogue(val index: Int, val prompt: String, val additions: List<AddedPrompt>, val progress: List<ProgressItem>)
 
     var phase by mutableStateOf(Phase.Input)
     var task by mutableStateOf("")
     var notice by mutableStateOf("")
     var userInstruction by mutableStateOf("")
+    var warning by mutableStateOf("")
+    var question by mutableStateOf("")
+    var answering by mutableStateOf(false)
+    var capturing by mutableStateOf(false)
+    var progress by mutableStateOf(listOf<ProgressItem>())
+    var additions by mutableStateOf(listOf<AddedPrompt>())
+    var latestStep by mutableStateOf(0)
+    var recordId by mutableStateOf("")
+    var recordName by mutableStateOf("未命名")
+    var dialoguePrompt by mutableStateOf("")
+    var lastStep by mutableStateOf(0)
+    var dialogues by mutableStateOf(listOf<Dialogue>())
 
     fun startBlockedReason(context: Context): String? {
         if (ScreenAgentService.instance != null) return null
