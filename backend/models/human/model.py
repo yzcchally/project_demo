@@ -1,0 +1,55 @@
+"""Human types the command. The input is the same dialogue every other model will receive."""
+import json
+from pathlib import Path
+
+from models.base import AgentModel, ModelCancelled
+from models.decision import normalize_decision
+from models.turn import Turn
+from models.human.terminal import read_line
+from models.registry import registry
+
+BACKEND = Path(__file__).resolve().parents[2]
+WORK = Path(__file__).resolve().parent / "work"
+
+
+@registry.register("human")
+class Human(AgentModel):
+    def __init__(self, options: dict):
+        super().__init__(options)
+        self.work = WORK
+        self.work.mkdir(parents=True, exist_ok=True)
+
+    def complete(self, turn: Turn) -> dict:
+        self._show(turn)
+        while True:
+            raw = read_line(self._cancel)
+            if raw is None:
+                raise ModelCancelled()
+            if not raw:
+                print("请输入 JSON")
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                print("不是合法 JSON")
+                continue
+            try:
+                return normalize_decision(data)
+            except ValueError as error:
+                print(f"指令不合法: {error}")
+
+    def _show(self, turn: Turn):
+        print(f"\n任务: {turn.task}")
+        print(f"本轮: 第 {turn.index} 轮，前面还有 {len(turn.previous)} 轮")
+        for item in turn.previous:
+            print(f"  第 {item.index} 轮  {self._words(item)}")
+        print(f"坐标仍看: {BACKEND / 'last_screen.png'}  {turn.info.get('width')}x{turn.info.get('height')}")
+        print(f"坐标: {BACKEND / 'pick.html'}  打开后看鼠标旁边的 x y")
+        print('输入 {"command": {...} 或 null, "progress": "进度文字"}')
+
+    def _words(self, turn) -> str:
+        text = turn.text.strip() or "无文字"
+        command = turn.info.get("command")
+        if command is None:
+            return f"{text}  无指令"
+        return f"{text}  {json.dumps(command, ensure_ascii=False)}"

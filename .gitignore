@@ -27,6 +27,7 @@ __pycache__/
 *.pdf
 backend/memory/
 backend/last_screen.png
+backend/models/human/work/
 backend/*.xml
 backend/*.log
 backend/*.json

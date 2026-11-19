@@ -36,6 +36,17 @@ def begin_round(png: bytes) -> dict:
         return {"index": index, "total": index, "folder": folder, "screen": screen}
 
 
+def remember_input(index: int, payload: dict):
+    with _lock:
+        folder = ROOT / f"{index:03d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "input.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        _write_index()
+
+
 def remember_output(index: int, output: dict):
     with _lock:
         folder = ROOT / f"{index:03d}"
@@ -45,6 +56,49 @@ def remember_output(index: int, output: dict):
             encoding="utf-8",
         )
         _write_index()
+
+
+def earlier_turns(before: int) -> list[dict]:
+    """Rounds already finished before this index. Each one has its image, text, and info."""
+    with _lock:
+        turns = []
+        for folder in _rounds():
+            index = int(folder.name)
+            if index >= before:
+                continue
+            screen = folder / "screen.png"
+            output = _read_json(folder / "output.json")
+            recorded = _read_json(folder / "input.json")
+            info = {}
+            if isinstance(recorded, dict):
+                if isinstance(recorded.get("info"), dict):
+                    info = dict(recorded["info"])
+                else:
+                    recorded_turns = recorded.get("turns") or []
+                    if recorded_turns and isinstance(recorded_turns[-1], dict):
+                        info = dict(recorded_turns[-1].get("info") or {})
+            text = ""
+            command = None
+            if isinstance(output, dict):
+                text = str(output.get("progress") or "")
+                command = output.get("command")
+            info["width"] = int(info.get("width") or 0)
+            info["height"] = int(info.get("height") or 0)
+            info["command"] = command
+            info["latest"] = False
+            turns.append({
+                "index": index,
+                "image_png": screen.read_bytes() if screen.exists() else b"",
+                "image_file": f"{folder.name}/screen.png",
+                "text": text,
+                "info": info,
+            })
+        return turns
+
+
+def memory_notes() -> dict:
+    with _lock:
+        return {"urls": _lines("urls.txt"), "notes": _lines("notes.txt")}
 
 
 def remember_url(url: str):
@@ -75,6 +129,15 @@ def _next_index() -> int:
     return max(numbers, default=0) + 1
 
 
+def _read_json(path: Path):
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
 def _lines(name: str) -> list[str]:
     file = ROOT / name
     if not file.exists():
@@ -98,6 +161,7 @@ def _write_index():
                 "index": int(folder.name),
                 "dir": folder.name,
                 "screen": f"{folder.name}/screen.png",
+                "input": f"{folder.name}/input.json",
                 "output": f"{folder.name}/output.json",
                 "latest": folder == rounds[-1],
             }

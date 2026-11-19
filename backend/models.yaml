@@ -1,35 +1,25 @@
-# 当前用哪一个模型。改这一行就完成切换，然后重新运行 python backend/main.py。
-active: manual
+# 后端启动时只加载 active 指向的那一个模型。改完后重新运行 python backend/main.py。
+active: human
 
-# 每一轮发给模型的内容都是同一份，写在该轮的 input.json：
-# task 任务原文，step 当前第几轮，screen 当前截图的宽高和文件，
-# history 更早各轮的截图路径和模型输出，memory 里是 urls 与 notes，
-# extra 留给模型自己的准备步骤（例如 RAG）填写。
-# 当前截图本身是同目录的 screen.png，不写进 JSON。
+# 输入是当前这一轮。这一轮里有：
+# image 当前截图，text 当前文字，info 宽高等，
+# previous 前面每一轮的 image、text、info。
+# 输出是一条指令，外加给悬浮窗的 progress。
 #
-# 换模型：把上面的 active 改成 models 里的某个名字。
-# 新增一个已有类型：在 models 下照抄一块，改名字和参数。
-# 新增一种类型：在 backend/models/ 写 AgentModel 的子类，
-# 加上 @registry.register("类型名")，再在这里写 kind: 类型名。
-# api 是托管接口，必须有 api_key。local 是本机服务，api_key 可空。
-# 两者都走 OpenAI 兼容的 /chat/completions。
-# base_url 不要带 /chat/completions；需要 /v1 时把 /v1 留在 base_url 里。
+# 现在只实现了 human，代码在 backend/models/human/。
+# 新增一种模型要做三件事：
+# 1. 新建 backend/models/<kind>/，类继承 AgentModel，实现 complete(self, turn)。
+# 2. 在类上写 @registry.register("<kind>")，并在 backend/models/__init__.py 里 import 这个包。
+# 3. 在下面 models 里加一块，把 active 改成它的名字。
+#
+# deepseek:
+#   kind: deepseek
+#   base_url: ${SILVERGUIDE_MODEL_BASE_URL}
+#   api_key: ${DEEPSEEK_API_KEY}
+#   model: ${SILVERGUIDE_VISION_MODEL}
+#
 # ${名字} 从环境变量或项目根目录的 .env 读取。
-# instructions 留空。要给模型系统提示词时写在对应模型下面，不要写进代码。
 
 models:
-  manual:
-    kind: manual
-
-  deepseek:
-    kind: api
-    base_url: ${SILVERGUIDE_MODEL_BASE_URL}
-    api_key: ${DEEPSEEK_API_KEY}
-    model: ${SILVERGUIDE_VISION_MODEL}
-    timeout_s: 90
-
-  local:
-    kind: local
-    base_url: http://127.0.0.1:11434/v1
-    model: qwen2.5vl
-    timeout_s: 120
+  human:
+    kind: human

@@ -1,30 +1,34 @@
-"""The single packet every model receives for one step."""
+"""One round given to a model. It carries this step and every step before it."""
 from dataclasses import dataclass, field
-from pathlib import Path
 
 
 @dataclass
 class Turn:
-    task: str
     index: int
-    width: int
-    height: int
     image_png: bytes
-    folder: Path
-    history: list[dict]
-    memory: dict
-    extra: dict = field(default_factory=dict)
+    image_file: str
+    text: str
+    info: dict = field(default_factory=dict)
+    previous: list["Turn"] = field(default_factory=list)
+    task: str = ""
+    memory: dict = field(default_factory=dict)
 
     def payload(self) -> dict:
+        """This round, with earlier rounds inline. Screenshot bytes stay on the objects."""
         return {
             "task": self.task,
-            "step": self.index,
-            "screen": {
-                "width": self.width,
-                "height": self.height,
-                "file": f"{self.index:03d}/screen.png",
-            },
-            "history": self.history,
+            "index": self.index,
+            "image": self.image_file,
+            "text": self.text,
+            "info": self.info,
+            "previous": [item.record() for item in self.previous],
             "memory": self.memory,
-            "extra": self.extra,
+        }
+
+    def record(self) -> dict:
+        return {
+            "index": self.index,
+            "image": self.image_file,
+            "text": self.text,
+            "info": self.info,
         }
