@@ -495,6 +495,7 @@ class MailAccessibilityService : AccessibilityService() {
             var scheduledNodes = 1
             var refreshedParent = false
             var omittedArrivalAnimation = false
+            val relativeArrivalTime = Regex("[1-9][0-9]?分钟")
 
             fun checkedPackage(value: AccessibilityNodeInfo): String {
                 if (value.isPassword) throw TransitTreeException("sensitive_field")
@@ -533,8 +534,9 @@ class MailAccessibilityService : AccessibilityService() {
                     !onAmapWindow(row) || !unlabelled(row) || !row.isClickable || !row.isFocusable) return null
                 val arrivalLabel = siblings[1]
                 val badge = siblings[2]
+                val arrivalText = arrivalLabel.text?.toString().orEmpty()
                 if (!onAmapWindow(arrivalLabel) || arrivalLabel.className?.toString() != "android.view.View" ||
-                    arrivalLabel.childCount != 0 || arrivalLabel.text?.toString() != "即将进站" ||
+                    arrivalLabel.childCount != 0 || (arrivalText != "即将进站" && !relativeArrivalTime.matches(arrivalText)) ||
                     !arrivalLabel.contentDescription.isNullOrEmpty() || !arrivalLabel.viewIdResourceName.isNullOrEmpty() ||
                     !inert(arrivalLabel) || !onAmapWindow(badge) || !unlabelled(badge) ||
                     badge.className?.toString() != "android.view.ViewGroup" ||
