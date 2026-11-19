@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from device.amap import AmapDevice, PACKAGE, ID, bounds, clean, label, place_key, screen_text
+from device.amap import AmapDevice, PACKAGE, ID, TransitTreeChanging, bounds, clean, label, place_key, screen_text
 from device.huawei import ScreenContextChanged
 from domain import Cancelled, WorkflowError
 
@@ -1504,6 +1504,37 @@ def test_native_navigation_uses_one_observed_footer_and_leaves_active_amap(adapt
     adapter.base.tap.assert_called_once()
     before_tap.assert_called_once()
     assert all(call.args[:2] != ("am", "start") for call in adapter.base.shell.call_args_list)
+
+
+@pytest.mark.parametrize("second_read_changes", [False, True])
+def test_native_navigation_retries_only_one_read_of_the_same_task(adapter, monkeypatch, second_read_changes):
+    monkeypatch.setattr("device.amap.time.sleep", lambda _: None)
+    route = _verified_navigation_route(adapter)
+    start = _navigation_detail()
+    adapter.base.observe.side_effect = [start, start, _navigation_detail(state="active")]
+    original_observe = adapter._observe
+    read_count = 0
+
+    def read(*args, **kwargs):
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1 or (read_count == 3 and second_read_changes):
+            raise TransitTreeChanging("tree replaced during read")
+        return original_observe(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_observe", read)
+    before_tap = Mock()
+    if second_read_changes:
+        with pytest.raises(TransitTreeChanging):
+            adapter.start_navigation(route, lambda: None, before_tap)
+        assert read_count == 3
+        before_tap.assert_not_called()
+        adapter.base.tap.assert_not_called()
+    else:
+        assert adapter.start_navigation(route, lambda: None, before_tap)["observation_id"]
+        assert read_count == 4
+        before_tap.assert_called_once()
+        adapter.base.tap.assert_called_once()
 
 
 @pytest.mark.parametrize("bad_frame", ["wrong_route", "changed_footer", "wrong_child", "already_active"])

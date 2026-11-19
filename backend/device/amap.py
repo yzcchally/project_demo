@@ -1740,14 +1740,27 @@ class AmapDevice:
         if partial and (not expected_strip or any(not (result.get(role) or {}).get("name") for role in ["origin", "destination"])):
             raise WorkflowError("部分路线缺少可信方案或真实起终点身份，请重新查询")
         normalize = lambda value: re.sub(r"\s+", "", clean(value))
+        can_retry_read = True
 
-        def observe():
+        def read_same_task():
             self._check(checkpoint)
             snapshot = self.base.shell("dumpsys", "activity", "activities")
             self._check(checkpoint)
             if self.base.context_epoch != epoch or self._resumed_map_identity(snapshot) != identity:
                 raise ScreenContextChanged("查看期间高德页面身份已变化，已停止旧目标操作")
-            shot = self._observe(checkpoint, "route_detail")
+            return self._observe(checkpoint, "route_detail")
+
+        def observe():
+            nonlocal can_retry_read
+            try:
+                shot = read_same_task()
+            except TransitTreeChanging:
+                if not can_retry_read:
+                    raise
+                can_retry_read = False
+                self._check(checkpoint)
+                time.sleep(.75)
+                shot = read_same_task()
             if self.base.context_epoch != epoch or shot["epoch"] != epoch:
                 raise ScreenContextChanged("暂停恢复后需重新核对本次高德详情")
             nodes, viewport = self._visible_detail_nodes(shot["xml"])
