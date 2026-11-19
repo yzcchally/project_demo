@@ -118,7 +118,7 @@ def _xml_direction(node):
     line = "".join(_xml_label(child) for child in leaves if not _xml_label(child).endswith("方向"))
     if re.fullmatch(r"(?:地铁)?(?:\d+[A-Za-z]?号线(?:支线|内环|外环)?|APM线)", line):
         mode = "subway"
-    elif re.fullmatch(r"(?:公交)?(?:夜|高峰快线|旅游)?[A-Za-z0-9]+路(?:[A-Za-z0-9支快短线]*)", line):
+    elif re.fullmatch(r"(?:公交)?(?:夜|高峰快线|旅游|番(?=\d))?[A-Za-z0-9]+路(?:[A-Za-z0-9支快短线]*)", line):
         mode = "bus"
     else:
         return None

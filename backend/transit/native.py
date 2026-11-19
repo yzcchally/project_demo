@@ -43,7 +43,7 @@ def _line(direction):
     text = "".join(leaves)
     if re.fullmatch(r"(?:地铁)?(?:\d+[A-Za-z]?号线(?:支线|内环|外环)?|APM线)", text):
         return "subway", text
-    if re.fullmatch(r"(?:公交)?(?:夜|高峰快线|旅游)?[A-Za-z0-9]+路(?:[A-Za-z0-9支快短线]*)", text):
+    if re.fullmatch(r"(?:公交)?(?:夜|高峰快线|旅游|番(?=\d))?[A-Za-z0-9]+路(?:[A-Za-z0-9支快短线]*)", text):
         return "bus", text
     return None
 

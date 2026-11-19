@@ -26,7 +26,7 @@ PACKAGE = "com.autonavi.minimap"
 ID = PACKAGE + ":id/"
 ROUTE_FIELDS = {"origin": ("route_edit_summary_start", "起点"), "destination": ("route_edit_summary_end", "终点")}
 NUMBERED_ROUTE = re.compile(r"^方案[1-9]\d*，\d+(?:\.\d+)?(?:小时(?:\d+(?:\.\d+)?分钟)?|分钟)，")
-TRANSIT_LINE = re.compile(r"(?:地铁)?(?:\d+[A-Za-z]?号线(?:支线|内环|外环)?|APM线)|(?:公交)?(?:夜|高峰快线|旅游)?[A-Za-z0-9]+路")
+TRANSIT_LINE = re.compile(r"(?:地铁)?(?:\d+[A-Za-z]?号线(?:支线|内环|外环)?|APM线)|(?:公交)?(?:夜|高峰快线|旅游|番(?=\d))?[A-Za-z0-9]+路")
 
 
 class ExpectedTransitControlMissing(WorkflowError):
@@ -590,7 +590,7 @@ class AmapDevice:
             # identity and no arbitrary trailing text is discarded.
             glyphs = leaves[:len(text)]
             split_title = (glyphs and all(len(s) == 1 for s in glyphs) and "".join(glyphs) == text
-                           and all(s in {"地铁站", "最近浏览", "浏览过", "刚刚浏览"} for s in leaves[len(text):]))
+                           and all(s in {"地铁站", "最近浏览", "浏览过", "刚刚浏览", "导航过"} for s in leaves[len(text):]))
             if text in leaves or split_title:
                 names.add(text)
         return names

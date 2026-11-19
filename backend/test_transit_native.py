@@ -109,24 +109,26 @@ def test_huawei_detail_rejects_swapped_stop_roles_or_unconfirmed_stop_names(tmp_
     assert extract([detail], {"origin": "广州塔地铁站", "destination": "客村地铁站"}) is None
 
 
-def two_edge_walk_fixture(tmp_path, *, extra_tail=False, hidden_tail=False):
-    ride = column("客村立交站", "体育中心站", ("夜", "61", "路"), "体育中心站方向", "3站9分钟")
+def two_edge_walk_fixture(tmp_path, *, extra_tail=False, hidden_tail=False, line=("夜", "61", "路")):
+    ride = column("客村立交站", "体育中心站", line, "体育中心站方向", "3站9分钟")
     list(ride)[0].append(n(text="关注", group=False))
     lead = n(desc="步行 1.4公里 23分钟", children=[n(text="步行 1.4公里 · 23分钟", group=False), n(text="步行导航", group=False)])
     tail = n(desc="步行 403米 8分钟", children=[n(text="步行 403米 · 8分钟", group=False), n(text="步行导航", group=False)], visible=not hidden_tail)
     branches = [station("广州塔(地铁站)"), n(children=[lead]), n(children=[ride]), n(children=[tail]), station("体育西路(地铁站)")]
     if extra_tail:
         branches.insert(-1, station("其他地点"))
-    return observation(tmp_path, [n(children=branches)], summary="49分钟步行23分钟转夜61路步行8分钟最快3站¥4步行1.8公里")
+    return observation(tmp_path, [n(children=branches)], summary=f"49分钟步行23分钟转{''.join(line)}步行8分钟最快3站¥4步行1.8公里")
 
 
-def test_two_measured_edge_walks_are_bound_independently_without_swapping_metrics(tmp_path):
-    e = two_edge_walk_fixture(tmp_path)
+@pytest.mark.parametrize("line", [("夜", "61", "路"), ("番", "72", "路")])
+def test_two_measured_edge_walks_are_bound_independently_without_swapping_metrics(tmp_path, line):
+    e = two_edge_walk_fixture(tmp_path, line=line)
     e["text"] += "\n广州"
     req = {"origin": "广州塔地铁站", "destination": "体育西路地铁站", "city": "广州"}
     result = extract([e], req)
     assert result and [s["mode"] for s in result["segments"]] == ["walk", "bus", "walk"]
     a, ride, b = result["segments"]
+    assert ride["line"] == "".join(line)
     assert (a["walking_meters"], a["duration_minutes"], a["alight"]) == (1400, 23, "客村立交站")
     assert (b["walking_meters"], b["duration_minutes"], b["board"]) == (403, 8, "体育中心站")
     result["origin"] = {"name": "广州塔(地铁站)", "city": "广州", "evidence_refs": {"name": [e["evidence_id"]], "city": [e["evidence_id"]]}}

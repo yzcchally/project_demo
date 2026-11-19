@@ -381,8 +381,9 @@ def huawei_route_list(line="3号线", *, hidden_line=False):
     return [origin, destination, transit, owner], card
 
 
-def test_huawei_route_headers_current_mode_and_numbered_choice(adapter):
-    nodes, card = huawei_route_list()
+@pytest.mark.parametrize("line", ["3号线", "番72路"])
+def test_huawei_route_headers_current_mode_and_numbered_choice(adapter, line):
+    nodes, card = huawei_route_list(line)
     adapter.base.observe.return_value = xml(nodes)
     shot = adapter._observe(lambda: None, "route_list")
     origin = {"name": "广州塔地铁站"}
@@ -391,7 +392,7 @@ def test_huawei_route_headers_current_mode_and_numbered_choice(adapter):
         "广州塔(地铁站)", "客村(地铁站)"
     )
     assert [label(found) for found in adapter._route_cards(shot)] == [label(card)]
-    assert adapter._route_card_summary(shot, adapter._route_cards(shot)[0]).splitlines() == [label(card), "3号线"]
+    assert adapter._route_card_summary(shot, adapter._route_cards(shot)[0]).splitlines() == [label(card), line]
     adapter._select_public_transit({"origin": origin, "destination": destination}, lambda: None)
     adapter._set_origin(origin, lambda: None)
     adapter.base.tap.assert_not_called()
@@ -1311,13 +1312,20 @@ def test_preview_identity_keeps_gate_distinct_from_the_whole_campus(adapter):
     assert adapter._poi_title_names({'nodes':list(title.iter('node'))})=={'示例大学国际校区(西南门)'}
 
 
-def test_compact_station_detail_reads_the_address_from_its_own_header(adapter, monkeypatch):
+@pytest.mark.parametrize("reviewed_badge", [False, True])
+def test_compact_station_detail_reads_the_address_from_its_own_header(adapter, monkeypatch, reviewed_badge):
     monkeypatch.setattr("device.amap.time.sleep", lambda _: None)
     name = "广州塔(地铁站)"
     adapter.request["city"] = "广州市"
     listing = museum_search_shot(query="广州市广州塔地铁站", name=name, address="广州市海珠区")
     title = node(desc=name, rect="[53,806][1147,882]")
-    title.append(node(name, cls="android.view.View", rect="[53,806][620,882]"))
+    if reviewed_badge:
+        for index, glyph in enumerate(name):
+            x = 53 + index * 45
+            title.append(node(glyph, cls="android.view.View", rect=f"[{x},806][{x + 45},882]"))
+        title.append(node("导航过", cls="android.view.View", rect="[650,818][779,874]"))
+    else:
+        title.append(node(name, cls="android.view.View", rect="[53,806][620,882]"))
     header = node(rect="[0,767][1200,1219]")
     header.extend([title, node("广州市海珠区", cls="android.view.View", rect="[53,1150][270,1200]")])
     screen = node(rect="[0,0][1200,2640]")
