@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>截图坐标</title>
+  <style>
+    body { margin: 0; background: #1d2939; color: #fff; font-family: sans-serif; }
+    #bar {
+      position: sticky; top: 0; z-index: 2;
+      display: flex; gap: 12px; align-items: center;
+      padding: 10px 14px; background: #101828;
+      font-size: 18px;
+    }
+    #line { flex: 1; font: 16px Consolas, monospace; padding: 6px 8px; }
+    #stage { position: relative; display: inline-block; line-height: 0; }
+    img { display: block; height: calc(100vh - 52px); width: auto; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <span id="label">把鼠标移到目标中心。</span>
+    <input id="line" readonly>
+  </div>
+  <div id="stage">
+    <img id="shot" alt="最近一张截图">
+    <canvas id="grid"></canvas>
+  </div>
+  <script>
+    const shot = document.getElementById("shot");
+    const grid = document.getElementById("grid");
+    const label = document.getElementById("label");
+    const line = document.getElementById("line");
+    shot.src = "last_screen.png?t=" + Date.now();
+
+    function drawGrid() {
+      const width = shot.clientWidth;
+      const height = shot.clientHeight;
+      grid.width = width;
+      grid.height = height;
+      const context = grid.getContext("2d");
+      const scaleX = width / shot.naturalWidth;
+      const scaleY = height / shot.naturalHeight;
+      context.clearRect(0, 0, width, height);
+      context.strokeStyle = "rgba(255,255,255,0.35)";
+      context.fillStyle = "#111";
+      context.font = "12px sans-serif";
+      context.lineWidth = 1;
+      for (let x = 0; x <= shot.naturalWidth; x += 100) {
+        const pixel = Math.round(x * scaleX);
+        context.beginPath();
+        context.moveTo(pixel, 0);
+        context.lineTo(pixel, height);
+        context.stroke();
+        context.fillText(String(x), pixel + 2, 14);
+      }
+      for (let y = 0; y <= shot.naturalHeight; y += 100) {
+        const pixel = Math.round(y * scaleY);
+        context.beginPath();
+        context.moveTo(0, pixel);
+        context.lineTo(width, pixel);
+        context.stroke();
+        context.fillText(String(y), 2, pixel + 12);
+      }
+    }
+
+    shot.addEventListener("load", drawGrid);
+    window.addEventListener("resize", drawGrid);
+
+    function point(event) {
+      const rect = shot.getBoundingClientRect();
+      const x = Math.round((event.clientX - rect.left) * shot.naturalWidth / rect.width);
+      const y = Math.round((event.clientY - rect.top) * shot.naturalHeight / rect.height);
+      return {
+        x: Math.max(0, Math.min(shot.naturalWidth - 1, x)),
+        y: Math.max(0, Math.min(shot.naturalHeight - 1, y)),
+      };
+    }
+
+    function show(here) {
+      label.textContent = "x=" + here.x + "    y=" + here.y;
+      line.value = '{"command": {"type": "tap", "x": ' + here.x + ', "y": ' + here.y + '}, "progress": "点击"}';
+    }
+
+    shot.addEventListener("mousemove", (event) => show(point(event)));
+
+    shot.addEventListener("click", (event) => {
+      show(point(event));
+      line.focus();
+      line.select();
+    });
+  </script>
+</body>
+</html>

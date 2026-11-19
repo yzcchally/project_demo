@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">Demo</string>
-    <string name="accessibility_service_description">本机演示：回到桌面并按固定步骤打开 Gmail。只在这台设备上使用。</string>
+    <string name="app_name">Screen Agent</string>
+    <string name="accessibility_description">读取当前屏幕并执行服务器返回的点击、输入和滑动。</string>
 </resources>

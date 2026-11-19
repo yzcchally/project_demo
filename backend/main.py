@@ -1,15 +1,9 @@
-"""SilverGuide application entry point. Legacy demo URLs remain compatible."""
+import sys
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-from gmail_demo import app
+import uvicorn
 
-app.title = "SilverGuide Agent API"
-app.version = "2.0.0"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if __name__ == "__main__":
-    from device.connection import ReverseMonitor
-    import uvicorn
-    with ReverseMonitor():
-        uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)

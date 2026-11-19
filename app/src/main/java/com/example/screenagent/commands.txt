@@ -1,0 +1,57 @@
+把下面某一行整段贴到后端终端的「模型输出>」后面。
+也可以只贴 command 里的对象，progress 会当成空。
+command 为 null 时手机不执行动作。progress 为空时不增加进度。
+
+一、不操作
+{"command": null, "progress": ""}
+
+二、屏幕手势
+手指在屏幕上的动作。按钮、列表都用这一类，不按文字查找控件。
+{"command": {"type": "tap", "x": 500, "y": 800}, "progress": "点击屏幕"}
+{"command": {"type": "long_press", "x": 500, "y": 800}, "progress": "长按屏幕"}
+{"command": {"type": "swipe", "x1": 600, "y1": 1600, "x2": 600, "y2": 900, "duration_ms": 300}, "progress": "从第一点滑到第二点"}
+{"command": {"type": "zoom", "x": 600, "y": 1200, "direction": "in", "distance": 280}, "progress": "从此处放大"}
+{"command": {"type": "zoom", "x": 600, "y": 1200, "direction": "out", "distance": 280}, "progress": "从此处缩小"}
+swipe 从 (x1, y1) 滑到 (x2, y2)，duration_ms 是滑动用时。
+zoom 以 (x, y) 为中心，两指同时张开或合拢。in 是放大，out 是缩小，distance 是每根手指移动的像素。
+搜索、更多这类按钮直接用 tap，x y 取按钮中心。
+
+三、输入文字
+{"command": {"type": "input_text", "x": 500, "y": 300, "text": "广州塔"}, "progress": "在输入框写入广州塔"}
+用坐标点中输入框。文字先放入剪贴板，再自动粘贴到当前输入位置。密码和支付不要用这条。
+
+四、系统按键
+不依赖当前 App 的界面。
+{"command": {"type": "back"}, "progress": "返回"}
+{"command": {"type": "home"}, "progress": "回到桌面"}
+{"command": {"type": "recents"}, "progress": "打开最近任务"}
+{"command": {"type": "notifications"}, "progress": "打开通知栏"}
+{"command": {"type": "quick_settings"}, "progress": "打开快捷设置"}
+{"command": {"type": "dismiss_shade"}, "progress": "收起通知栏"}
+{"command": {"type": "power_dialog"}, "progress": "打开电源菜单"}
+{"command": {"type": "lock_screen"}, "progress": "锁屏"}
+{"command": {"type": "toggle_split_screen"}, "progress": "切换分屏"}
+
+五、打开应用
+{"command": {"type": "launch", "package": "com.autonavi.minimap"}, "progress": "打开高德地图"}
+
+六、流程
+控制这一轮要不要继续，不直接点屏幕。
+{"command": {"type": "wait", "duration_ms": 1000}, "progress": "等待一秒"}
+{"command": {"type": "user_action", "instruction": "请输入支付密码"}, "progress": "等待用户输入密码"}
+{"command": {"type": "end"}, "progress": "结束并返回应用"}
+user_action 让用户自己完成敏感操作。悬浮窗显示操作指示，点「完成」后才继续下一轮。
+end 会回到本应用，界面结果和点击「结束」相同。暂停保留本次任务，结束才会标记为可以清除上下文。
+
+七、悬浮窗
+{"command": {"type": "move_overlay", "x": 800, "y": 1800}, "progress": "把操作条移到这个位置"}
+move_overlay 的 x y 是操作条左上角，会立刻出现在那里。
+
+本次试过的坐标
+
+{"command": {"type": "tap", "x": 320, "y": 1467}, "progress": "点击"}
+
+{"command": {"type": "tap", "x": 338, "y": 578}, "progress": "点击"}
+
+
+{"command": {"type": "swipe", "x1": 320, "y1": 1467, "x2": 338, "y2": 578, "duration_ms": 300}, "progress": "从第一点滑到第二点"}

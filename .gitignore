@@ -25,6 +25,8 @@ app/build/
 .kotlin/
 __pycache__/
 *.pdf
+backend/memory/
+backend/last_screen.png
 backend/*.xml
 backend/*.log
 backend/*.json
