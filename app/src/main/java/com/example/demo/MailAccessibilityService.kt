@@ -490,43 +490,171 @@ class MailAccessibilityService : AccessibilityService() {
             xml.attribute(null, "nonce", nonce)
             xml.attribute(null, "window-id", windowId.toString())
             xml.attribute(null, "captured-at", android.os.SystemClock.elapsedRealtime().toString())
-            var count = 0
-            fun node(value: AccessibilityNodeInfo, depth: Int) {
-                lease.check()
-                if (depth > 40 || count >= 2500) throw TransitTreeException("tree_limit")
+            val maxDepth = 40
+            val maxNodes = 2500
+            var scheduledNodes = 1
+            var refreshedParent = false
+            var omittedArrivalAnimation = false
+
+            fun checkedPackage(value: AccessibilityNodeInfo): String {
                 if (value.isPassword) throw TransitTreeException("sensitive_field")
                 val packageName = value.packageName?.toString().orEmpty()
                 if (packageName.isNotEmpty() && packageName != "com.autonavi.minimap") throw TransitTreeException("foreign_node")
-                count += 1
-                lease.readNode()
-                lease.readStage("node_attributes")
-                val visible = value.isVisibleToUser
-                val rect = Rect(); value.getBoundsInScreen(rect)
-                xml.startTag(null, "node")
-                val attributes = linkedMapOf(
-                    "text" to xmlText(value.text), "content-desc" to xmlText(value.contentDescription),
-                    "resource-id" to xmlText(value.viewIdResourceName), "class" to xmlText(value.className),
-                    "package" to packageName, "bounds" to nodeBounds(rect),
-                    "visible-to-user" to visible.toString(), "enabled" to value.isEnabled.toString(),
-                    "clickable" to value.isClickable.toString(), "focused" to value.isFocused.toString(),
-                    "focusable" to value.isFocusable.toString(), "scrollable" to value.isScrollable.toString(),
-                    "editable" to value.isEditable.toString(), "checked" to value.isChecked.toString(),
-                    "checkable" to value.isCheckable.toString(), "selected" to value.isSelected.toString(),
-                )
-                attributes.forEach { (key, text) -> xml.attribute(null, key, text) }
+                return packageName
+            }
+
+            fun onAmapWindow(value: AccessibilityNodeInfo): Boolean =
+                value.windowId == windowId && value.packageName?.toString() == "com.autonavi.minimap" &&
+                    value.isVisibleToUser && !value.isPassword
+
+            fun unlabelled(value: AccessibilityNodeInfo): Boolean =
+                value.text.isNullOrEmpty() && value.contentDescription.isNullOrEmpty() &&
+                    value.viewIdResourceName.isNullOrEmpty() && value.error.isNullOrEmpty() &&
+                    (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || value.hintText.isNullOrEmpty()) &&
+                    (Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
+                        (value.paneTitle.isNullOrEmpty() && value.tooltipText.isNullOrEmpty())) &&
+                    (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || value.stateDescription.isNullOrEmpty())
+
+            fun inert(value: AccessibilityNodeInfo): Boolean =
+                !value.isClickable && !value.isLongClickable && !value.isContextClickable &&
+                    !value.isFocused && !value.isAccessibilityFocused && !value.isFocusable &&
+                    !value.isEditable && !value.isScrollable && !value.isCheckable && !value.isSelected &&
+                    (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !value.isScreenReaderFocusable)
+
+            fun arrivalAnimationBounds(
+                frame: AccessibilityNodeInfo,
+                row: AccessibilityNodeInfo?,
+                siblings: List<AccessibilityNodeInfo>,
+            ): Rect? {
+                if (row == null || siblings.size != 3 || siblings[0] !== frame ||
+                    frame.className?.toString() != "android.widget.FrameLayout" || frame.childCount != 2 ||
+                    !onAmapWindow(frame) || !unlabelled(frame) || !inert(frame) ||
+                    row.className?.toString() != "android.view.ViewGroup" ||
+                    !onAmapWindow(row) || !unlabelled(row) || !row.isClickable || !row.isFocusable) return null
+                val arrivalLabel = siblings[1]
+                val badge = siblings[2]
+                if (!onAmapWindow(arrivalLabel) || arrivalLabel.className?.toString() != "android.view.View" ||
+                    arrivalLabel.childCount != 0 || arrivalLabel.text?.toString() != "即将进站" ||
+                    !arrivalLabel.contentDescription.isNullOrEmpty() || !arrivalLabel.viewIdResourceName.isNullOrEmpty() ||
+                    !inert(arrivalLabel) || !onAmapWindow(badge) || !unlabelled(badge) ||
+                    badge.className?.toString() != "android.view.ViewGroup" ||
+                    badge.childCount != 3 || !badge.isClickable || !badge.isFocusable) return null
+                val frameBounds = Rect().also { frame.getBoundsInScreen(it) }
+                val rowBounds = Rect().also { row.getBoundsInScreen(it) }
+                val labelBounds = Rect().also { arrivalLabel.getBoundsInScreen(it) }
+                val badgeBounds = Rect().also { badge.getBoundsInScreen(it) }
+                return frameBounds.takeIf {
+                    !it.isEmpty && it.width() == it.height() && it.width() <= 24 * resources.displayMetrics.density &&
+                        rowBounds.contains(it) && rowBounds.contains(labelBounds) && rowBounds.contains(badgeBounds) &&
+                        !labelBounds.isEmpty && !badgeBounds.isEmpty &&
+                        it.right <= labelBounds.left && labelBounds.right <= badgeBounds.left &&
+                        it.centerY() in labelBounds.top until labelBounds.bottom
+                }
+            }
+
+            fun collectChildren(
+                parent: AccessibilityNodeInfo,
+                depth: Int,
+                stage: String,
+                animationBounds: Rect? = null,
+            ): List<AccessibilityNodeInfo>? {
+                lease.check()
+                val childCount = parent.childCount
+                if (childCount == 0) return emptyList()
+                if (depth >= maxDepth || childCount > maxNodes - scheduledNodes) {
+                    throw TransitTreeException("tree_limit")
+                }
+                val children = ArrayList<AccessibilityNodeInfo>(childCount)
+                var complete = false
+                var missing = false
+                try {
+                    lease.readStage(stage)
+                    for (index in 0 until childCount) {
+                        lease.check()
+                        val child = parent.getChild(index)
+                        if (child == null) {
+                            lease.check()
+                            if (missing || animationBounds == null || childCount != 2) return null
+                            missing = true
+                        } else {
+                            children.add(child)
+                        }
+                    }
+                    lease.check()
+                    if (missing) {
+                        // Amap's live arrival icon has two coextensive, unlabelled image layers.
+                        // The row, arrival text and other siblings are still traversed in full.
+                        val image = children.single()
+                        val bounds = Rect().also { image.getBoundsInScreen(it) }
+                        if (!onAmapWindow(image) || !unlabelled(image) || !inert(image) ||
+                            image.className?.toString() != "android.widget.ImageView" ||
+                            image.childCount != 0 || bounds != animationBounds) return null
+                        omittedArrivalAnimation = true
+                        return emptyList()
+                    }
+                    complete = true
+                    return children
+                } finally {
+                    if (!complete) children.forEach { it.recycle() }
+                }
+            }
+
+            fun node(
+                value: AccessibilityNodeInfo,
+                depth: Int,
+                owner: AccessibilityNodeInfo? = null,
+                siblings: List<AccessibilityNodeInfo> = emptyList(),
+            ) {
+                lease.check()
+                var packageName = checkedPackage(value)
+                var visible = value.isVisibleToUser
                 // The boundary node still undergoes password/package checks
                 // and is serialized as invisible. Its descendants cannot be
                 // action/evidence sources under any backend native guard.
                 // Keep all visible nodes, including zero-bounds footer labels.
-                if (visible) {
-                    for (index in 0 until value.childCount) {
-                        lease.check()
-                        lease.readStage("get_child")
-                        val child = value.getChild(index) ?: throw TransitTreeException("tree_changed")
-                        try { lease.check(); node(child, depth + 1) } finally { child.recycle() }
+                var children = if (visible) collectChildren(value, depth, "get_child") else emptyList()
+                if (children == null) {
+                    // The stale child list was discarded. Refresh this parent once and
+                    // recheck its attributes before reading a fresh, complete child list.
+                    lease.check()
+                    lease.readStage("parent_refresh")
+                    val refreshed = value.refresh()
+                    lease.check()
+                    if (!refreshed || value.windowId != windowId) throw TransitTreeException("tree_changed")
+                    packageName = checkedPackage(value)
+                    visible = value.isVisibleToUser
+                    children = if (visible) {
+                        collectChildren(value, depth, "get_child_after_parent_refresh",
+                            arrivalAnimationBounds(value, owner, siblings))
+                            ?: throw TransitTreeException("tree_changed")
+                    } else {
+                        emptyList()
                     }
+                    refreshedParent = true
                 }
-                xml.endTag(null, "node")
+                scheduledNodes += children.size
+                try {
+                    lease.check()
+                    lease.readNode()
+                    lease.readStage("node_attributes")
+                    val rect = Rect(); value.getBoundsInScreen(rect)
+                    xml.startTag(null, "node")
+                    val attributes = linkedMapOf(
+                        "text" to xmlText(value.text), "content-desc" to xmlText(value.contentDescription),
+                        "resource-id" to xmlText(value.viewIdResourceName), "class" to xmlText(value.className),
+                        "package" to packageName, "bounds" to nodeBounds(rect),
+                        "visible-to-user" to visible.toString(), "enabled" to value.isEnabled.toString(),
+                        "clickable" to value.isClickable.toString(), "focused" to value.isFocused.toString(),
+                        "focusable" to value.isFocusable.toString(), "scrollable" to value.isScrollable.toString(),
+                        "editable" to value.isEditable.toString(), "checked" to value.isChecked.toString(),
+                        "checkable" to value.isCheckable.toString(), "selected" to value.isSelected.toString(),
+                    )
+                    attributes.forEach { (key, text) -> xml.attribute(null, key, text) }
+                    children.forEach { node(it, depth + 1, value, children) }
+                    xml.endTag(null, "node")
+                } finally {
+                    children.forEach { it.recycle() }
+                }
             }
             node(root, 0)
             xml.endTag(null, "hierarchy")
@@ -543,7 +671,11 @@ class MailAccessibilityService : AccessibilityService() {
             if (result.toByteArray(Charsets.UTF_8).size > 350_000) { lastTransitReadReason = "tree_limit"; return null }
             lease.check()
             lastTransitReadReason = "ok"
-            lease.readStage("complete")
+            lease.readStage(when {
+                omittedArrivalAnimation -> "complete_without_arrival_animation"
+                refreshedParent -> "complete_after_parent_refresh"
+                else -> "complete"
+            })
             return result
         } catch (_: TransitBridgeExpired) {
             lastTransitReadReason = "bridge_timeout"; return null

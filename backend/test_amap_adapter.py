@@ -366,6 +366,64 @@ def test_route_cards_exclude_cycling_and_taxi_and_sort_observed_transit_options(
     assert adapter._route_cards(shot) == [first, second]
 
 
+def huawei_route_list(line="3号线", *, hidden_line=False):
+    origin = node(desc="起点，广州塔(地铁站)", rect="[165,174][891,277]")
+    origin.append(node("广州塔(地铁站)", rect="[224,174][891,277]", cls="android.view.View"))
+    destination = node(desc="终点，客村(地铁站)", rect="[165,276][891,379]")
+    destination.append(node("客村(地铁站)", rect="[224,276][891,379]", cls="android.view.View"))
+    transit = node(desc="公共交通，6分钟，已选中，按钮", rect="[375,406][686,499]")
+    transit.append(node("公共交通", rect="[471,419][657,485]", cls="android.view.View"))
+    card = node(desc="方案1，6分钟，无堵车风险，1站，2元，广州塔进站", rect="[72,743][1033,917]")
+    line_node = node(desc=line, rect="[72,933][1126,1036]", **{"visible-to-user": "false" if hidden_line else "true"})
+    line_node.append(node(line, rect="[95,950][224,1016]", cls="android.view.View"))
+    owner = node(rect="[72,743][1126,1168]")
+    owner.extend([card, line_node])
+    return [origin, destination, transit, owner], card
+
+
+def test_huawei_route_headers_current_mode_and_numbered_choice(adapter):
+    nodes, card = huawei_route_list()
+    adapter.base.observe.return_value = xml(nodes)
+    shot = adapter._observe(lambda: None, "route_list")
+    origin = {"name": "广州塔地铁站"}
+    destination = {"name": "客村地铁站"}
+    assert adapter._checked_route_values(shot, {"origin": origin, "destination": destination}) == (
+        "广州塔(地铁站)", "客村(地铁站)"
+    )
+    assert [label(found) for found in adapter._route_cards(shot)] == [label(card)]
+    assert adapter._route_card_summary(shot, adapter._route_cards(shot)[0]).splitlines() == [label(card), "3号线"]
+    adapter._select_public_transit({"origin": origin, "destination": destination}, lambda: None)
+    adapter._set_origin(origin, lambda: None)
+    adapter.base.tap.assert_not_called()
+
+
+def test_huawei_numbered_choice_rechecks_line_and_rejects_hidden_or_unassociated_lines(adapter):
+    rejected_nodes, _ = huawei_route_list(hidden_line=True)
+    adapter.base.observe.return_value = xml(rejected_nodes)
+    assert adapter._route_cards(adapter._observe(lambda: None, "route_list")) == []
+    nodes, _ = huawei_route_list()
+    owner = nodes[-1]
+    line = owner[-1]
+    owner.remove(line)
+    separate = node(rect="[0,0][1200,2486]")
+    separate.extend([owner, line])
+    adapter.base.observe.return_value = xml([*nodes[:-1], separate])
+    assert adapter._route_cards(adapter._observe(lambda: None, "route_list")) == []
+    nodes, _ = huawei_route_list()
+    nodes[-1].append(node(desc="方案2，15分钟，2站，2元，广州塔进站", rect="[72,1017][1033,1191]"))
+    adapter.base.observe.return_value = xml(nodes)
+    assert adapter._route_cards(adapter._observe(lambda: None, "route_list")) == []
+    nodes, _ = huawei_route_list()
+    adapter.base.observe.return_value = xml(nodes)
+    shot = adapter._observe(lambda: None, "route_list")
+    card = adapter._route_cards(shot)[0]
+    changed, _ = huawei_route_list("8号线")
+    adapter.base.observe.return_value = xml(changed)
+    with pytest.raises(WorkflowError, match="线路已变化"):
+        adapter._tap(shot, card, lambda: None, role="route", page="route_list")
+    adapter.base.tap.assert_not_called()
+
+
 def test_map_readiness_checks_amap_and_device_without_mail_dependency(adapter, monkeypatch):
     import gmail_demo
     monkeypatch.setattr(gmail_demo, "_adb", lambda: "adb-test")

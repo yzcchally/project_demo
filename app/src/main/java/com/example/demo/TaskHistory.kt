@@ -108,15 +108,15 @@ internal fun TaskHistoryScaffold(
     onOpen: () -> Unit,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    Box(modifier.fillMaxSize()) {
+    Row(modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
         Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(scrollState)
-                .padding(start = 20.dp, end = 62.dp, top = 20.dp, bottom = 20.dp),
+            modifier = Modifier.weight(1f).fillMaxHeight().verticalScroll(scrollState)
+                .padding(start = 20.dp, end = 8.dp, top = 20.dp, bottom = 20.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
             content = content,
         )
         Button(
-            modifier = Modifier.align(Alignment.CenterEnd).heightIn(min = 56.dp),
+            modifier = Modifier.widthIn(min = 54.dp, max = 98.dp).heightIn(min = 56.dp),
             onClick = onOpen,
             shape = RoundedCornerShape(topStart = 22.dp, bottomStart = 22.dp),
             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 12.dp),

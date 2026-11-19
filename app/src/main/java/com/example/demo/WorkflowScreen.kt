@@ -13,6 +13,7 @@ import android.speech.tts.UtteranceProgressListener
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -20,6 +21,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -351,29 +355,29 @@ internal fun WorkflowScreen(
 
 
     TaskHistoryScaffold(modifier, pageScroll, onOpen = { showHistory = true }) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("小银助手", style = MaterialTheme.typography.headlineMedium)
-                Text("SilverGuide", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("小银助手", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.semantics { heading() })
+        if (task == null) {
+            val selectedDemo = DemoCases.find(selectedDemoId)
+            TaskInstructionEntry(
+                instruction = instruction,
+                loading = loading,
+                startLabel = selectedDemo?.startLabel ?: "开始任务",
+                onInstructionChange = {
+                    instruction = it
+                    if (it != selectedDemoPrompt) { selectedDemoId = ""; selectedDemoPrompt = "" }
+                    changed()
+                },
+                onChooseExample = {
+                    selectedDemoId = ""; selectedDemoPrompt = ""; instruction = it; changed()
+                    scope.launch { pageScroll.animateScrollTo(0) }
+                },
+                onStart = { startGoal(instruction) },
+            )
+            selectedDemo?.let { demo ->
+                SelectedDemoCaseCard(case = demo, onClear = {
+                    selectedDemoId = ""; selectedDemoPrompt = ""; instruction = ""; changed()
+                }, canClear = !loading)
             }
-            TextButton(onClick = { showDemoPicker = true }) { Text("演示案例", fontSize = 17.sp) }
-        }
-        Text("扫码分享网页，也能查询公交地铁路线。", fontSize = 20.sp)
-        OutlinedButton(
-            onClick = { showFamilyContact = true },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
-        ) { Text("联系家人", fontSize = 22.sp) }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("语音播报任务进度", fontSize = 18.sp)
-            Switch(speakEnabled, onCheckedChange = { speakEnabled = it; prefs.edit().putBoolean("speak_enabled", it).apply(); if (!it) tts.stop() })
-        }
-        if (speakEnabled && (!ttsReady || !ttsSupported)) Text("当前语音播报不可用，可继续查看文字进度。")
-        if (speakEnabled && ttsReady && ttsSupported) {
-            TextButton(onClick = {
-                if (tts.speak("您好，我是小银助手。请核对邮件内容，确认后再发送。", TextToSpeech.QUEUE_FLUSH, null, "voice-preview") == TextToSpeech.ERROR)
-                    speechStatus = "本次播报未完成，请查看文字。"
-            }) { Text("试听语音播报", fontSize = 19.sp) }
-            if (speechStatus.isNotBlank()) Text(speechStatus, fontSize = 18.sp)
         }
         if (result.isNotBlank() && result != message) Text(result, fontSize = 18.sp, color = MaterialTheme.colorScheme.primary)
         if (task != null && state in terminalStates)
@@ -480,34 +484,23 @@ internal fun WorkflowScreen(
             }
         }
         if (task == null) {
-            OutlinedButton(onClick = { transitFormOpen = !transitFormOpen }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
-                Text(if (transitFormOpen) "收起路线填写" else "公交 / 地铁路线", fontSize = 20.sp)
-            }
-            if (transitFormOpen) TransitRequestCard(enabled = !loading, onStart = { text ->
-                selectedDemoId = ""; selectedDemoPrompt = ""; changed(); startGoal(text)
-            })
-            DemoCases.find(selectedDemoId)?.let { demo ->
-                SelectedDemoCaseCard(case = demo, onClear = {
-                    selectedDemoId = ""; selectedDemoPrompt = ""; instruction = ""; changed()
-                }, canClear = !loading)
-            }
-            OutlinedTextField(instruction, onValueChange = {
-                instruction = it
-                if (it != selectedDemoPrompt) { selectedDemoId = ""; selectedDemoPrompt = "" }
-                changed()
-            }, label = { Text("告诉小银想做什么") },
-                placeholder = { Text("点下面的例子，或写自己的话") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
-            if (instruction.isBlank()) TaskPromptExamples(enabled = !loading) {
-                selectedDemoId = ""; selectedDemoPrompt = ""; instruction = it; changed()
-            }
-            Button(onClick = { startGoal(instruction) }, enabled = !loading && instruction.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)) {
-                Text(DemoCases.find(selectedDemoId)?.startLabel ?: "让小银完成这个任务", fontSize = 21.sp)
-            }
             LocalVoiceInput(enabled = !loading, onRecognized = { text ->
                 if (listOf("主题", "正文", "内容").any { it in text } && listOf("扫码", "扫描", "二维码", "打开", "发给", "发送", "分享", "公交", "地铁", "路线", "出发", "换乘").none { it in text }) {
                     fillInstruction(text); manualMode = true
                 } else { changed(); startGoal(text) }
             }, onMessage = { result = it })
+        }
+        OutlinedButton(
+            onClick = { showFamilyContact = true },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
+        ) { Text("联系家人", fontSize = 22.sp) }
+        if (task == null) {
+            OutlinedButton(onClick = { transitFormOpen = !transitFormOpen }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+                Text(if (transitFormOpen) "收起路线填写" else "按地点查公交地铁", fontSize = 20.sp)
+            }
+            if (transitFormOpen) TransitRequestCard(enabled = !loading, onStart = { text ->
+                selectedDemoId = ""; selectedDemoPrompt = ""; changed(); startGoal(text)
+            })
             TextButton(onClick = { contactsOpen = !contactsOpen; scope.launch {
                 try { contactsList = request("/api/contacts").getJSONArray("contacts") } catch (e: Exception) { result = e.message.orEmpty() }
             } }) { Text("管理联系人称呼", fontSize = 19.sp) }
@@ -553,6 +546,31 @@ internal fun WorkflowScreen(
                 modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp)) { Text(if (loading) "正在提交…" else "准备草稿，稍后由我确认发送", fontSize = 20.sp) }
             }
 
+        }
+        TextButton(onClick = { showDemoPicker = true }) { Text("演示案例", fontSize = 18.sp) }
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 56.dp).toggleable(
+                value = speakEnabled,
+                role = Role.Switch,
+                onValueChange = { enabled ->
+                    speakEnabled = enabled
+                    prefs.edit().putBoolean("speak_enabled", enabled).apply()
+                    if (!enabled) tts.stop()
+                },
+            ),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("语音播报任务进度", modifier = Modifier.weight(1f), fontSize = 18.sp)
+            Switch(checked = speakEnabled, onCheckedChange = null)
+        }
+        if (speakEnabled && (!ttsReady || !ttsSupported)) Text("当前语音播报不可用，可继续查看文字进度。")
+        if (speakEnabled && ttsReady && ttsSupported) {
+            TextButton(onClick = {
+                if (tts.speak("您好，我是小银助手。请核对邮件内容，确认后再发送。", TextToSpeech.QUEUE_FLUSH, null, "voice-preview") == TextToSpeech.ERROR)
+                    speechStatus = "本次播报未完成，请查看文字。"
+            }) { Text("试听语音播报", fontSize = 19.sp) }
+            if (speechStatus.isNotBlank()) Text(speechStatus, fontSize = 18.sp)
         }
         TextButton(onClick = { advanced = !advanced }) { Text("连接与基础控制", fontSize = 18.sp) }
         if (advanced) {

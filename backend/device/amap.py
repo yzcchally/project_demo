@@ -24,6 +24,9 @@ from device.huawei import ScreenContextChanged
 
 PACKAGE = "com.autonavi.minimap"
 ID = PACKAGE + ":id/"
+ROUTE_FIELDS = {"origin": ("route_edit_summary_start", "起点"), "destination": ("route_edit_summary_end", "终点")}
+NUMBERED_ROUTE = re.compile(r"^方案[1-9]\d*，\d+(?:\.\d+)?(?:小时(?:\d+(?:\.\d+)?分钟)?|分钟)，")
+TRANSIT_LINE = re.compile(r"(?:地铁)?(?:\d+[A-Za-z]?号线(?:支线|内环|外环)?|APM线)|(?:公交)?(?:夜|高峰快线|旅游)?[A-Za-z0-9]+路")
 
 
 class ExpectedTransitControlMissing(WorkflowError):
@@ -32,6 +35,10 @@ class ExpectedTransitControlMissing(WorkflowError):
 
 class TransitHomeInterrupted(ScreenContextChanged):
     """A recorded Amap task was replaced by the verified Huawei launcher."""
+
+
+class TransitTreeChanging(WorkflowError):
+    """The protected read detected an unstable transition; no frame was accepted."""
 
 
 def clean(value):
@@ -63,6 +70,32 @@ def screen_text(nodes):
     # whitespace only, so a native '3' + '号线' remains grounded as '3号线'.
     return "\n".join(dict.fromkeys(clean(n.get(k)) for n in nodes if bounds(n)
                                  for k in ["content-desc", "text"] if clean(n.get(k))))
+
+
+def visible_route_nodes(nodes):
+    parents = {child: parent for parent in nodes for child in parent}
+    visible = set()
+    hidden = set()
+    for node in nodes:
+        parent = parents.get(node)
+        if (parent in hidden or node.get("package") != PACKAGE
+                or node.get("visible-to-user") == "false" or node.get("enabled") == "false"):
+            hidden.add(node)
+        elif bounds(node):
+            visible.add(node)
+    return visible, parents
+
+
+def contained_title(node, title, visible):
+    if not title:
+        return False
+    left, top, right, bottom = bounds(node)
+    return any(
+        child is not node and child in visible and clean(child.get("text")) == title
+        and left <= bounds(child)[0] < bounds(child)[2] <= right
+        and top <= bounds(child)[1] < bounds(child)[3] <= bottom
+        for child in node.iter("node")
+    )
 
 
 class AmapDevice:
@@ -166,7 +199,8 @@ class AmapDevice:
                     "query_id": self.query_id, "reason": reason, "time": now(),
                 }, ensure_ascii=False), encoding="utf-8")
             if isinstance(reason, str) and reason in messages:
-                raise WorkflowError(messages[reason]) from None
+                error_type = TransitTreeChanging if reason == "tree_changed" else WorkflowError
+                raise error_type(messages[reason]) from None
             raise
         self._check(checkpoint)
         all_nodes = list(ET.fromstring(xml).iter("node"))
@@ -200,8 +234,8 @@ class AmapDevice:
             # original XML on disk without promoting its invisible captions.
             evidence_nodes = [n for n in ns if current_native(n)]
             detail_marker = any(label(n) == "公交详情页面" and bounds(n) for n in evidence_nodes)
-            query_fields = any(n.get("resource-id") in {ID + "route_edit_summary_start", ID + "route_edit_summary_end"}
-                               and bounds(n) for n in evidence_nodes)
+            query_fields = any(n.get("resource-id") in {ID + suffix for suffix, _ in ROUTE_FIELDS.values()}
+                               and bounds(n) for n in evidence_nodes) or bool(self._route_fields(evidence_nodes))
             # Waiting *for* details does not make an old list/loading frame
             # into detail evidence. Do not mix its other route candidates into
             # either the native parser or the model's selected itinerary.
@@ -219,9 +253,21 @@ class AmapDevice:
             raise WorkflowError("高德提示网络不佳，请检查手机网络后重新查询")
         return {"xml": xml, "nodes": ns, "epoch": epoch, "evidence": evidence}
 
-    def _wait(self, predicate, checkpoint, page="screen", attempts=8, *, missing_error=WorkflowError):
+    def _wait(self, predicate, checkpoint, page="screen", attempts=8, *, missing_error=WorkflowError,
+              after_transition=False):
+        # Opening a detail sheet can replace its native tree for several seconds.
+        # Give that same screen one read-only retry, without replaying the tap.
+        retry_transition = after_transition
         for attempt in range(attempts):
-            shot = self._observe(checkpoint, page)
+            try:
+                shot = self._observe(checkpoint, page)
+            except TransitTreeChanging:
+                if not retry_transition or attempt + 1 >= attempts:
+                    raise
+                retry_transition = False
+                self._check(checkpoint)
+                time.sleep(.75)
+                continue
             value = predicate(shot)
             if value is not None and value is not False:
                 return shot, value
@@ -273,14 +319,64 @@ class AmapDevice:
                     or any(mark in cls for mark in ("dialog", "popupwindow"))
                     or re.search(r"正在加载|网络不佳|网络不可用|网络连接失败|登录账号|登录账户|输入密码|验证码|权限请求|允许访问", text)):
                 raise WorkflowError("高德页面有加载、权限、登录或错误提示，未使用 AutoGLM 辅助")
-        for suffix in ("route_edit_summary_start", "route_edit_summary_end"):
-            fields = [n for n in visible_nodes if n.get("package") == PACKAGE
-                      and n.get("resource-id") == ID + suffix and bounds(n)]
-            if len(fields) != 1:
-                raise WorkflowError("当前高德路线字段未完整可见，未使用 AutoGLM 辅助")
+        if len(AmapDevice._route_fields(visible_nodes)) != len(ROUTE_FIELDS):
+            raise WorkflowError("当前高德路线字段未完整可见，未使用 AutoGLM 辅助")
         self._check(checkpoint)
         if shot.get("epoch") != self.base.context_epoch:
             raise ScreenContextChanged("高德页面上下文已变化，辅助动作已废弃")
+
+    @staticmethod
+    def _route_fields(nodes):
+        visible, _ = visible_route_nodes(nodes)
+        fields = {}
+        for role, (suffix, title) in ROUTE_FIELDS.items():
+            legacy = [n for n in visible if n.get("resource-id") == ID + suffix]
+            if len(legacy) > 1:
+                return {}
+            if legacy:
+                fields[role] = legacy[0], clean(legacy[0].get("text"))
+                continue
+            native = []
+            for node in visible:
+                text = clean(node.get("content-desc"))
+                if (node.get("class") == "android.view.ViewGroup" and not node.get("resource-id")
+                        and text.startswith(title + "，") and contained_title(node, text[3:], visible)):
+                    native.append((node, text[3:]))
+            if len(native) == 1:
+                fields[role] = native[0]
+            elif native:
+                return {}
+        # Custom captions form a paired, aligned header. A stray landmark or
+        # result label must never become a route edit control.
+        if any(not node.get("resource-id") for node, _ in fields.values()):
+            if len(fields) != len(ROUTE_FIELDS):
+                return {}
+            start, end = (bounds(fields[role][0]) for role in ROUTE_FIELDS)
+            if start[0] != end[0] or start[2] != end[2] or not (start[1] < end[1] <= start[3] + 8):
+                return {}
+        return fields
+
+    @staticmethod
+    def _native_route_button(shot, title):
+        visible, _ = visible_route_nodes(shot["nodes"])
+        candidates = [n for n in visible if n.get("class") == "android.view.ViewGroup"
+                      and not n.get("resource-id") and n.get("clickable") == "true"
+                      and label(n).startswith(title + "，") and label(n).endswith("，按钮")
+                      and contained_title(n, title, visible)]
+        if len(candidates) > 1:
+            raise WorkflowError("高德路线按钮存在歧义，未执行点击")
+        return candidates[0] if candidates else None
+
+    def _checked_route_values(self, shot, places):
+        nodes = self._route_fields(shot["nodes"])
+        if len(nodes) != len(ROUTE_FIELDS):
+            raise WorkflowError("当前页面不是可核对起终点的高德路线页")
+        start, end = (nodes[role][1] for role in ROUTE_FIELDS)
+        origin_matches = (place_key(start) == place_key(places["origin"]["name"]) if self.request.get("origin")
+                          else start == "我的位置")
+        if not origin_matches or place_key(end) != place_key(places["destination"]["name"]):
+            raise WorkflowError("高德起终点与本次明确需求不一致，未采纳路线")
+        return start, end
 
     def _select_public_transit(self, places, checkpoint):
         """Rules first; only this verified route-page miss can invoke assist.
@@ -292,20 +388,13 @@ class AmapDevice:
         def route_page(shot, *, verify_assist=False):
             if verify_assist:
                 self._assist_page_safe(shot, checkpoint)
-            fields = {}
-            for role, suffix in (("origin", "route_edit_summary_start"), ("destination", "route_edit_summary_end")):
-                nodes = [n for n in shot["nodes"] if n.get("resource-id") == ID + suffix and bounds(n)]
-                if len(nodes) != 1:
-                    raise WorkflowError("当前页面不是可核对起终点的高德路线页")
-                fields[role] = clean(nodes[0].get("text"))
-            expected = self.request.get("origin")
-            if ((place_key(fields["origin"]) != place_key(places["origin"]["name"]) if expected
-                 else fields["origin"] != "我的位置")
-                    or place_key(fields["destination"]) != place_key(places["destination"]["name"])):
-                raise WorkflowError("高德起终点与本次明确需求不一致，未操作公共交通入口")
+            self._checked_route_values(shot, places)
 
         def target(shot):
             route_page(shot)
+            native = self._native_route_button(shot, "公共交通")
+            if native is not None:
+                return native
             # Preserve the existing exact-label rule and its clickable-parent
             # preference; assistance must not replace a working rule.
             original = self._text_target(shot, "公共交通")
@@ -374,6 +463,8 @@ class AmapDevice:
                 except FileExistsError:
                     pass
             if not inject:
+                if node.get("class") == "android.view.ViewGroup" and label(node).endswith("，已选中，按钮"):
+                    return
                 self._tap(shot, node, checkpoint, role="transit", page="route_list")
                 return
             self._assist_trigger = "controlled_test_miss"
@@ -415,6 +506,22 @@ class AmapDevice:
         found = [n for n in fresh["nodes"] if sig(n) == sig(node) and bounds(n)]
         if len(found) != 1:
             raise WorkflowError("高德控件已变化，已停止本次点击，请重新查询")
+        if page == "route_input" and role in ROUTE_FIELDS and label(node).startswith(ROUTE_FIELDS[role][1] + "，"):
+            field = self._route_fields(fresh["nodes"]).get(role)
+            if not field or field[0] is not found[0]:
+                raise WorkflowError("高德起终点控件已变化，已停止点击")
+        if page == "route_list" and role in {"transit", "preference"} and label(node).endswith("，按钮"):
+            if self._native_route_button(fresh, label(node).split("，", 1)[0]) is not found[0]:
+                raise WorkflowError("高德路线按钮已变化，已停止点击")
+        if role == "route" and page == "route_list" and NUMBERED_ROUTE.match(label(node)):
+            old_summary = self._route_card_summary(shot, node)
+            fresh_summary = self._route_card_summary(fresh, found[0])
+            if not old_summary or fresh_summary != old_summary:
+                raise WorkflowError("高德选中方案的线路已变化，已停止点击")
+            old_fields = {role: value for role, (_, value) in self._route_fields(shot["nodes"]).items()}
+            fresh_fields = {role: value for role, (_, value) in self._route_fields(fresh["nodes"]).items()}
+            if len(old_fields) != len(ROUTE_FIELDS) or fresh_fields != old_fields:
+                raise WorkflowError("高德起终点已变化，已停止点击")
         if place_binding is not None:
             matches = [(candidate, row) for candidate, row in self._place_candidates(
                 fresh, place_binding["query"], include_related=True)
@@ -624,7 +731,9 @@ class AmapDevice:
 
     def _tap_label(self, text, checkpoint, page="screen"):
         shot = self._observe(checkpoint, page)
-        node = self._text_target(shot, text)
+        node = self._native_route_button(shot, text) if page == "route_list" else None
+        if node is None:
+            node = self._text_target(shot, text)
         if node is not None:
             role={"路线":"route","公共交通":"transit"}.get(text,"preference")
             self._tap(shot, node, checkpoint, role=role, page=page)
@@ -828,10 +937,10 @@ class AmapDevice:
                     raise WorkflowError("高德打开的地点与本次选择不一致（"+next(iter(names))+"），已停止，请重新选择地点")
             return None
         try:
-            detail, match = self._wait(detail_ready,checkpoint,"place_detail")
+            detail, match = self._wait(detail_ready, checkpoint, "place_detail", after_transition=True)
             if match == "expand":
                 self._expand_station_card(detail, name, checkpoint)
-                detail, match = self._wait(lambda s: detail_ready(s, allow_expand=False), checkpoint, "place_detail")
+                detail, match = self._wait(lambda s: detail_ready(s, allow_expand=False), checkpoint, "place_detail", after_transition=True)
         except (Cancelled, ScreenContextChanged):
             raise
         except WorkflowError as error:
@@ -930,18 +1039,34 @@ class AmapDevice:
                 "evidence_refs":{"name":[eid],"address":[eid] if address else [],"city":[city_eid] if actual_city else []}}
 
     def _set_origin(self, origin, checkpoint):
-        shot,n = self._wait(lambda s:next((n for n in s["nodes"] if n.get("resource-id")==ID+"route_edit_summary_start" and bounds(n)),None),checkpoint,"route_list")
+        shot, (n, value) = self._wait(lambda s: self._route_fields(s["nodes"]).get("origin"),
+                                     checkpoint, "route_list")
+        if not n.get("resource-id") and place_key(value) == place_key(origin["name"]):
+            return
         self._tap(shot,n,checkpoint,role="origin",page="route_input")
-        shot,fields = self._wait(lambda s: sorted([n for n in s["nodes"] if n.get("class")=="android.widget.EditText" and bounds(n)
-                    and n.get("resource-id") not in {ID+"route_edit_summary_start",ID+"route_edit_summary_end"}],key=lambda n:bounds(n)[1]) or None, checkpoint,"place_list")
+        def editor(s):
+            visible, _ = visible_route_nodes(s["nodes"])
+            fields = sorted([node for node in visible if node.get("class") == "android.widget.EditText"
+                             and node.get("resource-id") not in {ID + suffix for suffix, _ in ROUTE_FIELDS.values()}],
+                            key=lambda node: bounds(node)[1])
+            if n.get("resource-id"):
+                return fields[0] if fields else None
+            focused = [node for node in fields if node.get("focused") == "true"]
+            return (focused or fields)[0] if len(focused or fields) == 1 else None
+
+        shot, field = self._wait(editor, checkpoint, "place_list")
         value=(self.request.get("city", "")+origin["name"])
-        self._enter(shot,fields[0],value,"origin",checkpoint)
-        shot,node = self._wait(lambda s: next((n for n in s["nodes"] if n.get("class")=="android.view.View" and
-                              place_key(label(n))==place_key(origin["name"]) and bounds(n) and bounds(n)[1]>400),None),checkpoint,"place_list",attempts=12)
-        # Never select by old index. If multiple same-name rows are observed,
-        # return to the user instead of guessing a branch.
-        equal=[n for n in shot["nodes"] if n.get("class")=="android.view.View" and place_key(label(n))==place_key(origin["name"]) and bounds(n) and bounds(n)[1]>400]
-        if len(equal)!=1: raise WorkflowError("起点存在同名候选，请补充具体地址后重新查询")
+        self._enter(shot,field,value,"origin",checkpoint)
+
+        def result(s):
+            visible, _ = visible_route_nodes(s["nodes"])
+            candidates = [node for node in visible if node.get("class") == "android.view.View"
+                          and place_key(label(node)) == place_key(origin["name"]) and bounds(node)[1] > 400]
+            if len(candidates) > 1:
+                raise WorkflowError("起点存在同名候选，请补充具体地址后重新查询")
+            return candidates[0] if candidates else None
+
+        shot, node = self._wait(result, checkpoint, "place_list", attempts=12)
         self._tap(shot,node,checkpoint)
 
     @staticmethod
@@ -1006,8 +1131,10 @@ class AmapDevice:
         return {"kind": "place", "place": place}
 
     def _set_current_origin(self, checkpoint):
-        shot, node = self._wait(lambda s: next((n for n in s["nodes"]
-            if n.get("resource-id") == ID + "route_edit_summary_start" and bounds(n)), None), checkpoint, "route_input")
+        shot, (node, value) = self._wait(lambda s: self._route_fields(s["nodes"]).get("origin"),
+                                         checkpoint, "route_input")
+        if not node.get("resource-id") and value == "我的位置":
+            return
         self._tap(shot, node, checkpoint, role="origin", page="route_input")
         previous = [None]
         def location_row(s):
@@ -1034,17 +1161,59 @@ class AmapDevice:
         self.base.shell("input","swipe",str(x),str(start),str(x),str(end),"420")
         self._audit_action(target,"scroll_detail")
 
+    @staticmethod
+    def _numbered_route_lines(node, visible, parents):
+        if node not in visible or node.get("class") != "android.view.ViewGroup" or node.get("resource-id"):
+            return ()
+        rect = bounds(node)
+        height = rect[3] - rect[1]
+        owner = parents.get(node)
+        while owner in visible:
+            owner_rect = bounds(owner)
+            if owner_rect[1] < rect[1] - height or owner_rect[3] > rect[3] + 4 * height:
+                return ()
+            family = [n for n in owner.iter("node") if n in visible]
+            headers = [n for n in family if NUMBERED_ROUTE.match(label(n))]
+            if headers != [node]:
+                return ()
+            lines = []
+            for child in family:
+                if not TRANSIT_LINE.fullmatch(label(child)):
+                    continue
+                x1, y1, x2, y2 = bounds(child)
+                if (rect[0] <= x1 < rect[2] and x2 > rect[0]
+                        and rect[1] <= y1 < y2 <= rect[3] + height):
+                    lines.append(label(child))
+            if lines:
+                return tuple(dict.fromkeys(lines))
+            owner = parents.get(owner)
+        return ()
+
+    def _route_card_summary(self, shot, card):
+        name = label(card)
+        if not NUMBERED_ROUTE.match(name):
+            return name
+        lines = self._numbered_route_lines(card, *visible_route_nodes(shot["nodes"]))
+        return "\n".join((name, *lines)) if lines else ""
+
     def _route_cards(self, shot):
+        visible, parents = visible_route_nodes(shot["nodes"])
         values=[]
         for n in shot["nodes"]:
+            if n not in visible or n.get("clickable") != "true":
+                continue
             s=label(n);r=bounds(n)
+            if any(word in s for word in ["骑行", "打车", "网约车", "顺风车"]):
+                continue
+            if NUMBERED_ROUTE.match(s):
+                if self._numbered_route_lines(n, visible, parents):
+                    values.append(n)
+                continue
             # Amap may show a walking-only calorie card inside the transit
             # tab. A time/distance alone is not a public-transport itinerary.
             route_text = re.sub(r"(?:步行|骑行|驾车|推荐|其他)?路线(?:方案)?", "", s)
             riding_line = bool(re.search(r"\d+[A-Za-z]?号线|(?:夜|高峰快线|旅游)?\d+[A-Za-z]?路|APM(?:线)?|[\u4e00-\u9fff]{2,12}线|(?:乘坐|搭乘)(?:公交|地铁)|(?:公交|地铁)(?:方案|出行)", route_text))
-            if (r and n.get("clickable")=="true" and re.match(r"\d+(?:小时|分钟)",s)
-                    and r[2]-r[0]>900 and riding_line
-                    and not any(w in s for w in ["骑行","打车","网约车","顺风车"])):
+            if re.match(r"\d+(?:小时|分钟)",s) and r[2]-r[0]>900 and riding_line:
                 values.append(n)
         values.sort(key=lambda n:(bounds(n)[1],-(bounds(n)[3]-bounds(n)[1])))
         return values
@@ -1065,7 +1234,8 @@ class AmapDevice:
                 signature = ("no_route", shot["epoch"], absent.group(0))
                 value = "no_route"
             elif cards:
-                signature = ("cards", shot["epoch"], tuple((label(n), n.get("bounds")) for n in cards))
+                signature = ("cards", shot["epoch"], tuple((self._route_card_summary(shot, n), n.get("bounds"))
+                                                          for n in cards))
                 value = cards
             else:
                 # Loading/empty frames invalidate every earlier candidate.
@@ -1248,7 +1418,7 @@ class AmapDevice:
         self._tap_label("路线",checkpoint,"place_detail")
         self._progress("planning_transit", "正在设置出发地并查询公共交通", checkpoint)
         def entry_state(s):
-            if any(n.get("resource-id")==ID+"route_edit_summary_start" and bounds(n) for n in s["nodes"]):return "input"
+            if "origin" in self._route_fields(s["nodes"]):return "input"
             if any(label(n)=="公交详情页面" and bounds(n) for n in s["nodes"]):return "detail"
             return None
         shot,entry=self._wait(entry_state,checkpoint,"route_input",attempts=12)
@@ -1257,7 +1427,7 @@ class AmapDevice:
             # Return to the actual query fields before setting an explicit start.
             self._action(checkpoint)
             self.base.shell("input","keyevent","KEYCODE_BACK")
-            shot,_=self._wait(lambda s:next((n for n in s["nodes"] if n.get("resource-id")==ID+"route_edit_summary_start" and bounds(n)),None),
+            shot,_=self._wait(lambda s:self._route_fields(s["nodes"]).get("origin"),
                               checkpoint,"route_input",attempts=12)
         cancel=self._text_target(shot,"暂不开启")
         if cancel is not None: self._tap(shot,cancel,checkpoint,role="back",page="route_input")
@@ -1267,40 +1437,50 @@ class AmapDevice:
             self._set_current_origin(checkpoint)
         self._select_public_transit(places, checkpoint)
         preference={"fewer_transfers":"换乘少","less_walking":"步行少","recommended":"高德推荐"}[request.get("preference","recommended")]
-        shot,_=self._wait(lambda s:self._text_target(s,preference),checkpoint,"route_list")
+        self._wait(lambda s:self._native_route_button(s,preference) or self._text_target(s,preference),
+                   checkpoint,"route_list")
         self._tap_label(preference,checkpoint,"route_list")
         shot,cards=self._wait_route_cards(checkpoint)
-        start=next((clean(n.get("text")) for n in shot["nodes"] if n.get("resource-id")==ID+"route_edit_summary_start"),"")
-        end=next((clean(n.get("text")) for n in shot["nodes"] if n.get("resource-id")==ID+"route_edit_summary_end"),"")
-        origin_matches = (place_key(start) == place_key(places["origin"]["name"]) if request.get("origin") else start == "我的位置")
-        if not origin_matches or place_key(end)!=place_key(places["destination"]["name"]):
-            raise WorkflowError("高德起终点与本次明确需求不一致，未采纳路线")
+        start, end = self._checked_route_values(shot, places)
         if cards=="no_route":
             rid=uuid.uuid4().hex
             self.route_id=rid;shot["evidence"]["route_id"]=rid
             return {"kind":"result","result":{"task_id":task_id,"query_id":query_id,"route_id":rid,
                     "queried_at":queried_at,"collected_at":now(),"origin":places["origin"],"destination":places["destination"],
                     "classification":"NO_ROUTE","segments":[]},"evidence":self.observations,"collection_complete":False}
-        self.route_id=hashlib.sha256((query_id+label(cards[0])).encode()).hexdigest()[:24]
+        summary = self._route_card_summary(shot, cards[0])
+        self.route_id=hashlib.sha256((query_id+summary).encode()).hexdigest()[:24]
         selected_eid=uuid.uuid4().hex
         selected_list={**shot["evidence"],"evidence_id":selected_eid,"route_id":self.route_id,
-                       "text":label(cards[0])+"\n起点："+start+"\n终点："+end+"\n本轮已点击筛选："+preference}
+                       "text":summary+"\n起点："+start+"\n终点："+end+"\n本轮已点击筛选："+preference}
         self._tap(shot,cards[0],checkpoint,role="route",page="route_list")
         self._progress("reading_transit", "正在展开选中方案，逐段读取路线详情", checkpoint)
-        self._wait(lambda s:next((n for n in s["nodes"] if label(n)=="公交详情页面" and bounds(n)
-                                   and s["evidence"]["page_kind"] == "route_detail"),None),checkpoint,"route_detail")
+        first_detail, _ = self._wait(lambda s:next((n for n in s["nodes"] if label(n)=="公交详情页面" and bounds(n)
+                                   and s["evidence"]["page_kind"] == "route_detail"),None),checkpoint,"route_detail", after_transition=True)
+        direct_ride = self._complete_visible_station_ride(first_detail, request, places, selected_list, task_id, query_id)
+        if direct_ride is not None:
+            self._progress("validating_transit", "正在核对已读取的线路、方向和上下车站", checkpoint)
+            return self.collect_observed_result(request, task_id, query_id, places, queried_at, selected_list,
+                                                True, checkpoint, native_candidate=direct_ride)
         previous=None;stable=0;collection_complete=False;last=None
+        from transit.native import destination_station
+        destination=place_key(places["destination"]["name"])
         for index in range(self.scroll_limit+1):
             detail=self._observe(checkpoint,"route_detail",screenshot=True);last=detail
             text=detail["evidence"]["text"]
+            visible, _ = visible_route_nodes(detail["nodes"])
+            if any(label(n).startswith("下车站") for n in visible):
+                realtime = {child for n in visible if re.match(r"^(?:第\s*\d+\s*辆|行程剩\d+)", label(n))
+                            for child in n.iter("node")}
+                text = screen_text(n for n in detail["nodes"] if n in visible and n not in realtime)
             meaningful=re.sub(r"(?:预计)?\d{1,2}:\d{2}(?:进站|到站)?|即将进站|第一班|第二班","",text)
             fingerprint=hashlib.sha256(meaningful.encode()).hexdigest()
             stable=stable+1 if fingerprint==previous else 0
             previous=fingerprint
-            destination=place_key(places["destination"]["name"])
-            endpoints=[n for n in detail["nodes"] if bounds(n) and bounds(n)[1]>650 and
-                       n.get("class")=="android.view.ViewGroup" and place_key(label(n))==destination]
-            if stable and endpoints:
+            endpoints = any(bounds(n)[1] > 650 and n.get("class") == "android.view.ViewGroup"
+                            and (place_key(label(n)) == destination or place_key(destination_station(n)) == destination)
+                            for n in visible)
+            if stable and endpoints and detail["evidence"]["page_kind"] == "route_detail":
                 collection_complete=True;break
             if index<self.scroll_limit:self._scroll_detail(detail,checkpoint)
         self._check(checkpoint)
@@ -1308,8 +1488,38 @@ class AmapDevice:
         return self.collect_observed_result(request, task_id, query_id, places, queried_at,
                                             selected_list, collection_complete, checkpoint, last=last)
 
+    def _complete_visible_station_ride(self, detail, request, places, selected_list, task_id, query_id):
+        """A one-screen, explicit station ride needs no scroll through live arrivals."""
+        if not all((places[role]["name"].endswith(("(地铁站)", "（地铁站）"))
+                    and places[role].get("source") != "current_location") for role in ("origin", "destination")):
+            return None
+        visible, _ = visible_route_nodes(detail["nodes"])
+        from transit.native import destination_station, extract_native
+
+        board = [n for n in visible if n.get("class") == "android.view.ViewGroup" and label(n).startswith("上车站")]
+        alight = [name for n in visible if label(n).startswith("下车站") and (name := destination_station(n))]
+        if (len(board) != 1 or len(alight) != 1
+                or place_key(label(board[0]).removeprefix("上车站")) != place_key(places["origin"]["name"])
+                or place_key(alight[0]) != place_key(places["destination"]["name"])):
+            return None
+        candidate = extract_native([detail["evidence"], selected_list], self._extraction_request(request, places),
+                                   task_id=task_id, query_id=query_id, route_id=self.route_id)
+        segments = candidate.get("segments", []) if candidate else []
+        if len(segments) != 1 or segments[0]["mode"] != "subway":
+            return None
+        header, *details = selected_list["text"].splitlines()
+        selected_lines = {line.removeprefix("地铁") for line in details if TRANSIT_LINE.fullmatch(line)}
+        if not NUMBERED_ROUTE.match(header) or len(selected_lines) != 1:
+            return None
+        route_ride = segments[0]
+        displayed_stop_count = re.search(r"(?:^|[，,])(\d+)站(?:[，,]|$)", header)
+        if (route_ride["line"].removeprefix("地铁") not in selected_lines or
+                displayed_stop_count and route_ride.get("stops") != int(displayed_stop_count[1])):
+            raise WorkflowError("高德详情与刚选中的路线不一致，请重新查询")
+        return candidate
+
     def collect_observed_result(self, request, task_id, query_id, places, queried_at,
-                                selected_list, collection_complete, checkpoint, *, last=None):
+                                selected_list, collection_complete, checkpoint, *, last=None, native_candidate=None):
         """Extract only observations already collected; never drive GUI navigation.
 
         Both rules and AutoGLM use this collector and the runtime's independent
@@ -1326,7 +1536,8 @@ class AmapDevice:
         image=base64.b64encode(Path(last["evidence"]["screenshot_path"]).read_bytes()).decode() if last and sparse else None
         extraction_request = self._extraction_request(request, places)
         from transit.native import extract_native
-        extracted=extract_native(selected,extraction_request,task_id=task_id,query_id=query_id,route_id=self.route_id)
+        extracted = native_candidate or extract_native(selected, extraction_request, task_id=task_id,
+                                                       query_id=query_id, route_id=self.route_id)
         if extracted is None:
             extracted=self.models.extract_transit(selected,extraction_request,task_id=task_id,query_id=query_id,route_id=self.route_id,image=image)
         self._check(checkpoint)

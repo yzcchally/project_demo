@@ -27,6 +27,7 @@ def _label(n):
 def _visible(n):
     b = [int(x) for x in re.findall(r"-?\d+", n.get("bounds", ""))]
     return (n.get("package") == PACKAGE and n.get("visible-to-user") != "false"
+            and n.get("enabled") != "false"
             and len(b) == 4 and min(b) >= 0 and b[0] < b[2] and b[1] < b[3])
 
 
@@ -38,13 +39,23 @@ def _line(direction):
     # Amap renders e.g. '3' and '号线' as adjacent leaves inside the direction
     # group. Read those leaves in tree order, excluding its direction label.
     leaves = [_label(n) for n in direction.iter("node") if not list(n) and _visible(n)
-              and _label(n) and not _label(n).endswith("方向")]
+              and _label(n) and not _label(n).endswith("方向") and _label(n) != "到站时刻表"]
     text = "".join(leaves)
     if re.fullmatch(r"(?:地铁)?(?:\d+[A-Za-z]?号线(?:支线|内环|外环)?|APM线)", text):
         return "subway", text
     if re.fullmatch(r"(?:公交)?(?:夜|高峰快线|旅游)?[A-Za-z0-9]+路(?:[A-Za-z0-9支快短线]*)", text):
         return "bus", text
     return None
+
+
+def _direction(node, line):
+    text = _label(node)
+    if text.startswith(line):
+        remainder = text[len(line):]
+        if not any(not list(n) and _visible(n) and _label(n) == remainder for n in node.iter("node")):
+            return None
+        text = remainder
+    return text.removesuffix("方向").removeprefix("开往").removeprefix("往")
 
 
 def _station_fields(n):
@@ -54,21 +65,33 @@ def _station_fields(n):
         return None
     # A station group itself labels the stop and contains its name leaf; labels
     # on a broad ancestor or an arbitrary text elsewhere are insufficient.
-    leaves = [_label(c) for c in n.iter("node") if c is not n and not list(c) and _visible(c)]
+    role = None
+    for prefix, value in (("上车站", "board"), ("下车站", "alight")):
+        if text.startswith(prefix):
+            text, role = text[len(prefix):], value
+            break
+    leaves = [_label(c) for c in n.iter("node") if c is not n and not list(c) and _visible(c) and _label(c)]
+    if not text:
+        return None
     if text in leaves or _key(text) in {_key(x) for x in leaves}:
-        return {"name": text, "portal": None}
+        return {"name": text, "portal": None, "role": role}
     # Amap explicitly groups an exit with its station, e.g. desc 珠江新城C口
     # and exactly two leaves 珠江新城 / C口. Never infer an exit from an
     # unrelated label elsewhere on the page or from a station-name database.
     if (len(leaves) == 2 and "".join(leaves) == text
             and re.fullmatch(r"(?:[A-Za-z]\d*|[东南西北](?:[一二三四五六七八九十\d]+号?)?)口", leaves[1])):
-        return {"name": leaves[0], "portal": leaves[1]}
+        return {"name": leaves[0], "portal": leaves[1], "role": role}
     return None
 
 
 def _station(n):
     value = _station_fields(n)
     return value["name"] if value else None
+
+
+def destination_station(n):
+    fields = _station_fields(n)
+    return fields["name"] if fields and fields["role"] == "alight" else ""
 
 
 def _column(direction, parents, *, with_container=False):
@@ -84,10 +107,13 @@ def _column(direction, parents, *, with_container=False):
         # Each recognized column has one direction and explicitly labeled stops
         # on either side of its direction branch, within the same parent.
         if len([n for n in parent.iter("node") if _visible(n) and _label(n).endswith("方向") and _line(n)]) == 1:
-            boards = [(n, _station(n)) for n in before if _station(n)]
-            alights = [(n, _station(n)) for n in after if _station(n)]
+            boards = [station for n in before if (station := _station_fields(n))]
+            alights = [station for n in after if (station := _station_fields(n))]
             if len(boards) == len(alights) == 1:
-                board, alight = boards[0][1], alights[0][1]
+                roles = (boards[0]["role"], alights[0]["role"])
+                if roles not in {(None, None), ("board", "alight")}:
+                    return None
+                board, alight = boards[0]["name"], alights[0]["name"]
                 if _key(board) == _key(alight):
                     return None
                 metrics = [_label(n) for child in after for n in child.iter("node") if _visible(n)]
@@ -96,8 +122,7 @@ def _column(direction, parents, *, with_container=False):
                 values = {"board": board, "alight": alight,
                           "stops": next(iter(stop_values)) if len(stop_values) == 1 else None,
                           "duration_minutes": next(iter(minutes)) if len(minutes) == 1 else None}
-                entrance = _station_fields(boards[0][0])["portal"]
-                exit_ = _station_fields(alights[0][0])["portal"]
+                entrance, exit_ = boards[0]["portal"], alights[0]["portal"]
                 if entrance: values["entrance"] = entrance
                 if exit_: values["exit"] = exit_
                 return (values, parent) if with_container else values
@@ -238,7 +263,7 @@ def _bound_known_transfer(row, segments, parents):
                                         or not _label(direction).endswith("方向")):
                                     continue
                                 line = _line(direction)
-                                identity = (*line, _label(direction).removesuffix("方向").removeprefix("开往").removeprefix("往")) if line else None
+                                identity = (*line, _direction(direction, line[1])) if line else None
                                 if identity != tuple(segment[k] for k in ["mode","line","direction"]):
                                     matches = False
                         if matches:
@@ -260,6 +285,22 @@ def _duration(text):
     if not m or not any(m.groups()):
         return None
     return float(m.group(1) or 0) * 60 + float(m.group(2) or 0)
+
+
+def _numbered_summary(observations, query_id, route_id, segments):
+    for record in observations:
+        if (record.get("query_id") != query_id or record.get("route_id") != route_id
+                or record.get("page_kind") != "route_list"):
+            continue
+        header, *body = record.get("text", "").splitlines() or [""]
+        match = re.fullmatch(
+            r"方案[1-9]\d*，(\d+(?:\.\d+)?(?:小时(?:\d+(?:\.\d+)?分钟)?|分钟))，"
+            r"(?:[^，]+，)*?(\d+(?:\.\d+)?)元，[^，]+", header,
+        )
+        lines = {part for part in body if not part.startswith(("起点：", "终点：", "本轮已点击筛选："))}
+        if match and lines == {segment["line"] for segment in segments}:
+            return record["evidence_id"], _duration(match[1]), float(match[2])
+    return None
 
 
 def extract_native(observations, request, *, task_id, query_id, route_id):
@@ -322,7 +363,7 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
             if parsed_line is None:
                 return None
             mode, line = parsed_line
-            direction = _label(n).removesuffix("方向").removeprefix("开往").removeprefix("往")
+            direction = _direction(n, line)
             if not direction:
                 return None
             described_lines.add((mode, line, direction))
@@ -428,6 +469,9 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
     eid, summary = summaries[-1] if summaries else (None, "")
     fare = re.search(r"[¥￥](\d+(?:\.\d+)?)", summary)
     duration = _duration(summary)
+    fare = float(fare.group(1)) if fare else None
+    if not summary and (numbered := _numbered_summary(observations, query_id, route_id, segments)):
+        eid, duration, fare = numbered
     walking = None
     if walking_seen or observed_transfers or observed_tail_rows or observed_leading_rows:
         walk = None
@@ -464,11 +508,11 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
     result = {"task_id": task_id, "query_id": query_id, "route_id": route_id, "source_app": "高德地图",
               "origin": {"name": ""}, "destination": {"name": ""}, "preference": preference,
               "applied_filter": filter_label if filtered else None,
-              "duration_minutes": duration, "fare_yuan": float(fare.group(1)) if fare else None,
+              "duration_minutes": duration, "fare_yuan": fare,
               "walking_meters": walking, "transfers": len([segment for segment in segments if segment["mode"] in {"bus", "subway"}]) - 1, "segments": segments,
               "evidence": observations, "evidence_refs": {}, "classification": "COMPLETE", "route_verified": False}
     if duration is not None: result["evidence_refs"]["duration_minutes"] = [eid]
-    if fare: result["evidence_refs"]["fare_yuan"] = [eid]
+    if fare is not None: result["evidence_refs"]["fare_yuan"] = [eid]
     if walking is not None: result["evidence_refs"]["walking_meters"] = [eid]
     if filtered: result["evidence_refs"]["applied_filter"] = [filtered["evidence_id"]]
     return result

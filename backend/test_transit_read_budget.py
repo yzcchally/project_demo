@@ -7,11 +7,29 @@ import pytest
 
 from device.huawei import HuaweiDevice, ScreenContextChanged
 from device.mobilerun import MobilerunTransport
-from device.amap import AmapDevice
+from device.amap import AmapDevice, TransitTreeChanging
 from domain import Cancelled, WorkflowError
 
 
 XML = '<hierarchy nonce="offline-read"><node package="com.autonavi.minimap" text="公共交通" bounds="[0,100][1200,300]"/></hierarchy>'
+
+
+def test_known_page_transition_retries_the_read_once_without_acting(monkeypatch):
+    monkeypatch.setattr("device.amap.time.sleep", lambda _: None)
+    base = SimpleNamespace(tap=Mock(), shell=Mock())
+    adapter = AmapDevice(base, None)
+    frame = {"phase": "ready"}
+    changing = TransitTreeChanging("tree changed")
+    adapter._observe = Mock(side_effect=[changing, frame])
+
+    assert adapter._wait(lambda shot: shot["phase"], lambda: None, "place_detail", after_transition=True) == (frame, "ready")
+
+    adapter._observe = Mock(side_effect=[changing, changing, frame])
+    with pytest.raises(TransitTreeChanging):
+        adapter._wait(lambda shot: shot["phase"], lambda: None, "place_detail", after_transition=True)
+    assert adapter._observe.call_count == 2
+    base.tap.assert_not_called()
+    base.shell.assert_not_called()
 
 
 def protected_device(tmp_path, monkeypatch, responses):

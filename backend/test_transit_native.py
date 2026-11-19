@@ -49,6 +49,66 @@ def extract(obs, request=None):
     return extract_native(obs, request or {"origin": "体育西路地铁站", "destination": "广州塔地铁站", "city": "广州"}, task_id=TASK, query_id=QUERY, route_id=ROUTE)
 
 
+def huawei_ride_frame(tmp_path, *, board_label="上车站广州塔", alight_label="下车站客村"):
+    board = n(desc=board_label, children=[n(children=[n("广州塔", group=False)])])
+    alight = n(desc=alight_label, children=[n(children=[n("客村", group=False)])])
+    direction = n(desc="3号线海傍方向", children=[
+        n("3号线", group=False), n("海傍方向", group=False), n("到站时刻表", group=False),
+    ])
+    live = n(desc="第 1 辆2分钟,较舒适", children=[n("2分钟", group=False)])
+    metrics = n(desc="1站3分钟", children=[n("1站", group=False), n("(3分钟)", group=False)])
+    ride = n(children=[board, n(children=[n(children=[direction]), live]), n(children=[metrics]), alight])
+    return observation(tmp_path, [ride], summary="行程剩7分钟16点50分到达")
+
+
+def test_huawei_detail_uses_explicit_stop_roles_and_selected_option_totals(tmp_path):
+    detail = huawei_ride_frame(tmp_path)
+    card = {"evidence_id": "list", "query_id": QUERY, "route_id": ROUTE, "page_kind": "route_list",
+            "text": "方案1，6分钟，无堵车风险，1站，2元，广州塔进站\n3号线\n起点：广州塔(地铁站)\n终点：客村(地铁站)\n本轮已点击筛选：高德推荐"}
+    req = {"origin": "广州塔地铁站", "destination": "客村地铁站", "city": "广州市"}
+    result = extract([detail, card], req)
+    assert (result["duration_minutes"], result["fare_yuan"]) == (6, 2)
+    assert result["evidence_refs"]["duration_minutes"] == ["list"]
+    seg, = result["segments"]
+    assert tuple(seg[field] for field in ("line", "direction", "board", "alight", "stops", "duration_minutes")) == (
+        "3号线", "海傍", "广州塔", "客村", 1, 3
+    )
+    wrong_line = {**card, "text": card["text"].replace("3号线", "8号线")}
+    rejected = extract([detail, wrong_line], req)
+    assert rejected["duration_minutes"] is None and rejected["fare_yuan"] is None
+
+
+def test_one_screen_collection_requires_both_explicit_station_endpoints(tmp_path):
+    from device.amap import AmapDevice
+
+    detail = huawei_ride_frame(tmp_path)
+    card = {"evidence_id": "list", "query_id": QUERY, "route_id": ROUTE, "page_kind": "route_list",
+            "text": "方案1，6分钟，1站，2元，广州塔进站\n3号线\n本轮已点击筛选：高德推荐"}
+    request = {"origin": "广州塔地铁站", "destination": "客村地铁站", "city": "广州"}
+    places = {"origin": {"name": "广州塔(地铁站)"}, "destination": {"name": "客村(地铁站)"}}
+    adapter = AmapDevice(None, None)
+    adapter.route_id = ROUTE
+    frame = {"nodes": list(ET.parse(detail["xml_path"]).iter("node")), "evidence": detail}
+
+    result = adapter._complete_visible_station_ride(frame, request, places, card, TASK, QUERY)
+    assert result and result["segments"][0]["alight"] == "客村"
+
+    from domain import WorkflowError
+
+    for bad_text in (card["text"].replace("3号线", "8号线"), card["text"].replace("1站", "2站")):
+        with pytest.raises(WorkflowError, match="刚选中"):
+            adapter._complete_visible_station_ride(frame, request, places, {**card, "text": bad_text}, TASK, QUERY)
+
+    places["destination"]["name"] = "体育西路(地铁站)"
+    assert adapter._complete_visible_station_ride(frame, request, places, card, TASK, QUERY) is None
+
+
+@pytest.mark.parametrize("labels", [("下车站广州塔", "上车站客村"), ("上车站其他站", "下车站客村")])
+def test_huawei_detail_rejects_swapped_stop_roles_or_unconfirmed_stop_names(tmp_path, labels):
+    detail = huawei_ride_frame(tmp_path, board_label=labels[0], alight_label=labels[1])
+    assert extract([detail], {"origin": "广州塔地铁站", "destination": "客村地铁站"}) is None
+
+
 def two_edge_walk_fixture(tmp_path, *, extra_tail=False, hidden_tail=False):
     ride = column("客村立交站", "体育中心站", ("夜", "61", "路"), "体育中心站方向", "3站9分钟")
     list(ride)[0].append(n(text="关注", group=False))
