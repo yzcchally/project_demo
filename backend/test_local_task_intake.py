@@ -24,3 +24,17 @@ def test_examples_are_deterministic_and_other_instructions_still_use_model():
     assert understand_local_instruction("帮我看看坐公交怎么去医院") is None
     assert understand_local_instruction("帮我扫这个二维码，打开网页。然后替我购买商品") is None
     assert understand_local_instruction("从起点去往去来广场，坐地铁或公交，尽量少换乘。") is None
+
+
+@pytest.mark.parametrize("instruction", ["去大学城南", "我想去大学城南。", "怎么去大学城南？", "大学城南怎么走", "到大学城南怎么走？", "坐公交去大学城南"])
+def test_short_destination_preserves_only_the_named_place(instruction):
+    result = understand_local_instruction(instruction)
+    assert result.task_type == "plan_transit"
+    assert result.transit.destination == "大学城南"
+    assert result.transit.origin == result.transit.city == ""
+    assert not result.transit.use_current_location
+
+
+@pytest.mark.parametrize("instruction", ["去", "去查天气", "去大学城南然后给女儿发邮件", "去大学城南并发送到我的钉钉文件助手", "从板桥到大学城南怎么走", "去大学城南，顺便打开网页", "我想去体育西路坐公交"])
+def test_short_destination_does_not_capture_compound_or_non_route_commands(instruction):
+    assert understand_local_instruction(instruction) is None

@@ -607,7 +607,7 @@ class Engine:
             missing = list(task.get("transit_missing_fields", []))
             if not request.get("destination"): missing.append("destination")
             if not request.get("origin") and not request.get("use_current_location"): missing.append("origin")
-            if request.get("origin") and not request.get("city"): missing.append("city")
+            if not request.get("city") and not request.get("use_current_location"): missing.append("city")
             return list(dict.fromkeys(missing))
         missing = []
         if task.get("task_type") != "open_url" and not task["draft"]["recipient"]:
@@ -622,7 +622,11 @@ class Engine:
         task["clarification_fields"] = fields
         if task.get("task_type") == "plan_transit":
             labels = {"origin": "明确出发地", "destination": "同城目的地", "city": "所在城市"}
-            self.store.save(task, task.get("transit_clarification_message") or "请补充" + "、".join(labels[x] for x in fields) + "；小银不会猜测地点或当前位置。")
+            message = task.get("transit_clarification_message")
+            destination = task["transit_request"]["destination"]
+            if not message and destination and set(fields) == {"origin", "city"}:
+                message = f"您想去{destination}。请问您在哪个城市，从哪里出发？"
+            self.store.save(task, message or "请补充" + "、".join(labels[x] for x in fields) + "；小银不会猜测地点或当前位置。")
             return
         alias = task.get("recipient_alias", "")
         message = ((f"请填写‘{alias}’对应的完整邮箱。" if alias else "请填写收件人的完整邮箱。")

@@ -188,6 +188,32 @@ def test_route_clarification_and_graph_resume_never_emit_recipient_prompt(engine
     assert all("收件" not in event["message"] for event in events)
 
 
+def test_short_destination_can_clarify_twice_and_resume_without_a_model(engine):
+    with patch.object(engine.models, "understand", side_effect=AssertionError("must not require a language model")) as understand:
+        task = create(engine, instruction="去大学城南")
+        query = task["query_id"]
+        assert task["state"] == "needs_clarification"
+        assert task["clarification_fields"] == ["origin", "city"]
+        assert task["message"] == "您想去大学城南。请问您在哪个城市，从哪里出发？"
+        assert not task["transit_request"]["use_current_location"]
+        assert not engine.transit_device.calls
+
+        task = settle(engine, engine.clarify_transit(task["id"], {"query_id": query, "city": "广州"}))
+        assert task["query_id"] == query and task["state"] == "needs_clarification"
+        assert task["clarification_fields"] == ["origin"]
+        assert task["transit_request"]["destination"] == "大学城南"
+        assert not engine.transit_device.calls
+
+        engine.transit_device.kind = "NO_ROUTE"
+        task = settle(engine, engine.clarify_transit(task["id"], {"query_id": query, "origin": "板桥地铁站"}))
+        assert task["query_id"] == query and task["state"] == "no_route"
+        assert task["transit_request"]["destination"] == "大学城南"
+        assert task["transit_request"]["origin"] == "板桥地铁站"
+        assert task["transit_request"]["city"] == "广州"
+        assert task["send_attempts"] == 0
+        understand.assert_not_called()
+
+
 def test_invented_model_city_is_not_accepted(engine):
     engine.models.request = TransitRequest(origin="起点公园", destination="终点医院", city="广州")
     task = create(engine, instruction="从起点公园去终点医院坐地铁")

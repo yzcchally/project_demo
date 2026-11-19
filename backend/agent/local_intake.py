@@ -1,4 +1,4 @@
-"""Intake for the app's exact examples and the explicit transit form."""
+"""Intake for app examples, explicit transit, and short destination requests."""
 import re
 
 from api.schemas import TaskIntent, TransitRequest
@@ -15,6 +15,27 @@ _PREFERENCES = {
     "尽量少步行": "less_walking",
     "选择高德推荐方案": "recommended",
 }
+_PLACE_NAME = r"(?P<destination>[\u3400-\u9fff][\u3400-\u9fffA-Za-z0-9·（）()]{0,39})"
+_SHORT_DESTINATION = re.compile(
+    rf"(?:(?:我想|我想要|我要|想|要|怎么)?去|坐(?:地铁|公交(?:车)?)去|前往)\s*{_PLACE_NAME}"
+)
+_DESTINATION_DIRECTIONS = re.compile(rf"(?:(?:去|到|前往)\s*)?{_PLACE_NAME}\s*怎么走")
+_ADDITIONAL_ACTION = re.compile(
+    r"然后|顺便|同时|并(?:且|帮|给|发送|分享|打开|转账)|再帮我|发邮件|发给|发送|分享|"
+    r"^(?:帮我|打开|查天气|买票|订票|付款|转账|打电话|睡觉|上班|上学|开车|走路|怎么办)|"
+    r"(?:怎么(?:去|走)|(?:坐|乘坐)(?:公交(?:车)?|地铁))$"
+)
+
+
+def _short_destination(instruction: str) -> str:
+    text = instruction.strip().rstrip("。！？?!.").rstrip()
+    if re.match(r"^(?:在\S+?)?从.+?(?:去|到|前往)", text):
+        return ""
+    match = _DESTINATION_DIRECTIONS.fullmatch(text) or _SHORT_DESTINATION.fullmatch(text)
+    if match is None:
+        return ""
+    destination = match["destination"]
+    return "" if _ADDITIONAL_ACTION.search(destination) else destination
 
 
 def understand_local_instruction(instruction: str) -> TaskIntent | None:
@@ -28,7 +49,8 @@ def understand_local_instruction(instruction: str) -> TaskIntent | None:
         ))
     match = _TRANSIT_FORM.fullmatch(instruction)
     if match is None:
-        return None
+        destination = _short_destination(instruction)
+        return TaskIntent(task_type="plan_transit", transit=TransitRequest(destination=destination)) if destination else None
     fields = match.groupdict()
     origin = fields["origin"] or ""
     if origin and ("去" in origin or "去" in fields["destination"]):
