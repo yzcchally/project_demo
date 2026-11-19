@@ -36,17 +36,6 @@ def begin_round(png: bytes) -> dict:
         return {"index": index, "total": index, "folder": folder, "screen": screen}
 
 
-def remember_input(index: int, payload: dict):
-    with _lock:
-        folder = ROOT / f"{index:03d}"
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / "input.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        _write_index()
-
-
 def remember_output(index: int, output: dict):
     with _lock:
         folder = ROOT / f"{index:03d}"
@@ -56,33 +45,6 @@ def remember_output(index: int, output: dict):
             encoding="utf-8",
         )
         _write_index()
-
-
-def earlier_rounds(index: int) -> list[dict]:
-    with _lock:
-        items = []
-        for folder in _rounds():
-            number = int(folder.name)
-            if number >= index:
-                continue
-            output_file = folder / "output.json"
-            output = None
-            if output_file.exists():
-                try:
-                    output = json.loads(output_file.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    output = None
-            items.append({
-                "step": number,
-                "screen": f"{folder.name}/screen.png",
-                "output": output,
-            })
-        return items
-
-
-def memory_notes() -> dict:
-    with _lock:
-        return {"urls": _lines("urls.txt"), "notes": _lines("notes.txt")}
 
 
 def remember_url(url: str):
@@ -136,7 +98,6 @@ def _write_index():
                 "index": int(folder.name),
                 "dir": folder.name,
                 "screen": f"{folder.name}/screen.png",
-                "input": f"{folder.name}/input.json",
                 "output": f"{folder.name}/output.json",
                 "latest": folder == rounds[-1],
             }

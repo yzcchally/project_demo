@@ -5,12 +5,12 @@ from pydantic import ValidationError
 
 from contract import parse_command
 from memory_store import clear as clear_memory
-from memory_store import remember_output, remember_prompt
-from models import ModelCancelled, build_turn, load_model
+from memory_store import remember_prompt
+from model import ManualModel, ModelCancelled
 from phone_link import capture_screen, execute_command, link
 
 app = FastAPI(title="Screen Agent", version="1.0.0")
-model = load_model()
+model = ManualModel()
 busy = False
 active_task = ""
 resume_when_idle = False
@@ -106,14 +106,10 @@ async def run_turn(socket: WebSocket, task: str):
             screen = await capture_screen()
             if link.phase != "operating":
                 break
-            turn = build_turn(task, screen)
-            if link.phase != "operating":
-                break
             try:
-                decision = await asyncio.to_thread(model.decide, turn)
+                decision = await asyncio.to_thread(model.decide, task, screen)
             except ModelCancelled:
                 break
-            remember_output(turn.index, decision)
             if link.phase != "operating":
                 break
             step = link.expect_step()
