@@ -571,7 +571,8 @@ def test_unknown_or_permission_screen_does_not_grant_tap_or_input():
     with pytest.raises(ValidationError): TransitScreenDecision.model_validate({"observation_id": "one", "page": "search", "actions": [{"action": "shell", "text": "am start"}]})
 
 
-def test_models_have_separate_transit_perception_and_evidence_extraction_prompts():
+def test_models_have_separate_transit_perception_and_evidence_extraction_prompts(monkeypatch):
+    monkeypatch.delenv("SILVERGUIDE_OLLAMA_INTENT_MODEL", raising=False)
     gateway = ModelGateway()
     with patch.object(gateway, "structured", return_value=None) as call:
         gateway.understand("从广州塔到体育西路坐地铁", [])

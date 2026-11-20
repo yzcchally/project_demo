@@ -12,6 +12,7 @@ from pathlib import Path
 
 from api.schemas import TransitResult, TransitRequest
 from domain import WorkflowError
+from transit.native import measured_walk_metrics
 
 
 def normalized(value):
@@ -90,7 +91,7 @@ def _xml_label(node):
     return html.unescape(re.sub(r"<[^>]+>", "", node.get("content-desc") or node.get("text", ""))).strip()
 
 
-def _xml_station(node):
+def _xml_station(node, *, endpoint=False):
     """A literal name wrapper, including an explicitly grouped portal."""
     title = _xml_label(node)
     leaves = [child for child in node.iter("node") if child is not node and not list(child) and _xml_label(child)]
@@ -100,9 +101,19 @@ def _xml_station(node):
         return None
     # Bus boarding rows may include the unrelated native “关注” action next
     # to the one literal station-name leaf. It cannot be a station or portal.
-    names = [_xml_label(child) for child in leaves if _xml_label(child) != "关注"]
+    names = [_xml_label(child) for child in leaves if _xml_label(child) not in {"关注", "地铁进站指引"}]
+    raw_title = title
+    if normalized("".join(names)) != normalized(title):
+        for prefix in (("起点",) if endpoint else ("上车站", "下车站")):
+            if title.startswith(prefix) and title != prefix:
+                title = title[len(prefix):]
+                break
     if len(names) == 1 and normalized(title) == normalized(names[0]):
         return {"name": title, "portal": None, "title": title}
+    if len(names) == 1 and raw_title.startswith("上车站"):
+        portal = re.fullmatch(r"(.+?)\s*[（(]([A-Za-z]\d*口)[）)]", names[0])
+        if portal and normalized(title) == normalized("".join(portal.groups())):
+            return {"name": portal[1].strip(), "portal": portal[2], "title": title}
     if (len(names) == 2 and normalized("".join(names)) == normalized(title)
             and re.fullmatch(r"(?:[A-Za-z]\d*|[东南西北](?:[一二三四五六七八九十\d]+号?)?)口", names[1])):
         return {"name": names[0], "portal": names[1], "title": title}
@@ -115,14 +126,20 @@ def _xml_direction(node):
     leaves = [child for child in node.iter("node") if not list(child) and _xml_label(child)]
     if not _xml_visible(node) or any(not _xml_visible(child) for child in leaves):
         return None
-    line = "".join(_xml_label(child) for child in leaves if not _xml_label(child).endswith("方向"))
+    line = "".join(_xml_label(child) for child in leaves
+                   if not _xml_label(child).endswith("方向") and _xml_label(child) != "到站时刻表")
     if re.fullmatch(r"(?:地铁)?(?:\d+[A-Za-z]?号线(?:支线|内环|外环)?|APM线)", line):
         mode = "subway"
     elif re.fullmatch(r"(?:公交)?(?:夜|高峰快线|旅游|番(?=\d))?[A-Za-z0-9]+路(?:[A-Za-z0-9支快短线]*)", line):
         mode = "bus"
     else:
         return None
-    return mode, line, _xml_label(node).removesuffix("方向").removeprefix("开往").removeprefix("往")
+    direction = _xml_label(node)
+    if direction.startswith(line):
+        direction = direction[len(line):]
+        if not any(_xml_label(child) == direction for child in leaves):
+            return None
+    return mode, line, direction.removesuffix("方向").removeprefix("开往").removeprefix("往")
 
 
 def _edge_walk_binding(record, ride, walk, *, leading=False, current_origin_name=None):
@@ -166,7 +183,7 @@ def _edge_walk_binding(record, ride, walk, *, leading=False, current_origin_name
                 ride_branch, walk_branch, endpoint = branches[-3:]
             if not all(path_visible(node, marker) for node in [ride_branch, walk_branch, endpoint]):
                 continue
-            terminal = _xml_station(endpoint)
+            terminal = _xml_station(endpoint, endpoint=leading)
             if not terminal or terminal["portal"] or not named_leaves_visible(endpoint, marker):
                 continue
             literal_endpoint = normalized(walk.get("board" if leading else "alight"))
@@ -176,18 +193,19 @@ def _edge_walk_binding(record, ride, walk, *, leading=False, current_origin_name
                 endpoint_matches = True
             if not endpoint_matches:
                 continue
-            measured_walk = bool(not leading and re.fullmatch(r"步行\s*\d+(?:\.\d+)?(?:米|公里)\s*(?:[·•]\s*)?\d+(?:\.\d+)?分钟", walk.get("instructions") or ""))
-            row_pattern = (r"步行\s*(\d+(?:\.\d+)?)(米|公里)\s*(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟" if leading or measured_walk else
-                           r"站内外共步行\s*(\d+(?:\.\d+)?)(米|公里)\s*(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟")
+            measured_walk = bool(not leading and measured_walk_metrics(walk.get("instructions") or ""))
+            prefix = "步行" if leading or measured_walk else "站内外共步行"
             rows = [node for node in walk_branch.iter("node") if node.get("class") == "android.view.ViewGroup"
-                    and re.fullmatch(row_pattern, _xml_label(node))]
+                    and measured_walk_metrics(_xml_label(node), prefix=prefix)]
             if len(rows) != 1 or not path_visible(rows[0], marker):
                 continue
             all_walk_rows = [node for node in walk_branch.iter("node") if node.get("class") == "android.view.ViewGroup"
-                             and re.fullmatch(r"(?:站内外共)?步行\s*\d+(?:\.\d+)?(?:米|公里)\s*(?:[·•]\s*)?\d+(?:\.\d+)?分钟", _xml_label(node))]
+                             and (measured_walk_metrics(_xml_label(node))
+                                  or measured_walk_metrics(_xml_label(node), prefix="站内外共步行"))]
             if all_walk_rows != rows or any(_xml_direction(node) for node in walk_branch.iter("node")):
                 continue
-            total_leaves = [node for node in rows[0].iter("node") if not list(node) and re.fullmatch(row_pattern, _xml_label(node))]
+            total_leaves = [node for node in rows[0].iter("node") if not list(node)
+                            and measured_walk_metrics(_xml_label(node), prefix=prefix)]
             if len(total_leaves) != 1 or not path_visible(total_leaves[0], marker):
                 continue
             row_label = _xml_label(rows[0])
@@ -225,11 +243,10 @@ def _edge_walk_binding(record, ride, walk, *, leading=False, current_origin_name
                             and (not ride.get("entrance") or normalized(ride["entrance"]) == normalized(board["portal"]))
                             and (not ride.get("exit") or normalized(ride["exit"]) == normalized(alight["portal"]))
                             and normalized(walk.get("alight" if leading else "board")) == normalized((board if leading else alight)["title"])):
-                        metric = re.fullmatch(row_pattern, row_label)
+                        meters, minutes = measured_walk_metrics(row_label, prefix=prefix)
                         columns.append({"start": terminal["title"] if leading else alight["name"],
                             "end": board["name"] if leading else terminal["title"], "instructions": row_label,
-                            "walking_meters": float(metric.group(1)) * (1000 if metric.group(2) == "公里" else 1),
-                            "duration_minutes": float(metric.group(3))})
+                            "walking_meters": meters, "duration_minutes": minutes})
                 branch = parent
             if len(columns) == 1:
                 bindings.append(columns[0])
@@ -521,10 +538,9 @@ def validate_result(result, task_id, query_id, request=None, *, evidence=None, c
         prefix = f"segments.{seg['segment_id']}"
         walk_instruction = seg["instructions"] if seg["mode"] == "walk" else None
         aggregate_walk = bool(walk_instruction and normalized(walk_instruction).startswith("站内外共步行"))
-        leading_walk = bool(index == 0 and walk_instruction and re.fullmatch(
-            r"步行\d+(?:\.\d+)?(?:米|公里)(?:[·•])?\d+(?:\.\d+)?分钟", normalized(walk_instruction)))
-        trailing_walk = bool(index == len(data["segments"]) - 1 and index > 0 and walk_instruction and re.fullmatch(
-            r"步行\d+(?:\.\d+)?(?:米|公里)(?:[·•])?\d+(?:\.\d+)?分钟", normalized(walk_instruction)))
+        measured_walk = bool(walk_instruction and measured_walk_metrics(normalized(walk_instruction)))
+        leading_walk = index == 0 and measured_walk
+        trailing_walk = index == len(data["segments"]) - 1 and index > 0 and measured_walk
         binding = None
         leading_binding = None
         leading_eid = None

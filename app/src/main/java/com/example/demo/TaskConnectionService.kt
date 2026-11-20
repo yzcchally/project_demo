@@ -40,8 +40,9 @@ class TaskConnectionService : Service() {
     private var controlReady = false
     private var controlRetry: Runnable? = null
     private var overlaySteps = emptyList<String>()
+    private var historyOpenAfterPause = ""
+    private var historyOpenRetry: Runnable? = null
     private lateinit var tts: TextToSpeech
-    private val terminal = setOf("completed", "partial", "no_route", "failed", "cancelled", "outcome_unknown", "interrupted")
 
     private val speechListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "route_speech_active" && prefs.getBoolean("route_speech_active", false)) handler.post { if (!destroyed) tts.stop() }
@@ -68,6 +69,7 @@ class TaskConnectionService : Service() {
         if (intent?.action == dismissAction(this)) {
             if (watched.isBlank() || watched == id) {
                 active = false; watched = ""; latest = null
+                historyOpenAfterPause = ""
                 TaskOverlayState.publish(this, null)
                 controlReady = false; controls.clear(); cancelControlRetry()
                 handler.removeCallbacksAndMessages(null)
@@ -94,6 +96,8 @@ class TaskConnectionService : Service() {
         if (watched != id || socket == null) {
             if (watched != id) {
                 latest = null; lastSpoken = ""
+                historyOpenAfterPause = ""
+                cancelHistoryOpenRetry()
                 cancelControlRetry()
                 controls.select(id, prefs.getString("pending_control:$id", null))
             }
@@ -109,7 +113,7 @@ class TaskConnectionService : Service() {
     private fun connect(id: String) {
         if (!current(id) || !active) return
         controlReady = false
-        TaskOverlayState.publish(this, null)
+        publishTaskOverlay()
         reconnectRetry?.let { handler.removeCallbacks(it) }; reconnectRetry = null
         cancelControlRetry()
         reconnectScheduled = false
@@ -134,6 +138,12 @@ class TaskConnectionService : Service() {
                             update(response)
                             if (snapshot && active && controls.reconcileSnapshot(latest?.optString("state").orEmpty())) persistControl(id)
                             publishTaskOverlay()
+                            if (controlReady || !active) openHistoryIfReady(id)
+                            if (snapshot && historyOpenAfterPause == id && controls.pending == null && controls.inFlight == null) {
+                                historyOpenAfterPause = ""
+                                publishTaskOverlay()
+                                MailAccessibilityService.instance?.showTaskHistoryMessage(id, "暂时无法暂停任务，请稍后再打开历史。")
+                            }
                             dispatchControl(id)
                         } catch (_: Exception) { reconnect(id) }
                     }
@@ -154,7 +164,7 @@ class TaskConnectionService : Service() {
     private fun reconnect(id: String) {
         if (!current(id) || !active || reconnectScheduled) return
         controlReady = false
-        TaskOverlayState.publish(this, null)
+        publishTaskOverlay()
         reconnectScheduled = true
         prefs.edit().putString("connection_error", "连接暂时中断，正在恢复原任务。请检查电脑和 USB 连接。").apply()
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification("连接中断，正在恢复", latest))
@@ -181,7 +191,7 @@ class TaskConnectionService : Service() {
             .putLong("cursor:$id", maxOf(prefs.getLong("cursor:$id", 0), response.optLong("cursor", 0))).remove("connection_error").apply()
         val message = task.optString("message")
         speak(id, message)
-        active = state !in terminal
+        active = state !in taskTerminalStates
         getSystemService(NotificationManager::class.java).notify(NOTICE, notification(message, task))
         if (!active) {
             controlReady = false; controls.clear(); persistControl(id); cancelControlRetry()
@@ -192,21 +202,67 @@ class TaskConnectionService : Service() {
     }
     private fun control(id: String, action: String) {
         if (!current(id) || !controls.enqueue(action)) return
-        // Remove the touchable overlay before any queued control can resume work.
-        TaskOverlayState.publish(this, null)
+        if (action != "pause") {
+            historyOpenAfterPause = ""
+            cancelHistoryOpenRetry()
+        }
         persistControl(id)
+        publishTaskOverlay()
         dispatchControl(id)
+    }
+
+    private fun pauseForHistory(id: String) {
+        if (!current(id) || !active || !controlReady || controls.pending != null || controls.inFlight != null) return
+        historyOpenAfterPause = id
+        control(id, "pause")
+    }
+
+    private fun openHistoryIfReady(id: String) {
+        if (historyOpenAfterPause != id || !canOpenAfterPause(id)) return
+        historyOpenAfterPause = ""
+        publishTaskOverlay()
+        cancelHistoryOpenRetry()
+        // The Amap and accessibility overlay windows can be between focus states here.
+        historyOpenRetry = object : Runnable {
+            private var retries = 3
+
+            override fun run() {
+                if (historyOpenRetry !== this) return
+                if (canOpenAfterPause(id) && MailAccessibilityService.instance?.retryOpeningPausedRouteHistory(id) == true && retries > 0) {
+                    retries--
+                    handler.postDelayed(this, 300)
+                } else historyOpenRetry = null
+            }
+        }.also { handler.post(it) }
+    }
+
+    private fun canOpenAfterPause(id: String): Boolean {
+        val state = latest?.optString("state").orEmpty()
+        return current(id) && latest?.optString("id") == id && (state == "paused" || state in taskTerminalStates)
+    }
+
+    private fun cancelHistoryOpenRetry() {
+        historyOpenRetry?.let(handler::removeCallbacks)
+        historyOpenRetry = null
     }
 
     private fun publishTaskOverlay() {
         val task = latest
-        val phase = TaskOverlayPhase.fromTaskState(task?.optString("state").orEmpty())
         val id = task?.optString("id").orEmpty()
-        if (!current(id) || !active || !controlReady || phase == null || controls.pending != null || controls.inFlight != null) {
+        if (!current(id)) {
             TaskOverlayState.publish(this, null)
             return
         }
-        TaskOverlayState.publish(this, TaskOverlaySnapshot(id, phase, overlaySteps)) { action -> control(id, action) }
+        val state = task?.optString("state").orEmpty()
+        val canControl = active && controlReady && controls.pending == null && controls.inFlight == null
+        val phase = if (canControl) TaskOverlayPhase.fromTaskState(state) else null
+        val history = if (task?.optString("task_type") == "plan_transit") {
+            RouteHistoryAvailability.forState(state, canControl, historyOpenAfterPause == id)
+        } else null
+        val next = if (phase != null || history != null) TaskOverlaySnapshot(id, phase, overlaySteps, history) else null
+        TaskOverlayState.publish(this, next) { action ->
+            if (action == "pause_for_history") pauseForHistory(id) else control(id, action)
+        }
     }
     private fun persistControl(id: String) {
         val editor = prefs.edit()
@@ -247,7 +303,13 @@ class TaskConnectionService : Service() {
         if (!controls.complete(attempt, retryable)) return
         persistControl(id)
         result?.let { update(it) }
+        if (attempt.action == "pause" && !retryable && result == null && historyOpenAfterPause == id && active) {
+            // A pause can be rejected because the route finished before the request arrived.
+            connect(id)
+            return
+        }
         publishTaskOverlay()
+        if (result != null) openHistoryIfReady(id)
         if (error != null && stillRequested && active) prefs.edit().putString("connection_error", error).apply()
         if (controls.pending == null) return
         if (retryable && stillRequested) {
@@ -268,8 +330,8 @@ class TaskConnectionService : Service() {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val builder = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("小银助手").setContentText(message).setStyle(NotificationCompat.BigTextStyle().bigText(message))
-            .setContentIntent(open).setOnlyAlertOnce(true).setOngoing(task == null || task.optString("state") !in terminal)
-        if (task != null && task.optString("state") !in terminal) {
+            .setContentIntent(open).setOnlyAlertOnce(true).setOngoing(task == null || task.optString("state") !in taskTerminalStates)
+        if (task != null && task.optString("state") !in taskTerminalStates) {
             val actions = mutableListOf<Pair<String, String>>()
             if (task.optString("state") != "needs_review") actions.add(if (task.optString("state") == "paused") "继续" to "resume" else "暂停" to "pause")
             actions.add("取消" to "cancel")

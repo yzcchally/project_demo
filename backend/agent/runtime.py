@@ -153,6 +153,8 @@ class Engine:
 
     def _return_to_app(self, task_id):
         task = self.store.get(task_id)
+        if task.get("task_type") == "contact_family":
+            return
         if task.get("task_type") == "plan_transit":
             self._transit_checkpoint(task_id, task["query_id"])()
             if task["state"] == "cancelled":
@@ -527,44 +529,75 @@ class Engine:
     def _understand(self, task_id):
         task = self._stage(task_id, "understanding")
         from agent.local_intake import understand_local_instruction
+        from agent.models import IntentModelUnavailable
 
-        intent = understand_local_instruction(task["instruction"])
-        parser = "explicit_input" if intent else "llm"
-        if intent is None:
-            intent = self.models.understand(task["instruction"], [c["alias"] for c in self.contacts.all()])
+        instruction = task["instruction"]
+        explicit = understand_local_instruction(instruction)
+        intent, parser = explicit, "explicit_input"
+        if explicit is None or (getattr(self.models, "intent_model_configured", False) and not task.get("demo_case_id")):
+            try:
+                candidate = self.models.understand(instruction, [c["alias"] for c in self.contacts.all()])
+            except IntentModelUnavailable:
+                if explicit is None:
+                    raise WorkflowError(
+                        "自然语言服务暂不可用。您可以输入“扫码”，或选择“联系家人”“按地点查公交地铁”“按字段准备邮件”。"
+                    ) from None
+            else:
+                intent, parser = candidate, "llm"
         self.checkpoint()
         task = self.store.get(task_id)
         if intent.task_type == "unsupported":
-            raise WorkflowError("目前支持扫码、网页、邮件分享和公交地铁路线，请换一个相关需求")
-        if task.get("demo_fault") and intent.task_type == "open_url":
+            raise WorkflowError("目前支持扫码、打开网页、邮件分享、联系家人和公交地铁路线。请告诉我想做其中哪一件事")
+        if task.get("demo_fault") and intent.task_type in {"open_url", "contact_family"}:
             raise WorkflowError("恢复演示需要邮件草稿场景，请使用内置恢复案例")
+        if intent.task_type == "contact_family":
+            if re.search(
+                r"(?:不要|别(?!忘)|先不|不用|不必|无需|不想|不需要|取消)[^，。！？；,!?;]{0,20}"
+                r"(?:打给|打(?:个|一通)?电话|拨(?:打|给|通|号)|呼叫|联系|通话)",
+                instruction,
+            ):
+                raise WorkflowError("已收到暂缓联系的请求。需要联系家人时，可以重新告诉我")
+            alias = intent.family_recipient_alias.strip()
+            alias = alias if alias and alias in instruction else ""
+            task.update(task_type="contact_family", state="completed", family_recipient_alias=alias,
+                        parser=parser, intake_complete=True, request_qr=False,
+                        plan=["理解联系家人的请求", "在手机上核对联系人和号码"])
+            for field in ("draft", "draft_digest", "approval_digest", "approval_nonce", "scan_nonce", "verification_marker"):
+                task.pop(field, None)
+            self.store.save(task, f"已理解您想联系{alias}，请在手机上核对号码" if alias else "请在手机上选择家人并核对号码")
+            return
         if intent.task_type == "plan_transit":
             if task.get("demo_fault"):
                 raise WorkflowError("写信恢复演示不能用于路线任务")
             from api.schemas import TransitRequest
-            request = (intent.transit or TransitRequest()).model_dump()
-            instruction = task["instruction"]
+            transit = intent.transit or TransitRequest()
+            request = transit.model_dump()
             for field in ("origin", "destination", "city"):
                 if request[field] and request[field] not in instruction:
                     request[field] = ""
-            explicit_from = bool(re.search(r"从.+?(?:去|到|前往)", instruction))
-            if request["origin"] in {"当前位置", "我的位置", "这里", "现在的位置"}:
+            origin_is_position = request["origin"] in {
+                "当前位置", "我的位置", "这里", "现在的位置", "我现在的位置", "我所在的位置", "这儿",
+            }
+            if origin_is_position:
                 request["origin"] = ""
-                request["use_current_location"] = True
+            mentioned_location = any(word in instruction for word in (
+                "当前位置", "我的位置", "现在的位置", "我所在的位置", "从这里出发", "从这儿出发", "从我这儿出发",
+            ))
+            refused_location = re.search(r"(?:别|不想|不要|不用|不使用|不读取|不授权)[^，。；！？]{0,14}(?:定位|位置)", instruction)
+            request["use_current_location"] = (
+                (request["use_current_location"] or origin_is_position)
+                and not request["origin"] and mentioned_location and not refused_location
+            )
             if any(w in instruction for w in ("少换乘", "少转车", "少转乘")):
                 request["preference"] = "fewer_transfers"
             elif any(w in instruction for w in ("少步行", "步行更少", "少走路", "少走一点")):
                 request["preference"] = "less_walking"
-            else:
+            elif "preference" not in transit.model_fields_set:
                 request["preference"] = "recommended"
-            if parser == "llm" and not request["origin"] and not explicit_from:
-                request["use_current_location"] = True
             for field in ("origin", "destination"):
                 if request[field] in {"家", "家里", "我家", "家中"}:
                     request[field] = ""
                     if field == "origin": request["use_current_location"] = False
-            if explicit_from and not request["origin"] and not any(w in instruction for w in ("当前位置", "我的位置", "现在的位置")):
-                request["use_current_location"] = False
             request = TransitRequest.model_validate(request).model_dump()
             dingtalk_requested = dingtalk_self_requested(instruction)
             task.update(task_type="plan_transit", transit_request=request, transit_original_request=dict(request),
@@ -593,8 +626,9 @@ class Engine:
             alias = ""
         urls = re.findall(r"https://[^\s，。；]+", instruction)
         url = validate_url(urls[0]) if len(urls) == 1 else ""
+        request_qr = intent.task_type == "scan_and_share" or (intent.task_type == "open_url" and intent.needs_qr)
         task.update(task_type=intent.task_type, recipient_alias=alias, recipient_ambiguous=ambiguous, parser=parser,
-                    request_qr=intent.task_type == "scan_and_share" or any(w in instruction for w in ("扫码", "二维码", "扫描")),
+                    request_qr=request_qr,
                     plan=(["理解需求", "识别二维码或网址", "核对网页"] if intent.task_type == "open_url" else
                           ["理解需求", "澄清收件人", "识别二维码或网址", "核对网页", "准备草稿", "用户确认", "单次发送并核验"]),
                     draft={"recipient": recipient, "subject": intent.subject or "网页分享", "body": intent.body, "url": url},
@@ -722,6 +756,8 @@ class Engine:
     def _require_mail(task):
         if task.get("task_type") == "plan_transit":
             raise WorkflowError("这是路线任务，请使用路线查询和讲解接口")
+        if task.get("task_type") == "contact_family":
+            raise WorkflowError("请在手机上打开联系家人并核对号码")
 
     def _transit_task(self, task_id, query_id):
         task = self.store.get(task_id)

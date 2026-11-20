@@ -7,6 +7,8 @@ DETAILS = {
 
 
 def explain(task):
+    if task.get("task_type") == "contact_family":
+        return task["message"] + "\n号码由手机上的家人资料提供，核对后可以打开拨号页。"
     if task.get("task_type") == "plan_transit":
         if task.get("transit_result"):
             from transit.explain import explain_result

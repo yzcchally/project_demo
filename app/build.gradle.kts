@@ -4,6 +4,19 @@ plugins {
 }
 
 val huaweiSideBySide = providers.gradleProperty("huaweiSideBySide").orNull == "true"
+val phoneVoice = rootProject.layout.projectDirectory.dir(".run/phone-voice")
+val phoneVoiceAar = phoneVoice.file("sherpa-onnx-2.0.2.aar")
+val phoneVoiceAssets = phoneVoice.dir("assets")
+val phoneVoicePython = providers.gradleProperty("phoneVoicePython").orElse(
+    providers.systemProperty("os.name").map { if (it.startsWith("Windows")) "python" else "python3" },
+)
+val preparePhoneVoice = tasks.register<Exec>("preparePhoneVoice") {
+    val script = rootProject.layout.projectDirectory.file("tools/prepare_phone_voice.py")
+    commandLine(phoneVoicePython.get(), script.asFile.absolutePath)
+    inputs.file(script)
+    outputs.files(phoneVoiceAar, phoneVoiceAssets.file("phone-voice/model.int8.onnx"),
+        phoneVoiceAssets.file("phone-voice/tokens.txt"), phoneVoiceAssets.file("phone-voice/sherpa-onnx-LICENSE.txt"))
+}
 
 android {
     namespace = "com.example.demo"
@@ -20,6 +33,7 @@ android {
         manifestPlaceholders["launcherLabel"] = "@string/app_name"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        if (huaweiSideBySide) ndk.abiFilters.add("arm64-v8a")
     }
 
     buildTypes {
@@ -30,6 +44,7 @@ android {
             }
         }
         release {
+            proguardFiles("proguard-phone-voice.pro")
             optimization {
                 enable = true
                 packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
@@ -43,9 +58,19 @@ android {
     buildFeatures {
         compose = true
     }
+    sourceSets.getByName("main") {
+        jniLibs.srcDir(rootProject.file(".run/standalone-build/jniLibs"))
+        assets.srcDir(rootProject.file(".run/standalone-build/runtime-assets"))
+        assets.srcDir(phoneVoiceAssets)
+    }
+    androidResources.noCompress += "onnx"
+    packaging.jniLibs.useLegacyPackaging = true
 }
 
+tasks.named("preBuild") { dependsOn(preparePhoneVoice) }
+
 dependencies {
+    implementation(files(phoneVoiceAar).builtBy(preparePhoneVoice))
     implementation(libs.okhttp)
     implementation(libs.zxing.embedded)
     implementation(platform(libs.androidx.compose.bom))

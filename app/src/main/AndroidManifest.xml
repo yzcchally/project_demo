@@ -33,6 +33,11 @@
             android:screenOrientation="fullSensor" tools:replace="screenOrientation" />
         <activity android:name=".TaskCaptureActivity" android:screenOrientation="fullSensor" android:theme="@style/zxing_CaptureTheme" />
         <activity
+            android:name=".PhoneScanCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor"
+            android:theme="@style/zxing_CaptureTheme" />
+        <activity
             android:name=".MainActivity"
             android:launchMode="singleTask"
             android:exported="true"

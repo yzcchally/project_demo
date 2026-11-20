@@ -49,10 +49,15 @@ private enum class FamilyContactStep { Show, Edit, ConfirmDial, ConfirmClear }
 private data class FamilyContactNotice(val text: String, val error: Boolean = false)
 
 @Composable
-internal fun FamilyContactDialog(onDismiss: () -> Unit) {
+internal fun FamilyContactDialog(
+    requestedAlias: String? = null,
+    onDialLaunched: (() -> Unit)? = null,
+    onDismiss: () -> Unit,
+) {
     val context = LocalContext.current
     val store = remember(context) { FamilyContactStore(context.noBackupFilesDir) }
     val scope = rememberCoroutineScope()
+    val requestedName = requestedAlias?.let(::normalizeFamilyContactName)
     var contact by remember { mutableStateOf<FamilyContact?>(null) }
     var step by remember { mutableStateOf(FamilyContactStep.Show) }
     var name by remember { mutableStateOf("") }
@@ -67,9 +72,11 @@ internal fun FamilyContactDialog(onDismiss: () -> Unit) {
     suspend fun readContact() {
         busy = true
         try {
-            contact = withContext(Dispatchers.IO) { store.read() }
+            val saved = withContext(Dispatchers.IO) { store.read() }
+            contact = saved
             readError = false
             notice = null
+            if (requestedName != null && saved?.name == requestedName) step = FamilyContactStep.ConfirmDial
         } catch (_: IOException) {
             contact = null
             readError = true
@@ -152,9 +159,15 @@ internal fun FamilyContactDialog(onDismiss: () -> Unit) {
         val saved = contact ?: return
         val validNumber = normalizeFamilyContactNumber(saved.number) ?: return
         try {
-            context.startActivity(Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", validNumber, null)))
-            step = FamilyContactStep.Show
-            notice = null
+            val dial = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", validNumber, null))
+            if (onDialLaunched != null) dial.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(dial)
+            onDialLaunched?.invoke()
+            if (requestedAlias != null) onDismiss()
+            else {
+                step = FamilyContactStep.Show
+                notice = null
+            }
         } catch (_: ActivityNotFoundException) {
             notice = FamilyContactNotice("此手机没有可用的拨号应用。", error = true)
         } catch (_: SecurityException) {
@@ -203,13 +216,20 @@ internal fun FamilyContactDialog(onDismiss: () -> Unit) {
                                     FamilyContactAction("清空家人资料") { step = FamilyContactStep.ConfirmClear }
                                 }
                                 saved == null -> {
-                                    Text("保存一位常联系的家人。资料保存在这部手机，离线也能查看。", style = MaterialTheme.typography.bodyLarge)
+                                    Text(
+                                        if (requestedAlias == null) "保存一位常联系的家人。资料保存在这部手机，离线也能查看。"
+                                        else "手机还没有保存家人的号码，请先添加家人。",
+                                        style = MaterialTheme.typography.bodyLarge,
+                                    )
                                     FamilyContactAction("添加家人", primary = true, onClick = ::edit)
                                 }
                                 else -> {
+                                    if (requestedName != null && saved.name != requestedName) {
+                                        Text("已保存的姓名与“$requestedName”不同。请先核对，再选择要联系的人。", style = MaterialTheme.typography.bodyLarge)
+                                    }
                                     FamilyContactDetails(saved)
                                     Text("可打开手机拨号页，核对后由您拨出。", style = MaterialTheme.typography.bodyLarge)
-                                    FamilyContactAction("准备拨号", primary = true) {
+                                    FamilyContactAction(if (requestedAlias == null) "准备拨号" else "选择这位家人", primary = true) {
                                         notice = null
                                         step = FamilyContactStep.ConfirmDial
                                     }

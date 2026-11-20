@@ -1,9 +1,17 @@
-"""Intake for app examples, explicit transit, and short destination requests."""
+"""Direct entry for unambiguous commands and app-generated instructions."""
 import re
 
 from api.schemas import TaskIntent, TransitRequest
 
 
+_SCAN_ONLY = re.compile(
+    r"(?:(?:我想要|我想|我要|想|请(?:你)?|麻烦(?:你)?|能不能|可以)\s*)?"
+    r"(?:(?:帮我|给我|替我)\s*)?"
+    r"(?:打开扫码|扫一扫|扫码(?:一下)?|扫个码|扫一下码|扫下码|"
+    r"(?:扫一扫|扫一下|扫下|扫|扫描)\s*(?:(?:这个|那个|一个|一下)\s*)?(?:二维码|码))"
+    r"(?:\s*[，,]?\s*(?:(?:并|然后|再)\s*)?(?:打开网页|看看是什么|看一下))?"
+    r"(?:\s*(?:吧|吗))?"
+)
 _TRANSIT_FORM = re.compile(
     r"(?:在(?P<city>[^，\n]{1,80})，)?"
     r"(?:从(?P<origin>[^，\n]{1,160})去|(?P<unspecified>我想去))"
@@ -27,8 +35,12 @@ _ADDITIONAL_ACTION = re.compile(
 )
 
 
+def _short_command(instruction: str) -> str:
+    return instruction.strip().rstrip("。！？?!.").rstrip()
+
+
 def _short_destination(instruction: str) -> str:
-    text = instruction.strip().rstrip("。！？?!.").rstrip()
+    text = _short_command(instruction)
     if re.match(r"^(?:在\S+?)?从.+?(?:去|到|前往)", text):
         return ""
     match = _DESTINATION_DIRECTIONS.fullmatch(text) or _SHORT_DESTINATION.fullmatch(text)
@@ -39,8 +51,8 @@ def _short_destination(instruction: str) -> str:
 
 
 def understand_local_instruction(instruction: str) -> TaskIntent | None:
-    if instruction == "帮我扫这个二维码，打开网页。":
-        return TaskIntent(task_type="open_url")
+    if _SCAN_ONLY.fullmatch(_short_command(instruction)):
+        return TaskIntent(task_type="open_url", needs_qr=True)
     if instruction == "帮我扫码，把网页发邮件给女儿。":
         return TaskIntent(task_type="scan_and_share", recipient_alias="女儿")
     if instruction == "在广州，从广州塔地铁站到客村地铁站怎么走？":

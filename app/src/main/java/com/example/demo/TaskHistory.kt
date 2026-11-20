@@ -55,15 +55,17 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 internal object TaskHistoryEntry {
-    const val EXTRA_OPEN_HISTORY = "com.example.demo.OPEN_TASK_HISTORY"
+    const val EXTRA_TASK_ID = "com.example.demo.OPEN_TASK_HISTORY_ID"
 
-    fun open(context: Context) {
+    fun open(context: Context, taskId: String) {
         context.startActivity(Intent(context, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-            putExtra(EXTRA_OPEN_HISTORY, true)
+            putExtra(EXTRA_TASK_ID, taskId)
         })
     }
 }
+
+internal data class TaskHistoryOpenRequest(val taskId: String, val sequence: Int)
 
 private data class TaskHistoryStep(
     val seq: Long,
@@ -128,6 +130,7 @@ internal fun TaskHistoryScaffold(
 internal fun TaskHistoryPanel(
     taskId: String,
     canReturn: Boolean,
+    isPaused: Boolean,
     onDismiss: () -> Unit,
     onReturned: (JSONObject) -> Unit,
 ) {
@@ -207,6 +210,9 @@ internal fun TaskHistoryPanel(
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text("任务历史", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
                         TextButton(onClick = onDismiss, enabled = !returning) { Text("关闭", fontSize = 18.sp) }
+                    }
+                    if (isPaused) {
+                        Text("任务已暂停", fontSize = 17.sp, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
                     }
                     HorizontalDivider()
                     if (selected != null) {

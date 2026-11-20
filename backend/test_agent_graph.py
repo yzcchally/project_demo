@@ -118,6 +118,61 @@ def test_open_only_goal_never_enters_mail_or_approval(engine):
     assert "准备草稿" not in task["plan"]
 
 
+def test_bare_scan_uses_qr_flow_without_calling_model_or_mail(engine):
+    task = settle(engine, engine.create_goal("扫码", "bare-scan-request"))
+
+    assert task["state"] == "awaiting_qr" and task["task_type"] == "open_url"
+    assert not engine.models.entered.is_set()
+    assert not engine.device.calls
+    assert engine.graph.get_state(engine._graph_config(task["id"])).next == ("scan",)
+
+    with pytest.raises(WorkflowError):
+        engine.submit_qr(task["id"], "https://example.org/", "stale-nonce")
+    with pytest.raises(WorkflowError):
+        engine.submit_qr(task["id"], "http://example.org/", task["scan_nonce"])
+    assert engine.store.get(task["id"])["state"] == "awaiting_qr"
+
+    task = settle(engine, engine.submit_qr(task["id"], "https://example.org/", task["scan_nonce"]))
+    assert task["state"] == "completed" and task["webpage_verified"]
+    assert task["source"] == "qr" and task["send_attempts"] == 0
+    assert engine.device.calls == [("url", "https://example.org/")]
+
+
+def test_model_can_select_scan_for_semantic_phrasing_without_scan_keywords(engine):
+    engine.models.result = TaskIntent(task_type="open_url", needs_qr=True)
+
+    task = settle(engine, engine.create_goal("帮我识别镜头前这个码", "semantic-scan-request"))
+
+    assert engine.models.entered.is_set()
+    assert task["state"] == "awaiting_qr" and task["task_type"] == "open_url"
+    assert not engine.device.calls
+
+
+def test_mention_of_qr_does_not_override_explicit_webpage_intent(engine):
+    engine.models.result = TaskIntent(task_type="open_url", needs_qr=False)
+
+    task = settle(engine, engine.create_goal("打开这个二维码说明网页 https://example.org/", "qr-document-request"))
+
+    assert engine.models.entered.is_set()
+    assert task["state"] == "completed" and task["webpage_verified"]
+    assert not task["request_qr"]
+    assert engine.device.calls == [("url", "https://example.org/")]
+
+
+def test_model_outage_suggests_supported_app_entries_without_starting_a_task_action(engine, monkeypatch):
+    from agent.models import ModelGateway
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("SILVERGUIDE_OLLAMA_INTENT_MODEL", raising=False)
+    with patch.object(engine.models, "understand", ModelGateway().understand):
+        task = settle(engine, engine.create_goal("能帮我看看袋子上的小方格吗", "offline-intake-request"))
+
+    assert task["state"] == "failed"
+    assert "扫码" in task["message"] and "按地点查公交地铁" in task["message"]
+    assert "密钥" not in task["message"]
+    assert not engine.device.calls
+
+
 def test_resuming_qr_requires_new_scan_nonce_and_rejects_old_callback(engine):
     engine.contacts.put("女儿", "receiver@example.org")
     task = create_goal(engine)

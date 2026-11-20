@@ -179,8 +179,10 @@ class TransitScreenDecision(BaseModel):
 
 class TaskIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    task_type: Literal["scan_and_share", "share_url", "share_current_page", "open_url", "plan_transit", "unsupported"]
+    task_type: Literal["scan_and_share", "share_url", "share_current_page", "open_url", "plan_transit", "contact_family", "unsupported"]
     transit: TransitRequest | None = None
+    needs_qr: bool = Field(default=False, description="打开网页前是否需要从相机读取二维码。")
+    family_recipient_alias: str = Field(default="", max_length=80, description="通话对象在用户原话中的称呼。")
     recipient_alias: str = Field(default="", max_length=80)
     recipient_address: str = Field(default="", max_length=254)
     subject: str = Field(default="网页分享", max_length=150)

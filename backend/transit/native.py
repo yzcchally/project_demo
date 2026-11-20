@@ -66,15 +66,20 @@ def _station_fields(n):
     # A station group itself labels the stop and contains its name leaf; labels
     # on a broad ancestor or an arbitrary text elsewhere are insufficient.
     role = None
-    for prefix, value in (("上车站", "board"), ("下车站", "alight")):
-        if text.startswith(prefix):
+    for prefix, value in (("上车站", "board"), ("下车站", "alight"), ("起点", "origin")):
+        if text.startswith(prefix) and text != prefix:
             text, role = text[len(prefix):], value
             break
-    leaves = [_label(c) for c in n.iter("node") if c is not n and not list(c) and _visible(c) and _label(c)]
+    leaves = [_label(c) for c in n.iter("node") if c is not n and not list(c) and _visible(c) and _label(c)
+              and _label(c) != "地铁进站指引"]
     if not text:
         return None
     if text in leaves or _key(text) in {_key(x) for x in leaves}:
         return {"name": text, "portal": None, "role": role}
+    if role == "board" and len(leaves) == 1:
+        portal = re.fullmatch(r"(.+?)\s*[（(]([A-Za-z]\d*口)[）)]", leaves[0])
+        if portal and text == "".join(portal.groups()):
+            return {"name": portal[1].strip(), "portal": portal[2], "role": role}
     # Amap explicitly groups an exit with its station, e.g. desc 珠江新城C口
     # and exactly two leaves 珠江新城 / C口. Never infer an exit from an
     # unrelated label elsewhere on the page or from a station-name database.
@@ -117,7 +122,7 @@ def _column(direction, parents, *, with_container=False):
                 if _key(board) == _key(alight):
                     return None
                 metrics = [_label(n) for child in after for n in child.iter("node") if _visible(n)]
-                stop_values = {int(x) for s in metrics for x in re.findall(r"(\d+)站", s)}
+                stop_values = {int(x) for s in metrics for x in re.findall(r"(\d+)站(?!台)", s)}
                 minutes = {float(x) for s in metrics for x in re.findall(r"(\d+(?:\.\d+)?)分钟", s)}
                 values = {"board": board, "alight": alight,
                           "stops": next(iter(stop_values)) if len(stop_values) == 1 else None,
@@ -131,10 +136,7 @@ def _column(direction, parents, *, with_container=False):
 
 
 def _transfer_metrics(text):
-    match = re.fullmatch(r"站内换乘\s*(\d+(?:\.\d+)?)(米|公里)\s*(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟", text)
-    if not match:
-        return None
-    return float(match.group(1)) * (1000 if match.group(2) == "公里" else 1), float(match.group(3))
+    return measured_walk_metrics(text, prefix="站内换乘")
 
 
 def _bound_station_transfer(row, rides, parents):
@@ -159,11 +161,14 @@ def _tail_walk_label(text):
     return bool(re.fullmatch(r"站内外共步行\s*\d+(?:\.\d+)?(?:公里|米)\s*(?:[·•]\s*)?\d+(?:\.\d+)?分钟", text))
 
 
-def _leading_walk_metrics(text):
-    match = re.fullmatch(r"步行\s*(\d+(?:\.\d+)?)(公里|米)\s*(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟", text)
+def measured_walk_metrics(text, *, prefix="步行"):
+    if not text.startswith(prefix):
+        return None
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)(公里|米)\s*(?:(?:[·•]\s*)?(\d+(?:\.\d+)?)分钟|\((\d+(?:\.\d+)?)分钟\))",
+                         text[len(prefix):].replace("（", "(").replace("）", ")"))
     if not match:
         return None
-    return float(match[1]) * (1000 if match[2] == "公里" else 1), float(match[3])
+    return float(match[1]) * (1000 if match[2] == "公里" else 1), float(match[3] or match[4])
 
 
 def _bound_leading_walk(row, rides, parents):
@@ -174,7 +179,7 @@ def _bound_leading_walk(row, rides, parents):
         if len(children) >= 3 and children[1] is branch and all(_visible(c) for c in children[:3]):
             origin, _, after = children[:3]
             walk_rows = [n for n in branch.iter("node") if _visible(n) and n.get("class") == "android.view.ViewGroup"
-                         and (_leading_walk_metrics(_label(n)) is not None or _tail_walk_label(_label(n)))]
+                         and (measured_walk_metrics(_label(n)) is not None or _tail_walk_label(_label(n)))]
             if walk_rows != [row] or any(_line(n) for n in branch.iter("node") if _visible(n) and _label(n).endswith("方向")):
                 return None
             source = _station(origin)
@@ -186,7 +191,7 @@ def _bound_leading_walk(row, rides, parents):
                 return None
             ride = following[0]
             segment = ride["segment"]
-            portals = {_label(n) for n in ride["container"].iter("node")
+            portals = {fields["name"] + (fields["portal"] or "") for n in ride["container"].iter("node")
                        if (fields := _station_fields(n)) and fields["name"] == segment["board"]
                        and fields["portal"] == segment.get("entrance")}
             if len(portals) != 1:
@@ -208,7 +213,7 @@ def _bound_tail_walk(row, rides, parents):
         if len(children) >= 3 and index == len(children)-2 and all(_visible(c) for c in children[-3:]):
             before, _, after = children[-3:]
             walk_rows = [n for n in branch.iter("node") if _visible(n) and n.get("class") == "android.view.ViewGroup"
-                         and (_leading_walk_metrics(_label(n)) is not None or _tail_walk_label(_label(n)))]
+                         and (measured_walk_metrics(_label(n)) is not None or _tail_walk_label(_label(n)))]
             if walk_rows != [row] or any(_line(n) for n in branch.iter("node") if _visible(n) and _label(n).endswith("方向")):
                 return None
             previous = [ride for ride in rides if ride["container"] in before.iter()]
@@ -294,12 +299,12 @@ def _numbered_summary(observations, query_id, route_id, segments):
             continue
         header, *body = record.get("text", "").splitlines() or [""]
         match = re.fullmatch(
-            r"方案[1-9]\d*，(\d+(?:\.\d+)?(?:小时(?:\d+(?:\.\d+)?分钟)?|分钟))，"
+            r"方案[1-9]\d*，(\d+(?:\.\d+)?(?:小时(?:\d+(?:\.\d+)?分(?:钟)?)?|分钟))，"
             r"(?:[^，]+，)*?(\d+(?:\.\d+)?)元，[^，]+", header,
         )
         lines = {part for part in body if not part.startswith(("起点：", "终点：", "本轮已点击筛选："))}
         if match and lines == {segment["line"] for segment in segments}:
-            return record["evidence_id"], _duration(match[1]), float(match[2])
+            return record["evidence_id"], _duration(match[1]), float(match[2]), header
     return None
 
 
@@ -338,7 +343,7 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
                             and ("号线" in _label(n) or "路" in _label(n)) and ("站" in _label(n) or "¥" in _label(n) or "￥" in _label(n))]
         transfer_rows = [n for n in ns if n.get("class") == "android.view.ViewGroup" and _transfer_metrics(_label(n)) is not None]
         tail_rows = [n for n in ns if n.get("class") == "android.view.ViewGroup" and _tail_walk_label(_label(n))]
-        leading_rows = [n for n in ns if n.get("class") == "android.view.ViewGroup" and _leading_walk_metrics(_label(n)) is not None]
+        leading_rows = [n for n in ns if n.get("class") == "android.view.ViewGroup" and measured_walk_metrics(_label(n)) is not None]
         if len(transfer_rows) > 1:
             return None  # Only one explicit same-station interchange is supported.
         if len(tail_rows) > 1 or len(leading_rows) > 2:
@@ -347,7 +352,27 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
         # two indistinguishable walking rows in the same frame.
         if len({_label(n) for n in leading_rows}) != len(leading_rows):
             return None
+        # Amap can split its compact total, mode strip and fare into adjacent
+        # summary subtrees. These describe the whole route, never a walk leg.
+        for n in ns:
+            if n.get("class") != "android.view.ViewGroup" or not re.fullmatch(
+                    r"行程剩\d+(?:小时(?:\d+分)?|分钟)\s+步行\d+(?:\.\d+)?(?:公里|米)\s+\d{1,2}点\d{2}分\s+到达", _label(n)):
+                continue
+            wrapper = parents.get(n)
+            owner = parents.get(wrapper)
+            if owner is None or len(wrapper) != 1 or len(owner) < 3 or owner[0] is not wrapper:
+                continue
+            modes = [child for child in owner[1].iter("node") if _visible(child) and re.fullmatch(
+                r"步行\d+分钟(?:转\d+[A-Za-z]?号线)+", _label(child))]
+            if len(modes) == 1 and _visible(owner[2]) and re.match(r"\d+站\s*[¥￥]\s*\d", _label(owner[2])):
+                aggregate_groups.extend((n, modes[0]))
         allowed_walk_nodes = {c for n in aggregate_groups + transfer_rows + tail_rows + leading_rows for c in n.iter()}
+        for row in leading_rows:
+            owner = parents.get(parents.get(row))
+            if owner is not None and _visible(owner):
+                for action in owner:
+                    if _label(action) == "步行导航":
+                        allowed_walk_nodes.update(action.iter())
         walking_labels = [n for n in ns if ("步行" in _label(n) or "站内换乘" in _label(n)) and _label(n) not in {"步行少", "少步行"}]
         if any(n not in allowed_walk_nodes for n in walking_labels):
             return None
@@ -408,7 +433,7 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
                 continue
             identity = (ride["segment"]["segment_id"], source, terminal)
             quote = _label(row)
-            meters, minutes = _leading_walk_metrics(quote)
+            meters, minutes = measured_walk_metrics(quote)
             leading_bindings[identity] = {
                 "segment_id": hashlib.sha256(repr(identity).encode()).hexdigest()[:20],
                 "mode": "walk", "instructions": quote, "board": source, "alight": terminal,
@@ -428,7 +453,7 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
                 continue
             identity = (ride["segment"]["segment_id"], board, terminal)
             quote = _label(row)
-            metrics = _leading_walk_metrics(quote)
+            metrics = measured_walk_metrics(quote)
             tail_bindings[identity] = {
                 "segment_id": hashlib.sha256(repr(identity).encode()).hexdigest()[:20],
                 "mode": "walk", "instructions": quote if metrics else "站内外共步行", "board": board, "alight": terminal,
@@ -471,7 +496,7 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
     duration = _duration(summary)
     fare = float(fare.group(1)) if fare else None
     if not summary and (numbered := _numbered_summary(observations, query_id, route_id, segments)):
-        eid, duration, fare = numbered
+        eid, duration, fare, summary = numbered
     walking = None
     if walking_seen or observed_transfers or observed_tail_rows or observed_leading_rows:
         walk = None
@@ -484,7 +509,7 @@ def extract_native(observations, request, *, task_id, query_id, route_id):
                 return None
         if observed_tail_rows and (tail is None or len(observed_tail_rows) != 1):
             return None
-        bound_normal = {v["instructions"] for v in (leading, tail) if v and _leading_walk_metrics(v["instructions"])}
+        bound_normal = {v["instructions"] for v in (leading, tail) if v and measured_walk_metrics(v["instructions"])}
         if observed_leading_rows != bound_normal:
             return None
         if walk is None and tail is None and leading is None:

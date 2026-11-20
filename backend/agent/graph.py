@@ -17,6 +17,8 @@ def build_graph(engine):
         return engine.store.get(state["task_id"])
 
     def next_intake(current):
+        if current.get("task_type") == "contact_family":
+            return "done"
         if engine._missing(current):
             return "transit_clarify" if current.get("task_type") == "plan_transit" else "clarify"
         return "transit_precheck" if current.get("task_type") == "plan_transit" else "scan"
@@ -93,9 +95,16 @@ def build_graph(engine):
                        ("transit_clarify", transit_clarify), ("transit_precheck", transit_precheck),
                        ("transit_query", transit_query), ("transit_choice", transit_choice)]:
         graph.add_node(name, node)
-    graph.add_conditional_edges(START, lambda s: "understand" if task(s).get("instruction") and not task(s).get("intake_complete")
-                                else next_intake(task(s)) if task(s).get("task_type") == "plan_transit" else "precheck")
-    graph.add_conditional_edges("understand", lambda s: s["decision"])
+    def entry(state):
+        current = task(state)
+        if current.get("instruction") and not current.get("intake_complete"):
+            return "understand"
+        if current.get("task_type") == "contact_family":
+            return END
+        return next_intake(current) if current.get("task_type") == "plan_transit" else "precheck"
+
+    graph.add_conditional_edges(START, entry)
+    graph.add_conditional_edges("understand", lambda s: END if s["decision"] == "done" else s["decision"])
     graph.add_conditional_edges("clarify", lambda s: s["decision"])
     graph.add_conditional_edges("transit_clarify", lambda s: s["decision"])
     graph.add_edge("transit_precheck", "transit_query")

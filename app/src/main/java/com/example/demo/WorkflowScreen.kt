@@ -79,7 +79,7 @@ internal suspend fun request(path: String, payload: JSONObject? = null, method: 
 internal fun WorkflowScreen(
     modifier: Modifier = Modifier,
     sharedScan: SharedScan? = null,
-    openHistoryRequest: Int = 0,
+    openHistoryRequest: TaskHistoryOpenRequest? = null,
     onDismissSharedScan: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -120,7 +120,7 @@ internal fun WorkflowScreen(
     var historyTaskId by rememberSaveable {
         mutableStateOf(prefs.getString("history_task_id", taskId.ifBlank { dismissedTaskId }).orEmpty())
     }
-    LaunchedEffect(openHistoryRequest) { if (openHistoryRequest > 0) showHistory = true }
+    LaunchedEffect(openHistoryRequest) { if (openHistoryRequest?.taskId == historyTaskId) showHistory = true }
     var speakEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("speak_enabled", false)) }
     var ttsReady by remember { mutableStateOf(false) }
     var ttsSupported by remember { mutableStateOf(true) }
@@ -129,6 +129,8 @@ internal fun WorkflowScreen(
     var speechStatus by remember { mutableStateOf("") }
     var showDemoPicker by rememberSaveable { mutableStateOf(false) }
     var showFamilyContact by rememberSaveable { mutableStateOf(false) }
+    var pendingGoalTaskId by remember { mutableStateOf("") }
+    var openFamilyTaskId by remember { mutableStateOf("") }
     var selectedDemoId by rememberSaveable { mutableStateOf("") }
     var selectedDemoPrompt by rememberSaveable { mutableStateOf("") }
     var demoMetadataSupported by rememberSaveable { mutableStateOf(false) }
@@ -177,8 +179,21 @@ internal fun WorkflowScreen(
     val state = task?.optString("state").orEmpty()
     val message = task?.optString("message").orEmpty()
     val active = task != null && state !in terminalStates
+    val familyTask = task?.optString("task_type") == "contact_family"
+    val familyReady = familyTask && state == "completed"
+    val canOpenFamilyDialog = !showHistory && !showFamilyContact && sharedScan == null
     val navigationReady = state == "completed" && task?.optString("task_type") == "plan_transit" &&
         task?.optBoolean("route_verified") == true && task?.optInt("transit_navigation_attempts") == 0
+    LaunchedEffect(pendingGoalTaskId, taskId, state, familyReady, lifecycleState, canOpenFamilyDialog) {
+        if (pendingGoalTaskId.isBlank()) return@LaunchedEffect
+        if (pendingGoalTaskId != taskId || (state in terminalStates && !familyReady)) {
+            pendingGoalTaskId = ""
+        } else if (familyReady && lifecycleState == Lifecycle.State.RESUMED && canOpenFamilyDialog) {
+            pendingGoalTaskId = ""
+            showDemoPicker = false
+            openFamilyTaskId = taskId
+        }
+    }
     fun changed() { requestKey = UUID.randomUUID().toString() }
     fun newTask() {
         stopRouteSpeech(); transitFormOpen = false
@@ -193,6 +208,7 @@ internal fun WorkflowScreen(
         manualMode = false; contactsOpen = false; advanced = false
         contactAlias = ""; contactAddress = ""
         receiptDialog = false; viewedTransitCompletion = ""; showDemoPicker = false; launchedScan = ""
+        pendingGoalTaskId = ""; openFamilyTaskId = ""
         scanInFlight = false; scanOwner = ""; scanNonce = ""
         task = null; taskId = ""; result = ""; changed()
         instruction = ""; webpage = ""; body = ""; subject = "网页分享"; source = "text"
@@ -223,6 +239,7 @@ internal fun WorkflowScreen(
                 // has already closed. Reconnect for that new active operation.
                 val becameActive = task?.optString("state") in terminalStates && incoming.optString("state") !in terminalStates
                 if (queryChanged || incoming.optString("state") == "cancelled") stopRouteSpeech()
+                if (taskId != incoming.optString("id")) openFamilyTaskId = ""
                 task = incoming; taskId = incoming.getString("id")
                 historyTaskId = taskId
                 prefs.edit().putString("task_id", taskId).putString("history_task_id", historyTaskId).apply()
@@ -240,7 +257,15 @@ internal fun WorkflowScreen(
         }
         scope.launch {
             loading = true
-            try { accept(request(path, payload, "POST")) }
+            try {
+                val response = request(path, payload, "POST")
+                if (path == "/api/tasks" && payload.optString("request_key") == requestKey) {
+                    // Goal recognition can arrive later on the task socket. Only arm the task returned by this submission.
+                    pendingGoalTaskId = response.optJSONObject("task")?.optString("id").orEmpty()
+                        .takeUnless { it == dismissedTaskId }.orEmpty()
+                }
+                accept(response)
+            }
             catch (e: Exception) { result = e.message ?: "连接失败，请检查电脑后端和 USB 连接" }
             finally { loading = false }
         }
@@ -395,6 +420,21 @@ internal fun WorkflowScreen(
                     OutlinedButton(onClick = { newTask() }, enabled = !loading,
                         modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
                         Text("准备新的任务", fontSize = 20.sp)
+                    }
+                }
+            } else if (familyTask) {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("联系家人", style = MaterialTheme.typography.titleLarge)
+                        Text(message, fontSize = 21.sp)
+                        if (familyReady) Button(
+                            onClick = {
+                                pendingGoalTaskId = ""
+                                openFamilyTaskId = taskId
+                            },
+                            enabled = !loading,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
+                        ) { Text("核对家人号码", fontSize = 20.sp) }
                     }
                 }
             } else {
@@ -595,7 +635,8 @@ internal fun WorkflowScreen(
     }
     if (showHistory) TaskHistoryPanel(
         taskId = historyTaskId,
-        canReturn = task != null && historyTaskId == taskId,
+        canReturn = task != null && historyTaskId == taskId && task?.optInt("transit_navigation_attempts") == 0,
+        isPaused = state == "paused" && historyTaskId == taskId,
         onDismiss = { showHistory = false },
         onReturned = { response ->
             accept(response)
@@ -604,6 +645,12 @@ internal fun WorkflowScreen(
         },
     )
     if (showFamilyContact && !showHistory) FamilyContactDialog(onDismiss = { showFamilyContact = false })
+    if (canOpenFamilyDialog && familyReady && openFamilyTaskId.isNotBlank() && openFamilyTaskId == taskId) {
+        val familyAlias = (task?.opt("family_recipient_alias") as? String).orEmpty()
+        key(openFamilyTaskId) {
+            FamilyContactDialog(requestedAlias = familyAlias, onDismiss = { openFamilyTaskId = "" })
+        }
+    }
     if (showDemoPicker && !showHistory) DemoCasePickerSheet(
         onDismiss = { showDemoPicker = false },
         onSelect = { useDemo(it) },
@@ -737,8 +784,11 @@ internal fun WorkflowScreen(
         )
     }
     task?.takeIf { current ->
-        !showHistory && current.optString("task_type") != "plan_transit" && state == "completed" && if (current.optString("task_type") == "open_url")
-            current.optBoolean("webpage_verified") else current.optBoolean("delivery_confirmed")
+        !showHistory && state == "completed" && when (current.optString("task_type")) {
+            "plan_transit", "contact_family" -> false
+            "open_url" -> current.optBoolean("webpage_verified")
+            else -> current.optBoolean("delivery_confirmed")
+        }
     }?.let { completed ->
         AlertDialog(
             onDismissRequest = { },

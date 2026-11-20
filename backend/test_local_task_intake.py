@@ -17,6 +17,25 @@ def test_transit_form_preserves_start_location_choice(instruction, origin, use_l
     assert result.transit.use_current_location == use_location
 
 
+@pytest.mark.parametrize("instruction", [
+    "扫码", "扫一扫", "  麻烦帮我扫一下这个二维码！ ", "扫个码", "打开扫码",
+    "能不能帮我扫码一下？", "请扫描二维码", "帮我扫这个二维码，打开网页。",
+])
+def test_direct_scan_opens_the_camera_without_requesting_mail(instruction):
+    result = understand_local_instruction(instruction)
+    assert result.task_type == "open_url"
+    assert result.needs_qr
+    assert not result.recipient_alias
+
+
+@pytest.mark.parametrize("instruction", [
+    "扫码发给女儿", "不要扫码", "扫码付款", "这是什么二维码", "扫一下二维码，顺便发邮件",
+    "帮我识别镜头前这个码",
+])
+def test_only_unambiguous_scan_commands_are_direct(instruction):
+    assert understand_local_instruction(instruction) is None
+
+
 def test_examples_are_deterministic_and_other_instructions_still_use_model():
     assert understand_local_instruction("帮我扫这个二维码，打开网页。").task_type == "open_url"
     assert understand_local_instruction("帮我扫码，把网页发邮件给女儿。").recipient_alias == "女儿"

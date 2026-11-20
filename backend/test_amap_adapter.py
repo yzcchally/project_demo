@@ -366,14 +366,15 @@ def test_route_cards_exclude_cycling_and_taxi_and_sort_observed_transit_options(
     assert adapter._route_cards(shot) == [first, second]
 
 
-def huawei_route_list(line="3号线", *, hidden_line=False):
+def huawei_route_list(line="3号线", *, hidden_line=False,
+                      card_label="方案1，6分钟，无堵车风险，1站，2元，广州塔进站"):
     origin = node(desc="起点，广州塔(地铁站)", rect="[165,174][891,277]")
     origin.append(node("广州塔(地铁站)", rect="[224,174][891,277]", cls="android.view.View"))
     destination = node(desc="终点，客村(地铁站)", rect="[165,276][891,379]")
     destination.append(node("客村(地铁站)", rect="[224,276][891,379]", cls="android.view.View"))
     transit = node(desc="公共交通，6分钟，已选中，按钮", rect="[375,406][686,499]")
     transit.append(node("公共交通", rect="[471,419][657,485]", cls="android.view.View"))
-    card = node(desc="方案1，6分钟，无堵车风险，1站，2元，广州塔进站", rect="[72,743][1033,917]")
+    card = node(desc=card_label, rect="[72,743][1033,917]")
     line_node = node(desc=line, rect="[72,933][1126,1036]", **{"visible-to-user": "false" if hidden_line else "true"})
     line_node.append(node(line, rect="[95,950][224,1016]", cls="android.view.View"))
     owner = node(rect="[72,743][1126,1168]")
@@ -398,7 +399,7 @@ def test_huawei_route_headers_current_mode_and_numbered_choice(adapter, line):
     adapter.base.tap.assert_not_called()
 
 
-def test_huawei_numbered_choice_rechecks_line_and_rejects_hidden_or_unassociated_lines(adapter):
+def test_huawei_numbered_choice_rejects_hidden_or_unassociated_lines(adapter):
     rejected_nodes, _ = huawei_route_list(hidden_line=True)
     adapter.base.observe.return_value = xml(rejected_nodes)
     assert adapter._route_cards(adapter._observe(lambda: None, "route_list")) == []
@@ -414,15 +415,103 @@ def test_huawei_numbered_choice_rechecks_line_and_rejects_hidden_or_unassociated
     nodes[-1].append(node(desc="方案2，15分钟，2站，2元，广州塔进站", rect="[72,1017][1033,1191]"))
     adapter.base.observe.return_value = xml(nodes)
     assert adapter._route_cards(adapter._observe(lambda: None, "route_list")) == []
-    nodes, _ = huawei_route_list()
+
+
+@pytest.mark.parametrize("card_label", [
+    "方案1，6分钟，无堵车风险，1站，2元，广州塔进站",
+    "方案1，1小时15分钟，综合最优，步行2.1公里，11站，6元，板桥(C口)进站",
+    "方案1，1小时15分，综合最优，步行2.1公里，11站，6元，板桥(C口)进站",
+])
+def test_huawei_numbered_choice_recognizes_duration_and_rechecks_line(adapter, card_label):
+    nodes, _ = huawei_route_list("7号线", card_label=card_label)
     adapter.base.observe.return_value = xml(nodes)
     shot = adapter._observe(lambda: None, "route_list")
-    card = adapter._route_cards(shot)[0]
-    changed, _ = huawei_route_list("8号线")
+    card, = adapter._route_cards(shot)
+    assert adapter._route_card_summary(shot, card).splitlines() == [card_label, "7号线"]
+    changed, _ = huawei_route_list("8号线", card_label=card_label)
     adapter.base.observe.return_value = xml(changed)
     with pytest.raises(WorkflowError, match="线路已变化"):
         adapter._tap(shot, card, lambda: None, role="route", page="route_list")
     adapter.base.tap.assert_not_called()
+
+
+def compact_detail_preview(destination, totals, *, active=False):
+    root = node(desc="公交详情页面", rect="[0,0][1200,2640]", clickable="false")
+    terminal = node(desc="下车站" + destination, rect="[72,2310][1133,2435]")
+    terminal.append(node(destination, rect="[178,2320][583,2410]", cls="android.view.View", clickable="false"))
+    footer = node(desc="结束导航" if active else "开始导航，开启下车提醒", rect="[769,2446][1124,2605]")
+    footer.append(node("结束导航" if active else "开始导航", rect="[845,2465][1045,2533]",
+                       cls="android.view.View", clickable="false"))
+    root.extend([node(desc="返回", rect="[34,188][173,327]"),
+                 node(desc=totals, rect="[53,1467][1146,1533]"), terminal, footer])
+    return xml([root])
+
+
+@pytest.mark.parametrize("response", ["corrected", "same_old_preview", "collapsed_then_list", "stayed_in_preview",
+                                      "collapsed_changed_totals", "collapsed_became_active", "became_active", "loaded_without_retry"])
+def test_huawei_numbered_choice_reopens_a_contradicted_idle_preview_once(adapter, monkeypatch, response):
+    card_label = "方案1，1小时15分，综合最优，步行2.1公里，11站，6元，板桥(C口)进站"
+    route_nodes, _ = huawei_route_list("7号线", card_label=card_label)
+    route_nodes[-1][-1].append(node("3号线", rect="[500,950][629,1016]", cls="android.view.View"))
+    route_list = xml(route_nodes)
+    summary = card_label + "\n7号线\n3号线"
+    places = {"origin": {"name": "广州塔(地铁站)"}, "destination": {"name": "客村(地铁站)"}}
+    stale = compact_detail_preview("大学城南", "1站 ¥2 板桥进站信号弱")
+    collapsed = (stale.replace("[72,2310][1133,2435]", "[72,2800][1133,2640]")
+                 .replace("[178,2320][583,2410]", "[178,2800][583,2640]")
+                 .replace("[53,1467][1146,1533]", "[53,2317][1146,2383]"))
+    corrected = compact_detail_preview("客村", "11站 ¥6 板桥进站")
+    active = compact_detail_preview("大学城南", "1站 ¥2 板桥进站信号弱", active=True)
+    monkeypatch.setattr("time.sleep", Mock())
+    frames = {
+        "corrected": [stale, stale, stale] + [route_list] * 4 + [corrected],
+        "same_old_preview": [stale, stale, stale] + [route_list] * 4 + [stale],
+        "collapsed_then_list": [stale, stale, stale, collapsed, collapsed] + [route_list] * 3 + [corrected],
+        "stayed_in_preview": [stale, stale, stale] + [collapsed] * 10,
+        "collapsed_changed_totals": [stale, stale, stale] + [collapsed.replace("¥2", "¥3")] * 8,
+        "collapsed_became_active": [stale, stale, stale, collapsed, active],
+        "became_active": [stale, stale, active],
+        "loaded_without_retry": [stale, corrected],
+    }
+    adapter.base.observe.side_effect = frames[response]
+
+    if response in {"corrected", "collapsed_then_list", "loaded_without_retry"}:
+        detail = adapter._read_selected_route_detail(summary, places, lambda: None)
+        assert "下车站客村" in detail["evidence"]["text"]
+    else:
+        message = {"same_old_preview": "仍与所选公交方案不一致", "stayed_in_preview": "返回后仍未显示路线列表",
+                   "collapsed_changed_totals": "返回后仍未显示路线列表", "collapsed_became_active": "已停止本次点击",
+                   "became_active": "已停止本次点击"}[response]
+        with pytest.raises(WorkflowError, match=message):
+            adapter._read_selected_route_detail(summary, places, lambda: None)
+
+    tapped = [label(call.args[0]) for call in adapter.base.tap.call_args_list]
+    expected_taps = {"corrected": ["返回", card_label], "same_old_preview": ["返回", card_label],
+                     "collapsed_then_list": ["返回", "返回", card_label], "stayed_in_preview": ["返回", "返回"],
+                     "collapsed_changed_totals": ["返回"], "collapsed_became_active": ["返回"]}
+    assert tapped == expected_taps.get(response, [])
+    if response not in {"became_active", "collapsed_became_active"}:
+        assert {e["page_kind"] for e in adapter.observations if "大学城南" in e["text"]} == {"screen"}
+
+
+@pytest.mark.parametrize("address_label, detached, expected", [
+    ("广东省广州市番禺区南村镇兴业大道东777号", False, "广州"),
+    ("广东省广州市番禺区南村镇兴业大道东778号", False, None),
+    ("广东省广州市番禺区南村镇兴业大道东777号", True, None),
+])
+def test_huawei_route_origin_city_requires_exact_address_under_the_same_title(address_label, detached, expected):
+    title = node("华南理工大学(广州国际校区)", cls="android.view.View", rect="[105,446][690,497]")
+    title_row = node(rect="[39,446][971,497]")
+    title_row.append(title)
+    address = node(address_label, cls="android.view.View", rect="[282,503][970,559]")
+    address_row = node(rect="[105,500][970,563]")
+    address_row.append(address)
+    owner = node(rect="[39,446][971,564]")
+    owner.extend([title_row, node() if detached else address_row])
+    tree = ET.fromstring(xml([owner, *([address_row] if detached else [])]))
+    nodes = list(tree.iter("node"))
+    target = next(n for n in nodes if label(n) == label(title))
+    assert AmapDevice._route_origin_city({"nodes": nodes}, target, "番禺区南村镇兴业大道东777号", "广州") == expected
 
 
 def test_map_readiness_checks_amap_and_device_without_mail_dependency(adapter, monkeypatch):
@@ -1179,10 +1268,49 @@ def test_show_backfills_legacy_context_only_from_current_query_trusted_xml(adapt
     route=long_shown_route();frames=[shown_detail_frame(0),shown_detail_frame(1)]
     context=prepare_shown_frames(adapter,route,frames,trusted=False)
     folder=adapter._context_path(adapter._context_key(route)).parent;folder.mkdir(parents=True,exist_ok=True)
-    source=folder/"actual-detail.xml";source.write_text(frames[0])
+    source=folder/"actual-detail.xml";source.write_text(frames[0], encoding="utf-8")
     route["evidence"]=[{"query_id":route["query_id"],"route_id":route["route_id"],"page_kind":"route_detail","xml_path":str(source)}]
     adapter.show_details(route,lambda:None)
     assert context["detail_strip_fingerprint"]
+
+
+def test_show_backfills_split_native_summary_without_excluding_upper_itinerary(adapter):
+    route = long_shown_route()
+    route["origin"]["name"] = "甲校区"
+    route.update(fare_yuan=6, walking_meters=2100)
+    route["segments"][0].update(stops=3, entrance="C口")
+    route["segments"][1]["stops"] = 8
+    route["segments"].insert(0, {"mode": "walk", "duration_minutes": 28})
+
+    def frame(phase, *, timing="行程剩7小时45分 步行2.1公里 06点47分 到达", mode="步行28分钟转1号线转2号线", fare="11站 ¥6 甲(C口)进站"):
+        root = node(desc="公交详情页面", rect="[0,0][1200,2640]")
+        texts = ["甲校区", "甲", "1号线", "乙方向", "丙"] if phase == 0 else ["丙", "2号线", "丁方向", "戊"]
+        root.extend(node(text, rect=f"[160,{500+i*100}][1100,{580+i*100}]") for i, text in enumerate(texts))
+        summary = node(rect="[53,1313][1146,1838]")
+        for top, bottom, value in [(1313, 1407, timing), (1433, 1572, mode)]:
+            bounds_value = f"[53,{top}][1146,{bottom}]"
+            wrapper = node(rect=bounds_value)
+            wrapper.append(node(desc=value, rect=bounds_value))
+            summary.append(wrapper)
+        summary.append(node(desc=fare, rect="[53,1606][1146,1672]"))
+        root.append(summary)
+        return xml([root])
+
+    frames = [frame(0), frame(1, timing="行程剩7小时46分 步行2.1公里 06点48分 到达")]
+    context = prepare_shown_frames(adapter, route, frames, trusted=False)
+    source = adapter._context_path(adapter._context_key(route)).parent / "native-detail.xml"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(frames[0], encoding="utf-8")
+    route["evidence"] = [{"query_id": route["query_id"], "route_id": route["route_id"],
+                          "page_kind": "route_detail", "xml_path": str(source)}]
+    adapter.show_details(route, lambda: None)
+    assert context["detail_strip_fingerprint"]
+    assert adapter._scroll_detail.call_count == 3
+    for changed in [frame(1, mode="步行28分钟转2号线转1号线"), frame(1, fare="11站 ¥6 甲(D口)进站")]:
+        adapter.base.observe.side_effect = lambda checkpoint: changed
+        with pytest.raises(WorkflowError, match="方案"):
+            adapter.show_details(route, lambda: None)
+    adapter.base.tap.assert_not_called()
 
 
 @pytest.mark.parametrize("problem", ["wrong_query", "outside_directory", "list_summary_only"])
@@ -1190,7 +1318,7 @@ def test_show_does_not_backfill_model_text_or_other_query_files(adapter,tmp_path
     route=long_shown_route();frames=[shown_detail_frame(0),shown_detail_frame(1)]
     prepare_shown_frames(adapter,route,frames,trusted=False)
     folder=adapter._context_path(adapter._context_key(route)).parent;folder.mkdir(parents=True,exist_ok=True)
-    source=(tmp_path if problem=="outside_directory" else folder)/"untrusted.xml";source.write_text(frames[0])
+    source=(tmp_path if problem=="outside_directory" else folder)/"untrusted.xml";source.write_text(frames[0], encoding="utf-8")
     route["evidence"]=[{"query_id":"another-query" if problem=="wrong_query" else route["query_id"],
         "route_id":route["route_id"],"page_kind":"route_list" if problem=="list_summary_only" else "route_detail",
         "xml_path":str(source),"text":"30分钟1号线2号线步行200米"}]

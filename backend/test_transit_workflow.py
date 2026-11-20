@@ -222,10 +222,10 @@ def test_invented_model_city_is_not_accepted(engine):
     assert not engine.transit_device.calls
 
 
-def test_destination_only_attempts_actual_location_then_asks_if_unavailable(engine):
-    engine.models.request = TransitRequest(destination="体育西路")
+def test_explicit_current_location_is_checked_then_asks_if_unavailable(engine):
+    engine.models.request = TransitRequest(destination="体育西路", use_current_location=True)
     engine.transit_device.location_missing = True
-    task = create(engine, instruction="我想去体育西路，帮我看看怎么坐公交过去")
+    task = create(engine, instruction="从当前位置出发去体育西路，帮我看看怎么坐公交过去")
     assert task["state"] == "needs_clarification"
     assert task["transit_request"]["use_current_location"]
     assert set(task["clarification_fields"]) == {"origin", "city"}
@@ -397,12 +397,12 @@ def test_cancelling_old_interrupted_task_cannot_cancel_new_worker(engine):
 
 
 def test_route_api_location_fallback_then_clarification_and_no_route_are_consistent(engine):
-    engine.models.request = TransitRequest(destination="体育西路")
+    engine.models.request = TransitRequest(destination="体育西路", use_current_location=True)
     engine.transit_device.location_missing = True
     engine.transit_device.kind = "NO_ROUTE"
     with patch("workflow_api.get_engine", return_value=engine):
         client = TestClient(gmail_demo.app)
-        response = client.post("/api/tasks", json={"instruction": "我想去体育西路坐公交", "request_key": "api-location-fallback"})
+        response = client.post("/api/tasks", json={"instruction": "从我的位置去体育西路坐公交", "request_key": "api-location-fallback"})
         task = settle(engine, response.json()["task"])
         assert task["state"] == "needs_clarification" and task["transit_request"]["use_current_location"]
         assert "draft" not in task
@@ -485,9 +485,9 @@ class AliasAndLocationMap(Map):
 
 
 def alias_goal(engine, key="alias-location-01"):
-    engine.models.request = TransitRequest(destination="广东省博物馆新馆", city="广州")
+    engine.models.request = TransitRequest(destination="广东省博物馆新馆", city="广州", use_current_location=True)
     engine.transit_device = AliasAndLocationMap()
-    return create(engine, key=key, instruction="在广州，我想去广东省博物馆新馆坐公交")
+    return create(engine, key=key, instruction="在广州，从当前位置去广东省博物馆新馆坐公交")
 
 
 def test_current_candidate_choice_canonicalizes_alias_preserves_original_and_audit(engine):
@@ -499,7 +499,7 @@ def test_current_candidate_choice_canonicalizes_alias_preserves_original_and_aud
     body = {"query_id": task["query_id"], "choice_nonce": selection["choice_nonce"], "candidate_id": "museum-main"}
     task = settle(engine, engine.choose_transit_place(task["id"], body))
     assert task["state"] == "needs_clarification"
-    assert task["instruction"] == "在广州，我想去广东省博物馆新馆坐公交"
+    assert task["instruction"] == "在广州，从当前位置去广东省博物馆新馆坐公交"
     assert task["transit_original_request"] == original_request
     assert task["transit_request"]["destination"] == "广东省博物馆"
     assert task["transit_choices"]["destination"] == AliasAndLocationMap.selected
@@ -594,7 +594,7 @@ class CurrentLocationMap(Map):
 
 def location_goal(engine, key="real-position-query-01"):
     engine.models.request = TransitRequest(destination="体育西路", city="广州", use_current_location=True)
-    return create(engine, key=key, instruction="在广州，我想去体育西路坐地铁")
+    return create(engine, key=key, instruction="在广州，从当前位置去体育西路坐地铁")
 
 
 def test_verified_current_position_result_does_not_require_explicit_origin(engine):

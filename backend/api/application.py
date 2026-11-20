@@ -15,7 +15,11 @@ def create_app():
 
     @app.get("/health")
     def health():
+        from agent.models import intent_provider
+
+        provider = intent_provider()
         return {**legacy._message(True, "后端连接成功"), "model_configured": bool(os.environ.get("DEEPSEEK_API_KEY", "").strip()),
+                "intent_model_configured": provider is not None, "intent_provider": provider,
                 "version": "2.0.0", "stack": {"orchestrator": "langgraph", "progress": "websocket", "device": "mobilerun-local-adb", "speech": "local-whisper"}}
 
     @app.post("/device/check")

@@ -9,13 +9,18 @@ import android.graphics.Rect
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Xml
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import android.widget.Toast
+import org.json.JSONObject
 
 internal class TransitBridgeExpired : RuntimeException()
 
@@ -38,6 +43,13 @@ internal class TransitBridgeLease(private val deadline: Long) {
 
 class MailAccessibilityService : AccessibilityService() {
     private val taskOverlay by lazy { TaskOperationOverlay(this) }
+    private val phoneTaskOverlay by lazy { PhoneTaskOverlayWindow(this, ::openPhoneTaskDestination) }
+    private val phoneOverlayHandler = Handler(Looper.getMainLooper())
+    private val refreshPhoneOverlay = Runnable { refreshTaskOverlay() }
+    private val taskPrefs by lazy { getSharedPreferences("silverguide", MODE_PRIVATE) }
+    private val taskOverlayListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "task_id" || key == "dismissed_task" || key == "live_task") refreshTaskOverlay()
+    }
     var lastTransitReadReason = "not_requested"
         private set
     var lastTransitInputReason = "not_requested"
@@ -88,6 +100,7 @@ class MailAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         configureTransitAccess()
         instance = this
+        taskPrefs.registerOnSharedPreferenceChangeListener(taskOverlayListener)
         refreshTaskOverlay()
     }
 
@@ -105,7 +118,10 @@ class MailAccessibilityService : AccessibilityService() {
     private fun nodeBounds(rect: Rect) = "[${rect.left},${rect.top}][${rect.right},${rect.bottom}]"
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
+        taskPrefs.unregisterOnSharedPreferenceChangeListener(taskOverlayListener)
         taskOverlay.hide()
+        phoneOverlayHandler.removeCallbacks(refreshPhoneOverlay)
+        phoneTaskOverlay.hide()
         if (instance === this) {
             instance = null
         }
@@ -113,7 +129,10 @@ class MailAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        taskPrefs.unregisterOnSharedPreferenceChangeListener(taskOverlayListener)
         taskOverlay.hide()
+        phoneOverlayHandler.removeCallbacks(refreshPhoneOverlay)
+        phoneTaskOverlay.hide()
         if (instance === this) {
             instance = null
         }
@@ -121,7 +140,8 @@ class MailAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (TaskOverlayState.snapshot == null || event == null) return
+        if (event == null || (PhoneTaskOverlay.session == null &&
+                TaskOverlayState.snapshot == null && selectedTaskId().isBlank())) return
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> refreshTaskOverlay()
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
@@ -138,34 +158,123 @@ class MailAccessibilityService : AccessibilityService() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         taskOverlay.configurationChanged()
+        phoneTaskOverlay.hide()
         refreshTaskOverlay()
     }
 
+    internal fun refreshPhoneTaskOverlaySoon() {
+        refreshTaskOverlay()
+        phoneOverlayHandler.removeCallbacks(refreshPhoneOverlay)
+        if (PhoneTaskOverlay.session != null) {
+            phoneOverlayHandler.postDelayed(refreshPhoneOverlay, 150L)
+            phoneOverlayHandler.postDelayed(refreshPhoneOverlay, 400L)
+        }
+    }
+
     internal fun refreshTaskOverlay() {
-        val snapshot = TaskOverlayState.snapshot
-        if (snapshot != null && canShowTaskOverlay()) taskOverlay.show(snapshot) else taskOverlay.hide()
+        val id = selectedTaskId()
+        val phone = PhoneTaskOverlay.session
+        val focused = if (id.isNotBlank() || phone != null) focusedAppPackage() else null
+        if (phone != null && phoneTaskOverlay.matches(phone, focused) && phoneTaskOverlay.show(phone)) {
+            taskOverlay.hide()
+            return
+        }
+        phoneTaskOverlay.hide()
+        val foreground = if (id.isNotBlank()) taskOverlayForeground(focused) else null
+        val inAmap = foreground == AMAP_PACKAGE
+        val snapshot = TaskOverlayState.snapshot?.takeIf { it.taskId == id }
+            ?: if (inAmap) cachedRouteHistory(id) else null
+        val showRouteHistory = inAmap && snapshot?.routeHistory != null
+        if (foreground != null && snapshot != null && (snapshot.phase != null || showRouteHistory)) {
+            taskOverlay.show(snapshot, showRouteHistory)
+        } else taskOverlay.hide()
+    }
+
+    private fun openPhoneTaskDestination(
+        expected: PhoneTaskOverlay.Session,
+        destination: PhoneOverlayDestination,
+    ) {
+        if (PhoneTaskOverlay.session !== expected || !phoneTaskOverlay.matches(expected, focusedAppPackage())) return
+        if (PhoneTaskOverlay.open(this, destination)) {
+            phoneTaskOverlay.hide()
+        } else {
+            Toast.makeText(this, "暂时打不开小银助手，请稍后再试。", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun selectedTaskId() = taskPrefs.getString("task_id", "").orEmpty()
+        .takeUnless { it == taskPrefs.getString("dismissed_task", "") }.orEmpty()
+
+    private fun cachedRouteHistory(id: String): TaskOverlaySnapshot? {
+        val task = runCatching { JSONObject(taskPrefs.getString("live_task", "{}").orEmpty()) }.getOrNull() ?: return null
+        if (task.optString("id") != id || task.optString("task_type") != "plan_transit") return null
+        val history = RouteHistoryAvailability.forState(task.optString("state"), canControl = false)
+        return TaskOverlaySnapshot(id, null, emptyList(), history)
+    }
+
+    internal fun openSelectedTaskHistory(id: String, amapOnly: Boolean) {
+        if (id != selectedTaskId()) return
+        val foreground = taskOverlayForeground() ?: return
+        if (amapOnly && foreground != AMAP_PACKAGE) return
+        TaskHistoryEntry.open(this, id)
+    }
+
+    internal fun retryOpeningPausedRouteHistory(id: String): Boolean {
+        if (id != selectedTaskId()) return false
+        return when (focusedAppPackage()) {
+            AMAP_PACKAGE -> {
+                runCatching { TaskHistoryEntry.open(this, id) }
+                true // Wait for the assistant to become foreground.
+            }
+            packageName -> {
+                runCatching { TaskHistoryEntry.open(this, id) }
+                false
+            }
+            null -> true // Windows are changing or a system window is covering the app.
+            else -> false
+        }
+    }
+
+    internal fun showTaskHistoryMessage(id: String, message: String) {
+        if (id == selectedTaskId() && taskOverlayForeground() == AMAP_PACKAGE) {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    internal fun requestRouteHistory(snapshot: TaskOverlaySnapshot) {
+        if (snapshot.taskId != selectedTaskId() || taskOverlayForeground() != AMAP_PACKAGE) return
+        when (snapshot.routeHistory) {
+            RouteHistoryAvailability.Open -> openSelectedTaskHistory(snapshot.taskId, amapOnly = true)
+            RouteHistoryAvailability.PauseToOpen -> TaskOverlayState.control(snapshot, "pause_for_history")
+            RouteHistoryAvailability.Pausing -> showTaskHistoryMessage(snapshot.taskId, "正在暂停任务。")
+            RouteHistoryAvailability.Connecting -> showTaskHistoryMessage(snapshot.taskId, "正在核对任务状态，请稍后打开历史。")
+            null -> Unit
+        }
+    }
+
+    private fun taskOverlayForeground(foreground: String? = focusedAppPackage()): String? = foreground?.takeUnless {
+        // The DingTalk bridge independently rejects observations through an overlay.
+        it == packageName || it == "com.alibaba.android.rimet"
     }
 
     @Suppress("DEPRECATION")
-    private fun canShowTaskOverlay(): Boolean {
-        if (getSystemService(KeyguardManager::class.java).isKeyguardLocked) return false
+    private fun focusedAppPackage(): String? {
+        if (getSystemService(KeyguardManager::class.java).isKeyguardLocked) return null
         val entries = runCatching { windows.orEmpty() }.getOrDefault(emptyList())
         return try {
             val front = entries.filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
-                .maxByOrNull { it.layer } ?: return false
-            if (!front.isFocused && !front.isActive) return false
+                .maxByOrNull { it.layer } ?: return null
+            if (!front.isFocused && !front.isActive) return null
             if (entries.any { it.layer > front.layer && it.type == AccessibilityWindowInfo.TYPE_SYSTEM &&
-                    (it.isFocused || it.isActive) }) return false
-            val root = front.root ?: return false
+                    (it.isFocused || it.isActive) }) return null
+            val root = front.root ?: return null
             try {
-                val foreground = root.packageName?.toString().orEmpty()
-                // The DingTalk bridge independently rejects observations through an overlay.
-                foreground.isNotEmpty() && foreground != packageName && foreground != "com.alibaba.android.rimet"
+                root.packageName?.toString()?.takeIf { it.isNotEmpty() }
             } finally {
                 root.recycle()
             }
         } catch (_: RuntimeException) {
-            false
+            null
         } finally {
             entries.forEach { it.recycle() }
         }
@@ -217,13 +326,11 @@ class MailAccessibilityService : AccessibilityService() {
         }
         target.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         val wrote = if (useClipboard) {
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("SilverGuide 邮件正文", value))
-            target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, Bundle().apply {
-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, target.text?.length ?: 0)
-            })
-            target.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            selectTextForReplacement(target) && run {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("SilverGuide 邮件正文", value))
+                target.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            }
         } else {
             target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
@@ -232,6 +339,16 @@ class MailAccessibilityService : AccessibilityService() {
         if (target !== root) target.recycle()
         root.recycle()
         return wrote
+    }
+
+    private fun selectTextForReplacement(target: AccessibilityNodeInfo): Boolean {
+        // Require a confirmed full selection for real editor content.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && target.isShowingHintText) return true
+        val length = target.text?.length ?: 0
+        return length == 0 || target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, length)
+        })
     }
 
     /** Only the exact, freshly observed Amap search field may receive route text. */
@@ -279,16 +396,14 @@ class MailAccessibilityService : AccessibilityService() {
             target.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             lease.check()
             val wrote = if (useClipboard) {
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                lease.check()
-                clipboard.setPrimaryClip(ClipData.newPlainText("SilverGuide 路线地点", value))
-                lease.check()
-                target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, Bundle().apply {
-                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
-                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, target.text?.length ?: 0)
-                })
-                lease.check()
-                target.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                selectTextForReplacement(target) && run {
+                    lease.check()
+                    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    lease.check()
+                    clipboard.setPrimaryClip(ClipData.newPlainText("SilverGuide 路线地点", value))
+                    lease.check()
+                    target.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                }
             } else {
                 lease.check()
                 target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
@@ -748,6 +863,7 @@ class MailAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        private const val AMAP_PACKAGE = "com.autonavi.minimap"
         var instance: MailAccessibilityService? = null
             private set
     }

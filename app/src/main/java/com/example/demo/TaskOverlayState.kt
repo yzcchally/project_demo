@@ -17,9 +17,26 @@ internal enum class TaskOverlayPhase(val title: String, val canResume: Boolean =
 
 internal data class TaskOverlaySnapshot(
     val taskId: String,
-    val phase: TaskOverlayPhase,
+    val phase: TaskOverlayPhase?,
     val steps: List<String>,
+    val routeHistory: RouteHistoryAvailability? = null,
 )
+
+internal enum class RouteHistoryAvailability {
+    Open, PauseToOpen, Pausing, Connecting;
+
+    companion object {
+        fun forState(state: String, canControl: Boolean, pauseRequested: Boolean = false) = when {
+            state in taskTerminalStates -> Open
+            pauseRequested -> Pausing
+            !canControl || state.isBlank() -> Connecting
+            TaskOverlayPhase.fromTaskState(state) != null -> Open
+            else -> PauseToOpen
+        }
+    }
+}
+
+internal val taskTerminalStates = setOf("completed", "partial", "no_route", "failed", "cancelled", "outcome_unknown", "interrupted")
 
 /** Only established workflow states can contribute text to the cross-app panel. */
 internal fun taskOverlaySteps(events: JSONArray, state: String, transitQuery: String?): List<String> {
@@ -72,6 +89,12 @@ internal object TaskOverlayState {
 
     fun control(expected: TaskOverlaySnapshot, action: String) {
         if (snapshot !== expected) return
-        if (action == "cancel" || (action == "resume" && expected.phase.canResume)) onControl?.invoke(action)
+        val allowed = when (action) {
+            "cancel" -> expected.phase != null
+            "resume" -> expected.phase?.canResume == true
+            "pause_for_history" -> expected.routeHistory == RouteHistoryAvailability.PauseToOpen
+            else -> false
+        }
+        if (allowed) onControl?.invoke(action)
     }
 }

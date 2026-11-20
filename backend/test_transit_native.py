@@ -61,13 +61,14 @@ def huawei_ride_frame(tmp_path, *, board_label="上车站广州塔", alight_labe
     return observation(tmp_path, [ride], summary="行程剩7分钟16点50分到达")
 
 
-def test_huawei_detail_uses_explicit_stop_roles_and_selected_option_totals(tmp_path):
+@pytest.mark.parametrize("duration, minutes", [("6分钟", 6), ("1小时15分", 75)])
+def test_huawei_detail_uses_explicit_stop_roles_and_selected_option_totals(tmp_path, duration, minutes):
     detail = huawei_ride_frame(tmp_path)
     card = {"evidence_id": "list", "query_id": QUERY, "route_id": ROUTE, "page_kind": "route_list",
-            "text": "方案1，6分钟，无堵车风险，1站，2元，广州塔进站\n3号线\n起点：广州塔(地铁站)\n终点：客村(地铁站)\n本轮已点击筛选：高德推荐"}
+            "text": f"方案1，{duration}，无堵车风险，1站，2元，广州塔进站\n3号线\n起点：广州塔(地铁站)\n终点：客村(地铁站)\n本轮已点击筛选：高德推荐"}
     req = {"origin": "广州塔地铁站", "destination": "客村地铁站", "city": "广州市"}
     result = extract([detail, card], req)
-    assert (result["duration_minutes"], result["fare_yuan"]) == (6, 2)
+    assert (result["duration_minutes"], result["fare_yuan"]) == (minutes, 2)
     assert result["evidence_refs"]["duration_minutes"] == ["list"]
     seg, = result["segments"]
     assert tuple(seg[field] for field in ("line", "direction", "board", "alight", "stops", "duration_minutes")) == (
@@ -309,6 +310,42 @@ def test_long_location_route_keeps_all_five_observed_legs_across_complete_riding
     from transit.explain import segment_text
     spoken = segment_text(checked["segments"][0],1)
     assert "从公共入口步行至北园站C口" in spoken and "37分钟" in spoken and "16分钟" not in spoken
+
+
+def test_huawei_compact_numbered_route_keeps_exact_campus_walk_and_split_summary(tmp_path):
+    campus = "华南理工大学(广州国际校区)"
+    origin = n(desc="起点" + campus, children=[n(campus, group=False)])
+    first = column("板桥", "汉溪长隆", ("7号线",), "美的大道方向", "3站10分钟")
+    first[0] = n(desc="上车站板桥C口", children=[n("板桥 (C口)", group=False),
+                                                 n("地铁进站指引", group=False)])
+    first[1][0].set("content-desc", "7号线美的大道方向")
+    first[1][0].append(n("到站时刻表", group=False))
+    first[2].append(n("换乘便捷：22站台门", group=False))
+    first[-1].set("content-desc", "下车站汉溪长隆")
+    second = column("汉溪长隆", "体育西路", ("3号线",), "天河客运站方向", "8站24分钟")
+    row = n(desc="步行1.8公里 (28分钟)", children=[n("步行1.8公里 (28分钟)", group=False)])
+    walk = n(children=[n(children=[row]), n(desc="步行导航", children=[n("步行导航", group=False)])])
+    transfer = n(desc="站内换乘 238米 (5分钟)", children=[n("站内换乘 238米 (5分钟)", group=False)])
+    owner = n(children=[origin, walk, n(children=[first]), n(children=[transfer]), n(children=[second])])
+    total = "行程剩7小时46分 步行2.1公里 06点46分 到达"
+    summary = n(children=[n(children=[n(desc=total, children=[n("步行2.1公里", group=False)])]),
+                          n(children=[n(desc="步行28分钟转7号线转3号线")]),
+                          n(desc="11站 ¥6 板桥(C口)进站")])
+    detail = observation(tmp_path, [summary, owner], summary="")
+    route_list = {"evidence_id": "list", "query_id": QUERY, "route_id": ROUTE, "page_kind": "route_list",
+                  "text": "方案1，1小时15分，综合最优，步行2.1公里，11站，6元，板桥(C口)进站\n7号线\n3号线"}
+    request = {"origin": campus, "destination": "体育西路"}
+    result = extract([detail, route_list], request)
+    assert result
+    assert (result["duration_minutes"], result["fare_yuan"], result["walking_meters"]) == (75, 6, 2100)
+    start, first_ride, change, second_ride = result["segments"]
+    assert (start["board"], start["alight"], start["walking_meters"], start["duration_minutes"]) == (campus, "板桥C口", 1800, 28)
+    assert (first_ride["entrance"], first_ride["stops"], second_ride["stops"]) == ("C口", 3, 8)
+    assert (change["board"], change["alight"], change["walking_meters"], change["duration_minutes"]) == ("汉溪长隆", "汉溪长隆", 238, 5)
+    for role, name in request.items():
+        result[role] = {"name": name, "evidence_refs": {"name": [detail["evidence_id"]]}}
+    checked = validate_result(result, TASK, QUERY, request, evidence=[detail, route_list], collection_complete=True)
+    assert checked["route_verified"] and checked["missing_fields"] == []
 
 
 def test_position_placeholder_cannot_be_used_as_the_prefix_of_an_explicit_origin_route(tmp_path):

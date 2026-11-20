@@ -25,6 +25,7 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
     private val ink = Color.rgb(32, 28, 43)
     private var panel: Panel? = null
     private var snapshot: TaskOverlaySnapshot? = null
+    private var showRouteHistory = false
     private var expanded = false
     private var savedX: Int? = null
     private var savedY: Int? = null
@@ -33,16 +34,19 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
         val view: LinearLayout,
         val frame: WindowManager.LayoutParams,
         val header: Button,
+        val history: Button,
         val details: LinearLayout,
         val steps: LinearLayout,
         val scroll: ScrollView,
+        val detailsHistory: Button,
         val resume: Button,
     )
 
-    fun show(next: TaskOverlaySnapshot) {
-        if (snapshot == next && panel != null) return
-        if (snapshot?.taskId != next.taskId) expanded = false
+    fun show(next: TaskOverlaySnapshot, showHistory: Boolean) {
+        if (snapshot == next && showRouteHistory == showHistory && panel != null) return
+        if (snapshot?.taskId != next.taskId || next.phase == null) expanded = false
         snapshot = next
+        showRouteHistory = showHistory
         if (panel == null) {
             val (width, height) = availableSize()
             val frame = WindowManager.LayoutParams(
@@ -53,7 +57,7 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
                 PixelFormat.TRANSLUCENT,
             ).apply {
                 gravity = Gravity.TOP or Gravity.LEFT
-                x = savedX ?: (width - dp(133)).coerceAtLeast(0)
+                x = savedX ?: (width - dp(if (next.phase == null) 70 else 133)).coerceAtLeast(0)
                 y = savedY ?: height / 3
                 title = "小银任务面板"
             }
@@ -72,6 +76,7 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
 
     fun hide() {
         snapshot = null
+        showRouteHistory = false
         expanded = false
         val previous = panel ?: return
         panel = null
@@ -89,10 +94,20 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
     }
 
     private fun render(current: Panel, state: TaskOverlaySnapshot) {
-        current.header.text = state.phase.title + if (expanded) "  ▴" else "  ▾"
-        current.header.contentDescription = state.phase.title + if (expanded) "，收起任务进度" else "，展开任务进度"
-        current.details.visibility = if (expanded) View.VISIBLE else View.GONE
-        current.resume.visibility = if (state.phase.canResume) View.VISIBLE else View.GONE
+        val phase = state.phase
+        current.header.visibility = if (phase != null) View.VISIBLE else View.GONE
+        current.header.text = phase?.title.orEmpty() + if (expanded) "  ▴" else "  ▾"
+        current.header.contentDescription = phase?.title.orEmpty() + if (expanded) "，收起任务进度" else "，展开任务进度"
+        current.history.visibility = if (showRouteHistory) View.VISIBLE else View.GONE
+        current.history.text = if (state.routeHistory == RouteHistoryAvailability.Pausing) "暂停中…" else "历史"
+        current.history.contentDescription = when (state.routeHistory) {
+            RouteHistoryAvailability.PauseToOpen -> "历史，暂停任务后打开"
+            RouteHistoryAvailability.Pausing -> "正在暂停任务以打开历史"
+            else -> "历史"
+        }
+        current.details.visibility = if (phase != null && expanded) View.VISIBLE else View.GONE
+        current.detailsHistory.visibility = if (showRouteHistory) View.GONE else View.VISIBLE
+        current.resume.visibility = if (phase?.canResume == true) View.VISIBLE else View.GONE
         current.steps.removeAllViews()
         for ((index, label) in state.steps.withIndex()) {
             current.steps.addView(TextView(service).apply {
@@ -120,6 +135,12 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
             setOnTouchListener(dragOrTap())
         }
         root.addView(header)
+        val history = button("历史", primary = true).apply {
+            minWidth = dp(52)
+            setOnClickListener { snapshot?.let(service::requestRouteHistory) }
+            setOnTouchListener(dragOrTap())
+        }
+        root.addView(history)
         val steps = column()
         val scroll = ScrollView(service).apply {
             isFillViewport = true
@@ -127,6 +148,13 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
         }
         val resume = button("继续任务", primary = true).apply {
             setOnClickListener { snapshot?.let { TaskOverlayState.control(it, "resume") } }
+        }
+        val detailsHistory = button("打开操作记录").apply {
+            setOnClickListener {
+                snapshot?.takeIf { it.phase != null }?.let {
+                    service.openSelectedTaskHistory(it.taskId, amapOnly = false)
+                }
+            }
         }
         val details = column().apply {
             addView(TextView(service).apply {
@@ -137,16 +165,14 @@ internal class TaskOperationOverlay(private val service: MailAccessibilityServic
                 setPadding(dp(3), dp(8), 0, dp(2))
             })
             addView(scroll)
-            addView(button("打开操作记录").apply {
-                setOnClickListener { TaskHistoryEntry.open(service) }
-            })
+            addView(detailsHistory)
             addView(resume)
             addView(button("取消任务").apply {
                 setOnClickListener { snapshot?.let { TaskOverlayState.control(it, "cancel") } }
             })
         }
         root.addView(details)
-        return Panel(root, frame, header, details, steps, scroll, resume).also { built ->
+        return Panel(root, frame, header, history, details, steps, scroll, detailsHistory, resume).also { built ->
             sizeDetails(built)
             root.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
                 if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
