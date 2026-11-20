@@ -7,12 +7,15 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Path
+import android.graphics.Point
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
+import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityNodeInfo
 import okhttp3.OkHttpClient
@@ -31,6 +34,8 @@ class ScreenAgentService : AccessibilityService() {
     private val main = Handler(Looper.getMainLooper())
     private val screenshots = Executors.newSingleThreadExecutor()
     private val operation = OperationOverlay(this)
+    @Volatile private var shotWidth = 0
+    @Volatile private var shotHeight = 0
     private var socket: WebSocket? = null
     private var pendingTask: String? = null
     private var pendingRecord: String? = null
@@ -108,6 +113,7 @@ class ScreenAgentService : AccessibilityService() {
             RunSession.additions,
             RunSession.progress,
         )
+        RunSession.pendingReply = if (saved) next else 0
         RunSession.lastStep = maxOf(RunSession.lastStep, RunSession.latestStep)
         RunSession.userInstruction = ""
         RunSession.warning = ""
@@ -217,6 +223,10 @@ class ScreenAgentService : AccessibilityService() {
         if (request.optString("op") == "record_name") {
             val name = request.optString("name").trim()
             if (name.isNotEmpty()) RunSession.recordName = name
+            return
+        }
+        if (request.optString("op") == "reply") {
+            RunSession.applyReply(request.optInt("dialogue"), request.optString("text"))
             return
         }
         if (request.optString("op") == "result") {
@@ -455,6 +465,8 @@ class ScreenAgentService : AccessibilityService() {
                             hardware.recycle()
                             val stream = ByteArrayOutputStream()
                             soft.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                            shotWidth = soft.width
+                            shotHeight = soft.height
                             body = JSONObject()
                                 .put("ok", true)
                                 .put("width", soft.width)
@@ -479,11 +491,11 @@ class ScreenAgentService : AccessibilityService() {
 
     private fun execute(command: JSONObject): JSONObject {
         val type = command.optString("type")
-        val ok = if (type == "tap") gesture(command.getInt("x").toFloat(), command.getInt("y").toFloat(), command.getInt("x") + 1f, command.getInt("y") + 1f, 50)
-        else if (type == "long_press") gesture(command.getInt("x").toFloat(), command.getInt("y").toFloat(), command.getInt("x") + 1f, command.getInt("y") + 1f, 600)
-        else if (type == "swipe") gesture(command.getInt("x1").toFloat(), command.getInt("y1").toFloat(), command.getInt("x2").toFloat(), command.getInt("y2").toFloat(), command.getLong("duration_ms"))
-        else if (type == "zoom") zoom(command.getInt("x").toFloat(), command.getInt("y").toFloat(), command.getString("direction"), command.getInt("distance").toFloat())
-        else if (type == "input_text") inputAt(command.getInt("x").toFloat(), command.getInt("y").toFloat(), command.getString("text"))
+        val ok = if (type == "tap") point(command.getInt("x"), command.getInt("y"), 120)
+        else if (type == "long_press") point(command.getInt("x"), command.getInt("y"), 600)
+        else if (type == "swipe") gesture(screenX(command.getInt("x1")), screenY(command.getInt("y1")), screenX(command.getInt("x2")), screenY(command.getInt("y2")), command.getLong("duration_ms"))
+        else if (type == "zoom") zoom(screenX(command.getInt("x")), screenY(command.getInt("y")), command.getString("direction"), command.getInt("distance") * screenScale())
+        else if (type == "input_text") inputAt(screenX(command.getInt("x")), screenY(command.getInt("y")), command.getString("text"))
         else if (type == "back") performGlobalAction(GLOBAL_ACTION_BACK)
         else if (type == "home") performGlobalAction(GLOBAL_ACTION_HOME)
         else if (type == "recents") performGlobalAction(GLOBAL_ACTION_RECENTS)
@@ -543,6 +555,40 @@ class ScreenAgentService : AccessibilityService() {
         return gesture(startX, y, endX, y, 320L)
     }
 
+    private fun realScreen(): Pair<Int, Int> {
+        val point = Point()
+        getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)?.getRealSize(point)
+        if (point.x > 0 && point.y > 0) return point.x to point.y
+        return resources.displayMetrics.widthPixels to resources.displayMetrics.heightPixels
+    }
+
+    private fun screenX(x: Int): Float {
+        val width = realScreen().first
+        if (shotWidth <= 0 || width <= 0 || shotWidth == width) return x.toFloat()
+        return x * width.toFloat() / shotWidth
+    }
+
+    private fun screenY(y: Int): Float {
+        val height = realScreen().second
+        if (shotHeight <= 0 || height <= 0 || shotHeight == height) return y.toFloat()
+        return y * height.toFloat() / shotHeight
+    }
+
+    private fun screenScale(): Float {
+        val (width, height) = realScreen()
+        if (shotWidth <= 0 || shotHeight <= 0 || width <= 0 || height <= 0) return 1f
+        if (shotWidth == width && shotHeight == height) return 1f
+        return (width.toFloat() / shotWidth + height.toFloat() / shotHeight) / 2f
+    }
+
+    private fun point(x: Int, y: Int, durationMs: Long): Boolean {
+        val sx = screenX(x)
+        val sy = screenY(y)
+        val (width, height) = realScreen()
+        Log.i("ScreenAgent", "点击 截图($x,$y) 图${shotWidth}x$shotHeight 屏幕${width}x$height -> ($sx,$sy)")
+        return gesture(sx, sy, sx + 1f, sy + 1f, durationMs)
+    }
+
     private fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long): Boolean {
         val path = Path().apply {
             moveTo(x1, y1)
@@ -553,8 +599,9 @@ class ScreenAgentService : AccessibilityService() {
     }
 
     private fun zoom(x: Float, y: Float, direction: String, distance: Float): Boolean {
-        val width = resources.displayMetrics.widthPixels.toFloat()
-        val height = resources.displayMetrics.heightPixels.toFloat()
+        val (screenWidth, screenHeight) = realScreen()
+        val width = screenWidth.toFloat()
+        val height = screenHeight.toFloat()
         val near = 60f
         val far = near + distance
         val opening = direction != "out"

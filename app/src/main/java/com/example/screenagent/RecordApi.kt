@@ -63,6 +63,7 @@ object RecordApi {
                     row.optString("prompt"),
                     prompts(row.optJSONArray("additions")),
                     steps(row.optJSONArray("progress")),
+                    row.optString("reply"),
                 )
             }
             return Detail(

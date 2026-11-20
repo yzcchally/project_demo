@@ -19,6 +19,8 @@ class GraphState(TypedDict, total=False):
     error: str
     scale_x: float
     scale_y: float
+    block_pointer: bool
+    must_refuse: bool
 
 
 def build_graph(llm, cancel):
@@ -37,8 +39,16 @@ def build_graph(llm, cancel):
             data = _parse_json(raw)
             command = data.get("command")
             if isinstance(command, dict):
+                blocked = _blocked(command, state)
+                if blocked:
+                    if int(state.get("attempts") or 0) >= 2 and state.get("must_refuse"):
+                        data = {"command": {"type": "refuse", "message": "连续点击没有新进展，这条任务做不到"}, "progress": ""}
+                        return {"decision": normalize_decision(data), "error": ""}
+                    return {"decision": None, "error": blocked}
                 data = dict(data)
-                data["command"] = scale_command(command, state["scale_x"], state["scale_y"])
+                mapped = scale_command(command, state["scale_x"], state["scale_y"])
+                print(f"坐标 {json.dumps(command, ensure_ascii=False)} -> {json.dumps(mapped, ensure_ascii=False)}")
+                data["command"] = mapped
             return {"decision": normalize_decision(data), "error": ""}
         except (ValueError, json.JSONDecodeError, TypeError) as error:
             return {"decision": None, "error": str(error)}
@@ -70,9 +80,12 @@ def build_graph(llm, cancel):
     return graph.compile()
 
 
-def initial_state(turn: Turn, summary: str) -> GraphState:
+POINTER = {"tap", "swipe", "long_press", "zoom"}
+
+
+def initial_state(turn: Turn, notes: str, policy: dict | None = None) -> GraphState:
     url, seen_w, seen_h, scale_x, scale_y = prepare_image(turn.image_png)
-    content: list[dict] = [{"type": "text", "text": user_text(turn, seen_w, seen_h, summary)}]
+    content: list[dict] = [{"type": "text", "text": user_text(turn, seen_w, seen_h, notes)}]
     previous = turn.previous[-1] if turn.previous else None
     if previous is not None and previous.image_png:
         previous_url, _, _, _, _ = prepare_image(previous.image_png)
@@ -87,7 +100,18 @@ def initial_state(turn: Turn, summary: str) -> GraphState:
         "error": "",
         "scale_x": scale_x,
         "scale_y": scale_y,
+        "block_pointer": bool((policy or {}).get("block_pointer")),
+        "must_refuse": bool((policy or {}).get("must_refuse")),
     }
+
+
+def _blocked(command: dict, state: GraphState) -> str:
+    kind = str(command.get("type") or "")
+    if state.get("must_refuse") and kind != "refuse":
+        return "连续点击没有新进展。这一步只能输出 refuse，说明做不到的原因。"
+    if state.get("block_pointer") and kind in POINTER:
+        return "最近都在点击且没有新进度。禁止 tap、swipe、long_press、zoom。改用 home、back、input_text、launch、ask 或 refuse。"
+    return ""
 
 
 def _parse_json(text: str) -> dict:
@@ -96,10 +120,9 @@ def _parse_json(text: str) -> dict:
         raw = raw.split("\n", 1)[-1]
         raw = raw.rsplit("```", 1)[0].strip()
     start = raw.find("{")
-    end = raw.rfind("}")
-    if start >= 0 and end > start:
-        raw = raw[start : end + 1]
-    data = json.loads(raw)
+    if start < 0:
+        raise ValueError("需要一个 JSON 对象")
+    data, _ = json.JSONDecoder().raw_decode(raw[start:])
     if not isinstance(data, dict):
         raise ValueError("需要一个 JSON 对象")
     return data

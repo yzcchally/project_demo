@@ -66,6 +66,8 @@ private val Teal = Color(0xFF027A48)
 private val TealSoft = Color(0xFFE7F6EE)
 private val Red = Color(0xFFB42318)
 private val RedSoft = Color(0xFFFEF3F2)
+private val Reply = Color(0xFF3E4784)
+private val ReplySoft = Color(0xFFF4F3FF)
 private val CardShape = RoundedCornerShape(16.dp)
 
 class MainActivity : ComponentActivity() {
@@ -205,6 +207,7 @@ class MainActivity : ComponentActivity() {
         RunSession.recordId = ""
         RunSession.recordName = "未命名"
         RunSession.dialogues = emptyList()
+        RunSession.pendingReply = 0
         RunSession.progress = emptyList()
         RunSession.additions = emptyList()
         RunSession.notice = ""
@@ -232,6 +235,7 @@ class MainActivity : ComponentActivity() {
                     RunSession.recordName = detail.name
                     RunSession.lastStep = detail.lastStep
                     RunSession.dialogues = detail.dialogues
+                    RunSession.pendingReply = 0
                     RunSession.notice = ""
                     RunSession.phase = RunSession.Phase.Review
                 }
@@ -537,6 +541,16 @@ private fun DialogueFrame(dialogue: RunSession.Dialogue) {
         }
         dialogue.progress.forEachIndexed { index, item ->
             StepRow(index, item.text, false) {}
+        }
+        val writing = dialogue.reply.isBlank() && dialogue.index == RunSession.pendingReply
+        if (dialogue.reply.isNotBlank() || writing) {
+            Spacer(Modifier.height(12.dp))
+            PromptCard(
+                "回复",
+                Reply,
+                ReplySoft,
+                if (writing) "正在写这次做了什么" else dialogue.reply,
+            )
         }
     }
 }

@@ -4,7 +4,7 @@ from io import BytesIO
 
 from PIL import Image
 
-LIMIT = 1024
+LIMIT = 1280
 
 
 def prepare_image(png: bytes) -> tuple[str, int, int, float, float]:
@@ -22,6 +22,7 @@ def prepare_image(png: bytes) -> tuple[str, int, int, float, float]:
 
 
 def scale_command(command: dict | None, scale_x: float, scale_y: float) -> dict | None:
+    """Map pixels on the image the model saw back to the original screenshot."""
     if not isinstance(command, dict):
         return command
     scaled = dict(command)

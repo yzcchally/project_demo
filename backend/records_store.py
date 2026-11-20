@@ -45,6 +45,7 @@ def detail(record_id: str) -> dict:
             "prompt": str(summary.get("prompt") or ""),
             "additions": summary.get("additions") if isinstance(summary.get("additions"), list) else [],
             "progress": summary.get("progress") if isinstance(summary.get("progress"), list) else [],
+            "reply": str(summary.get("reply") or ""),
         })
     return {
         "id": folder.name,
@@ -81,7 +82,7 @@ def active_id() -> str:
     return memory_store.current_record()
 
 
-def archive(task: str, additions: list, progress: list) -> dict:
+def archive(task: str, additions: list, progress: list, reply: str = "") -> dict:
     record_id = active_id()
     if not record_id or not (ROOT / record_id).is_dir():
         record_id = create()["id"]
@@ -95,11 +96,24 @@ def archive(task: str, additions: list, progress: list) -> dict:
     if memory_store.ROOT.exists():
         shutil.copytree(memory_store.ROOT, dest / "memory")
     prompt = task.strip() or memory_store.read_prompt()
-    summary = {"prompt": prompt, "additions": additions, "progress": progress}
+    summary = {"prompt": prompt, "additions": additions, "progress": progress, "reply": reply.strip()}
     (dest / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     memory_store.clear()
     meta = _read_meta(folder)
     return {"id": record_id, "name": str(meta.get("name") or "未命名"), "dialogue": number}
+
+
+def write_reply(record_id: str, dialogue: int, reply: str) -> None:
+    text = reply.strip()
+    if not text or dialogue < 1:
+        return
+    folder = _folder(record_id)
+    path = folder / "dialogues" / str(dialogue) / "summary.json"
+    summary = _read_json(path)
+    if not isinstance(summary, dict):
+        return
+    summary["reply"] = text
+    path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def restore(record_id: str) -> int:

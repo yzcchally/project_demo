@@ -41,3 +41,7 @@ class AgentModel(ABC):
     @abstractmethod
     def complete(self, turn: Turn) -> dict:
         """Return {"command": dict | None, "progress": str | None}."""
+
+    def summarize(self, notes: str) -> str:
+        """One closing reply after the task ends. Default leaves it to the caller."""
+        return ""

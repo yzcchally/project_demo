@@ -6,7 +6,8 @@ from pydantic import ValidationError
 
 from contract import parse_command
 from memory_store import clear as clear_memory
-from memory_store import current_record, latest_step, read_prompt, remember_addition, remember_extra, remember_note, remember_prompt, save_photo, truncate_after
+from memory_store import current_record, earlier_commands, earlier_extras, latest_step, read_prompt, remember_addition, remember_extra, remember_note, remember_prompt, save_photo, truncate_after
+from models.deepseek.retrieve import _brief
 from models import ModelCancelled, build_turn, load_model
 from phone_link import capture_screen, execute_command, link
 import records_store
@@ -337,13 +338,13 @@ async def phone(socket: WebSocket):
                 additions = message.get("additions")
                 progress = message.get("progress")
                 task = str(message.get("task") or active_task)
+                addition_rows = additions if isinstance(additions, list) else []
+                progress_rows = progress if isinstance(progress, list) else []
+                notes = _closing_notes(task, addition_rows, progress_rows)
                 try:
-                    saved = records_store.archive(
-                        task,
-                        additions if isinstance(additions, list) else [],
-                        progress if isinstance(progress, list) else [],
-                    )
+                    saved = records_store.archive(task, addition_rows, progress_rows)
                     print(f"\n已保存记录 {saved['name']}，第 {saved['dialogue']} 轮对话，工作记忆已清空")
+                    asyncio.create_task(_send_reply(socket, saved, notes, progress_rows))
                 except Exception as error:
                     print(f"\n保存记录失败: {error}")
             elif op == "resume":
@@ -374,3 +375,75 @@ async def phone(socket: WebSocket):
     finally:
         if link.socket is socket:
             link.close()
+
+
+def _closing_notes(task: str, additions: list, progress: list) -> str:
+    lines = ["要做的事:", task.strip() or "（没有写）"]
+    extra_lines = []
+    for item in additions:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            extra_lines.append(text)
+    if extra_lines:
+        lines.append("中途补充:")
+        lines.extend(extra_lines)
+    steps = []
+    for item in earlier_commands(10**9):
+        done = str(item.get("progress") or "").strip()
+        action = _brief(item.get("command"))
+        steps.append(f"第 {item['step']} 步 {action}" + (f"，记下：{done}" if done else ""))
+    if steps:
+        lines.append("做过的步骤:")
+        lines.extend(steps)
+    found = []
+    for item in earlier_extras(10**9):
+        line = _extra_line(item)
+        if line:
+            found.append(line)
+    if found:
+        lines.append("已经得到:")
+        lines.extend(found)
+    shown = [str(item.get("text") or "").strip() for item in progress if isinstance(item, dict)]
+    shown = [item for item in shown if item]
+    if shown:
+        lines.append("屏幕上记下的进度:")
+        lines.extend(shown)
+    return "\n".join(lines)
+
+
+def _extra_line(item: dict) -> str:
+    step = item.get("step")
+    kind = str(item.get("kind") or "")
+    if kind == "url":
+        return f"第 {step} 步扫到网址：{item.get('text') or ''}"
+    if kind == "photo":
+        return f"第 {step} 步拍了照片：{item.get('file') or item.get('error') or ''}"
+    text = str(item.get("text") or item.get("error") or "").strip()
+    if not text:
+        return ""
+    return f"第 {step} 步得到：{text}"
+
+
+def _plain_reply(progress: list) -> str:
+    done = [str(item.get("text") or "").strip() for item in progress if isinstance(item, dict)]
+    done = [item for item in done if item]
+    if not done:
+        return "这轮结束了，没有记下完成的步骤。"
+    return "这次做完的有：" + "；".join(done) + "。"
+
+
+async def _send_reply(socket: WebSocket, saved: dict, notes: str, progress: list):
+    reply = ""
+    try:
+        reply = await asyncio.to_thread(model.summarize, notes)
+    except Exception as error:
+        print(f"\n写回复失败: {error}")
+    if not reply.strip():
+        reply = _plain_reply(progress)
+    records_store.write_reply(saved["id"], int(saved["dialogue"]), reply)
+    try:
+        await socket.send_json({"op": "reply", "dialogue": saved["dialogue"], "text": reply})
+    except Exception:
+        print("\n回复没能发到手机，已经写进记录")

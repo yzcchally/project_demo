@@ -14,7 +14,13 @@ object RunSession {
 
     class ProgressItem(val text: String, val step: Int?)
     class AddedPrompt(val progress: Int, val text: String)
-    class Dialogue(val index: Int, val prompt: String, val additions: List<AddedPrompt>, val progress: List<ProgressItem>)
+    class Dialogue(
+        val index: Int,
+        val prompt: String,
+        val additions: List<AddedPrompt>,
+        val progress: List<ProgressItem>,
+        val reply: String = "",
+    )
 
     var phase by mutableStateOf(Phase.Input)
     var task by mutableStateOf("")
@@ -32,6 +38,17 @@ object RunSession {
     var dialoguePrompt by mutableStateOf("")
     var lastStep by mutableStateOf(0)
     var dialogues by mutableStateOf(listOf<Dialogue>())
+    var pendingReply by mutableStateOf(0)
+
+    fun applyReply(index: Int, text: String) {
+        val reply = text.trim()
+        if (reply.isEmpty() || dialogues.isEmpty()) return
+        val target = if (dialogues.any { it.index == index }) index else dialogues.last().index
+        dialogues = dialogues.map { item ->
+            if (item.index == target) Dialogue(item.index, item.prompt, item.additions, item.progress, reply) else item
+        }
+        if (pendingReply == index || pendingReply == target) pendingReply = 0
+    }
 
     fun startBlockedReason(context: Context): String? {
         if (ScreenAgentService.instance != null) return null
