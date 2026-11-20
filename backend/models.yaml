@@ -1,6 +1,5 @@
 # 后端启动时只加载 active 指向的那一个模型。改完后重新运行 python backend/main.py。
 active: deepseek
-
 # 输入是当前这一轮。这一轮里有：
 # image 当前截图，text 当前文字，info 宽高等，
 # previous 前面每一轮的 image、text、info。
@@ -20,5 +19,5 @@ models:
   deepseek:
     kind: deepseek
     base_url: https://api.deepseek.com
-    api_key: your_key
+    api_key: sk-756c0224eb0341398678fc6cce040251
     model: deepseek-v4-flash-vision-exp

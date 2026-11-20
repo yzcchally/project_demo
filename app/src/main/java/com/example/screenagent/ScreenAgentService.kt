@@ -7,7 +7,9 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Path
+import android.graphics.Rect
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
@@ -256,7 +258,7 @@ class ScreenAgentService : AccessibilityService() {
             "scan" -> beginCapture(QrCaptureActivity::class.java, keepOverlay = false) { _, text ->
                 sendStepDone(scanExtra(text))
             }
-            else -> if (hold) sendStepDone() else main.postDelayed({ sendStepDone() }, 2000)
+            else -> if (hold) sendStepDone() else main.postDelayed({ sendStepDone() }, if (type == "input_text") 2800 else 2000)
         }
     }
 
@@ -573,37 +575,217 @@ class ScreenAgentService : AccessibilityService() {
     }
 
     private fun inputAt(x: Float, y: Float, value: String): Boolean {
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("input", value))
         val tapped = gesture(x, y, x + 1f, y + 1f, 50)
         main.postDelayed({
-            if (pasteFocused()) return@postDelayed
-            val offset = 64f * resources.displayMetrics.density
-            val pasteY = if (y < resources.displayMetrics.heightPixels / 2f) y + offset else y - offset
-            gesture(x, pasteY, x + 1f, pasteY + 1f, 40)
-        }, 700)
+            replaceText(x, y, value)
+            main.postDelayed({
+                if (textLanded(x, y, value)) return@postDelayed
+                clearThenPaste(x, y, value)
+            }, 280)
+        }, 450)
         return tapped
     }
 
-    private fun pasteFocused(): Boolean {
+    private fun replaceText(x: Float, y: Float, value: String) {
+        val node = editableAt(x, y) ?: focusedEditor() ?: return
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle()
+        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        node.recycle()
+    }
+
+    private fun textLanded(x: Float, y: Float, value: String): Boolean {
+        val wanted = value.trim()
+        if (wanted.isEmpty()) return false
+        val node = editableAt(x, y) ?: focusedEditor() ?: return false
+        val current = if (node.isShowingHintText) "" else node.text?.toString()?.trim().orEmpty()
+        node.recycle()
+        return current.contains(wanted)
+    }
+
+    private fun clearThenPaste(x: Float, y: Float, value: String) {
+        if (editorText().isEmpty()) {
+            pasteValue(value)
+            return
+        }
+        if (selectAll()) {
+            main.postDelayed({
+                cutSelection()
+                main.postDelayed({
+                    replaceText(x, y, value)
+                    main.postDelayed({
+                        if (!textLanded(x, y, value)) pasteValue(value)
+                    }, 220)
+                }, 220)
+            }, 220)
+            return
+        }
+        gesture(x, y, x + 1f, y + 1f, 500)
+        main.postDelayed({
+            tapLabeled("全选")
+            main.postDelayed({
+                cutSelection()
+                main.postDelayed({ pasteValue(value) }, 220)
+            }, 280)
+        }, 650)
+    }
+
+    private fun editableAt(x: Float, y: Float): AccessibilityNodeInfo? {
         val roots = windows.mapNotNull { it.root }.filter { it.packageName?.toString() != packageName }
         val targets = roots.ifEmpty { listOfNotNull(rootInActiveWindow) }
-        var pasted = false
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = Int.MAX_VALUE
         for (root in targets) {
-            if (!pasted) {
-                var node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                var depth = 0
-                while (node != null && depth++ < 5 && !pasted) {
-                    node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                    pasted = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                    val parent = if (pasted) null else node.parent
-                    node.recycle()
-                    node = parent
+            visitEditable(root, x, y) { node, area ->
+                if (area < bestArea) {
+                    best?.recycle()
+                    best = AccessibilityNodeInfo.obtain(node)
+                    bestArea = area
                 }
             }
             root.recycle()
         }
+        return best
+    }
+
+    private fun visitEditable(node: AccessibilityNodeInfo, x: Float, y: Float, onEditable: (AccessibilityNodeInfo, Int) -> Unit) {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (node.isEditable && rect.contains(x.toInt(), y.toInt())) {
+            val area = rect.width() * rect.height()
+            if (area > 0) onEditable(node, area)
+        }
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            visitEditable(child, x, y, onEditable)
+            child.recycle()
+        }
+    }
+
+    private fun pasteValue(value: String) {
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("input", value))
+        main.postDelayed({
+            if (pasteFocused()) return@postDelayed
+            main.postDelayed({ tapLabeled("Screen Agent") }, 280)
+        }, 180)
+    }
+
+    private fun editorText(): String {
+        val node = focusedEditor() ?: return ""
+        val text = if (node.isShowingHintText) "" else node.text?.toString()?.trim().orEmpty()
+        node.recycle()
+        return text
+    }
+
+    private fun selectAll(): Boolean {
+        val node = focusedEditor() ?: return false
+        val length = if (node.isShowingHintText) 0 else node.text?.length ?: 0
+        val selected = if (length > 0) {
+            val args = Bundle()
+            args.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            args.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, length)
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
+        } else {
+            false
+        }
+        node.recycle()
+        return selected
+    }
+
+    private fun cutSelection() {
+        val node = focusedEditor()
+        val cut = node?.performAction(AccessibilityNodeInfo.ACTION_CUT) == true
+        node?.recycle()
+        if (!cut) tapLabeled("剪切")
+    }
+
+    private fun pasteFocused(): Boolean {
+        val node = focusedEditor() ?: return false
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        var pasted = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        var parent = node.parent
+        node.recycle()
+        var depth = 0
+        while (parent != null && depth++ < 4 && !pasted) {
+            pasted = parent.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            val next = if (pasted) null else parent.parent
+            parent.recycle()
+            parent = next
+        }
+        parent?.recycle()
         return pasted
+    }
+
+    private fun focusedEditor(): AccessibilityNodeInfo? {
+        val roots = windows.mapNotNull { it.root }.filter { it.packageName?.toString() != packageName }
+        val targets = roots.ifEmpty { listOfNotNull(rootInActiveWindow) }
+        var chosen: AccessibilityNodeInfo? = null
+        for (root in targets) {
+            if (chosen == null) chosen = pickEditor(root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT))
+            root.recycle()
+        }
+        return chosen
+    }
+
+    private fun pickEditor(focus: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        var node = focus
+        var depth = 0
+        var editable: AccessibilityNodeInfo? = null
+        var withText: AccessibilityNodeInfo? = null
+        while (node != null && depth++ < 6) {
+            if (editable == null && node.isEditable) editable = AccessibilityNodeInfo.obtain(node)
+            if (withText == null && !node.isShowingHintText && !node.text.isNullOrEmpty()) {
+                withText = AccessibilityNodeInfo.obtain(node)
+            }
+            val parent = node.parent
+            node.recycle()
+            node = parent
+        }
+        node?.recycle()
+        if (editable != null) {
+            withText?.recycle()
+            return editable
+        }
+        return withText
+    }
+
+    private fun tapLabeled(label: String): Boolean {
+        val roots = windows.mapNotNull { it.root }
+        var hit = false
+        for (root in roots) {
+            if (!hit) {
+                val nodes = root.findAccessibilityNodeInfosByText(label)
+                for (node in nodes) {
+                    if (!hit && node.packageName?.toString() != packageName) hit = clickNode(node)
+                    node.recycle()
+                }
+            }
+            root.recycle()
+        }
+        return hit
+    }
+
+    private fun clickNode(node: AccessibilityNodeInfo): Boolean {
+        var current: AccessibilityNodeInfo? = node
+        var depth = 0
+        var clicked = false
+        while (current != null && depth++ < 4 && !clicked) {
+            clicked = current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            val parent = if (clicked) null else current.parent
+            if (current !== node) current.recycle()
+            current = parent
+        }
+        if (current != null && current !== node) current.recycle()
+        if (clicked) return true
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (rect.width() <= 0 || rect.height() <= 0) return false
+        val x = rect.exactCenterX()
+        val y = rect.exactCenterY()
+        return gesture(x, y, x + 1f, y + 1f, 40)
     }
 
     private fun dismissShade(): Boolean {
